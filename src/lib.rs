@@ -8,5 +8,6 @@
 //! - `main` (CRAB-101): the CLI entrypoint.
 
 pub mod config;
+pub mod provider;
 pub mod tools;
 pub mod workspace;
