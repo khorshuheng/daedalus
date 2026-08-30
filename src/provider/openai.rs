@@ -56,6 +56,23 @@ impl OpenAIProvider {
         }
         body
     }
+
+    fn stream(
+        &self,
+        body: Value,
+        headers: &[(&str, &str)],
+        cancel: &AtomicBool,
+    ) -> Result<Completion, ProviderError> {
+        let reader = post_stream(
+            &self.url(),
+            headers,
+            body,
+            self.timeout_secs,
+            self.max_retries,
+        )?;
+        let mut buf = BufReader::new(reader);
+        parse_openai_stream(&mut buf, cancel)
+    }
 }
 
 fn to_openai_message(m: &Message) -> Value {
@@ -210,22 +227,36 @@ impl Provider for OpenAIProvider {
         tools: &[Value],
         cancel: &AtomicBool,
     ) -> Result<Completion, ProviderError> {
-        let body = self.request(history, tools);
         let auth = self.api_key.as_ref().map(|k| format!("Bearer {k}"));
         let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(a) = &auth {
             headers.push(("Authorization", a.as_str()));
         }
-        let reader = post_stream(
-            &self.url(),
-            &headers,
-            body,
-            self.timeout_secs,
-            self.max_retries,
-        )?;
-        let mut buf = BufReader::new(reader);
-        parse_openai_stream(&mut buf, cancel)
+
+        let body = self.request(history, tools);
+        match self.stream(body, &headers, cancel) {
+            Ok(completion) => Ok(completion),
+            Err(e) if is_stream_options_unsupported(&e) => {
+                // Some OpenAI-compatible endpoints (older models, some
+                // DeepSeek deployments) reject `stream_options`; retry once
+                // without it, sacrificing the prompt-token usage report.
+                let mut body = self.request(history, tools);
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("stream_options");
+                }
+                self.stream(body, &headers, cancel)
+            }
+            Err(e) => Err(e),
+        }
     }
+}
+
+/// Whether a provider error indicates the endpoint does not support the
+/// `stream_options` request field.
+fn is_stream_options_unsupported(e: &ProviderError) -> bool {
+    e.to_string()
+        .to_ascii_lowercase()
+        .contains("stream_options")
 }
 
 #[cfg(test)]
@@ -316,6 +347,16 @@ mod tests {
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "c");
         assert_eq!(v["content"], "ok");
+    }
+
+    #[test]
+    fn detects_unsupported_stream_options() {
+        let e = ProviderError::Http(
+            "status 400: Unrecognized request argument supplied: stream_options".into(),
+        );
+        assert!(is_stream_options_unsupported(&e));
+        let other = ProviderError::Http("status 400: bad request".into());
+        assert!(!is_stream_options_unsupported(&other));
     }
 
     /// Reader that yields `data` one byte at a time and sets `cancel` once it

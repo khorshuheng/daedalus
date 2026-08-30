@@ -117,7 +117,9 @@ pub fn from_config(config: &Config) -> Box<dyn Provider> {
 
 /// Map an HTTP status code to a typed provider error.
 fn map_status_error(code: u16, text: String) -> ProviderError {
-    if code == 401 || code == 403 {
+    if is_quota_or_billing(&text) {
+        ProviderError::Http(format!("quota or billing limit (status {code}): {text}"))
+    } else if code == 401 || code == 403 {
         ProviderError::Auth(format!("status {code}: {text}"))
     } else if code == 408 || code == 429 {
         ProviderError::Timeout(format!("status {code}: {text}"))
@@ -239,5 +241,23 @@ fn next_sse_event(
                 serde_json::from_str(data).map_err(|e| ProviderError::Malformed(e.to_string()))?;
             return Ok(Some(value));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quota_errors_are_not_labeled_timeout() {
+        let e = map_status_error(429, "insufficient_quota".into());
+        assert!(matches!(e, ProviderError::Http(_)));
+        assert!(e.to_string().contains("quota or billing"));
+    }
+
+    #[test]
+    fn transient_429_still_maps_to_timeout() {
+        let e = map_status_error(429, "rate limit exceeded".into());
+        assert!(matches!(e, ProviderError::Timeout(_)));
     }
 }
