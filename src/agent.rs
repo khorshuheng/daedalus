@@ -198,7 +198,7 @@ impl<'a> Agent<'a> {
     pub fn run(&self, prompt: &str) -> Result<String, AgentError> {
         let cancel = AtomicBool::new(false);
         let mut session = Session::new(self, prompt, &cancel);
-        match session.run_turn()? {
+        match session.run_turn(&mut |_| {})? {
             Turn::Final(text) => Ok(text),
             Turn::Cancelled(_) => Ok(String::new()),
         }
@@ -211,6 +211,14 @@ pub enum Turn {
     Final(String),
     /// The turn was cancelled; `String` holds any partial text (kept).
     Cancelled(String),
+}
+
+/// A displayable event emitted while a turn runs.
+pub enum Stream {
+    /// A streamed text delta from the model.
+    Text(String),
+    /// Tool names about to execute.
+    Tools(Vec<String>),
 }
 
 /// A persistent agent session that owns the message history, so a cancelled
@@ -247,8 +255,9 @@ impl<'a, 'inner> Session<'a, 'inner> {
     }
 
     /// Run one turn (complete -> tools -> repeat) until a final answer,
-    /// cancellation, or error.
-    pub fn run_turn(&mut self) -> Result<Turn, AgentError> {
+    /// cancellation, or error. `emit` receives streamed text and tool markers
+    /// for display.
+    pub fn run_turn(&mut self, emit: &mut dyn FnMut(Stream)) -> Result<Turn, AgentError> {
         let seed_len = 2; // [System, first User] are never trimmed.
         let mut iterations = 0usize;
         loop {
@@ -265,7 +274,9 @@ impl<'a, 'inner> Session<'a, 'inner> {
             let completion = self
                 .agent
                 .provider
-                .complete(&self.history, &self.schemas, self.cancel)
+                .complete(&self.history, &self.schemas, self.cancel, &mut |t| {
+                    emit(Stream::Text(t.to_string()))
+                })
                 .map_err(AgentError::Provider)?;
             if let Some(tokens) = completion.prompt_tokens {
                 self.anchor_tokens = tokens;
@@ -288,8 +299,18 @@ impl<'a, 'inner> Session<'a, 'inner> {
             }
 
             match completion.response {
-                Response::Text(text) => return Ok(Turn::Final(text)),
+                Response::Text(text) => {
+                    // Record the final answer so follow-up turns have context.
+                    self.history.push(Message::Assistant {
+                        text: Some(text.clone()),
+                        tool_calls: vec![],
+                    });
+                    return Ok(Turn::Final(text));
+                }
                 Response::ToolCalls(calls) => {
+                    emit(Stream::Tools(
+                        calls.iter().map(|c| c.name.clone()).collect(),
+                    ));
                     if self
                         .agent
                         .push_tool_results(&mut self.history, calls, false, self.cancel)
@@ -495,6 +516,7 @@ mod tests {
             history: &[Message],
             _tools: &[serde_json::Value],
             _cancel: &AtomicBool,
+            _on_text: &mut dyn FnMut(&str),
         ) -> Result<crate::provider::Completion, ProviderError> {
             self.histories.lock().unwrap().push(history.to_vec());
             Ok(self
@@ -540,11 +562,11 @@ mod tests {
         let agent = Agent::new(&provider, &tools, &ws, &cfg);
 
         let mut session = Session::new(&agent, "initial prompt", &cancel);
-        let first = session.run_turn().unwrap();
+        let first = session.run_turn(&mut |_| {}).unwrap();
         assert!(matches!(first, Turn::Cancelled(_)));
 
         session.resume("stop, do this instead".into());
-        let second = session.run_turn().unwrap();
+        let second = session.run_turn(&mut |_| {}).unwrap();
         match second {
             Turn::Final(text) => assert_eq!(text, "fixed answer"),
             _ => panic!("expected final answer"),
@@ -560,5 +582,47 @@ mod tests {
         assert!(second_history
             .iter()
             .any(|m| matches!(m, Message::User(u) if u == "stop, do this instead")));
+    }
+
+    #[test]
+    fn final_answer_is_recorded_for_followups() {
+        let (_dir, ws) = workspace("finalrec");
+        let cancel = AtomicBool::new(false);
+        let provider = ScriptedProvider {
+            completions: Mutex::new(std::collections::VecDeque::from([
+                crate::provider::Completion {
+                    response: Response::Text("first answer".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                },
+                crate::provider::Completion {
+                    response: Response::Text("second answer".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                },
+            ])),
+            histories: Mutex::new(Vec::new()),
+        };
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: _dir.clone(),
+            ..Config::defaults(_dir.clone())
+        };
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "q1", &cancel);
+        assert!(matches!(
+            session.run_turn(&mut |_| {}).unwrap(),
+            Turn::Final(_)
+        ));
+        session.resume("q2".into());
+        session.run_turn(&mut |_| {}).unwrap();
+
+        // The follow-up turn saw the previous final answer in history.
+        let histories = provider.histories.lock().unwrap();
+        let second = &histories[1];
+        assert!(second
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { text: Some(t), .. } if t == "first answer")));
     }
 }

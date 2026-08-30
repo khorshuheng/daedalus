@@ -11,12 +11,12 @@
 //!   1 — hard error (bad config/flags, provider unreachable)
 //!   2 — iteration cap exceeded
 
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crab::agent::{Agent, AgentError, Session, Turn};
+use crab::agent::{Agent, AgentError, Session, Stream, Turn};
 use crab::config::{Config, Overrides, ProviderKind};
 use crab::provider;
 use crab::term;
@@ -134,11 +134,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     let tools = ToolSet::new(config.max_output_bytes);
     let agent = Agent::new(provider.as_ref(), &tools, &workspace, &config);
 
-    // Ctrl-C requests cancellation rather than terminating the process.
-    term::install_ctrl_c();
-
-    // Interactive terminal -> REPL (cancel/steer with Ctrl-C/Esc, /exit to
-    // quit). Piped stdin -> one-shot.
+    // Interactive terminal -> REPL (Ctrl-C/Esc cancel while busy, terminate at
+    // the prompt, /exit to quit). Piped stdin -> one-shot.
     if !std::io::stdin().is_terminal() {
         return match agent.run(&cli.prompt) {
             Ok(answer) => {
@@ -156,49 +153,51 @@ fn run(cli: Cli) -> Result<i32, String> {
     run_repl(&agent, &cli.prompt)
 }
 
-/// The interactive REPL: run a turn, then prompt for a follow-up, steering, or
-/// `/exit`. Ctrl-C/Esc cancel the in-flight turn.
+/// The interactive REPL. Raw input mode is on for the whole session; a single
+/// input thread line-edits and reports Line/Cancel/Eof. While a turn runs,
+/// Esc/Ctrl-C cancel it; at the prompt, they terminate.
 fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
+    let _raw = term::RawMode::enable().map_err(|e| format!("cannot enable raw mode: {e}"))?;
+    let busy = Arc::new(AtomicBool::new(false));
+    let (rx, _input) = term::spawn_input(Arc::clone(&busy));
+
     let mut session = Session::new(agent, initial, term::cancel_flag());
     loop {
         term::clear_cancel();
-        match run_interactive_turn(&mut session) {
+        busy.store(true, Ordering::SeqCst);
+
+        let mut emit = |ev: Stream| match ev {
+            Stream::Text(t) => {
+                print!("{t}");
+                let _ = std::io::stdout().flush();
+            }
+            Stream::Tools(names) => {
+                print!("\n⚙ {}", names.join(", "));
+                let _ = std::io::stdout().flush();
+            }
+        };
+        match session.run_turn(&mut emit) {
             Ok(Turn::Final(answer)) => println!("{answer}"),
             Ok(Turn::Cancelled(_)) => println!("\n(interrupted)"),
             Err(AgentError::IterationCap(n)) => {
-                eprintln!("crab: iteration cap exceeded after {n} iterations")
+                eprintln!("\ncrab: iteration cap exceeded after {n} iterations")
             }
-            Err(e) => eprintln!("crab: {e}"),
+            Err(e) => eprintln!("\ncrab: {e}"),
         }
+        busy.store(false, Ordering::SeqCst);
 
         print!("> ");
         let _ = std::io::stdout().flush();
-        let mut line = String::new();
-        let n = std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Ok(0); // Ctrl-D
-        }
-        match line.trim() {
-            "/exit" | "/quit" | "/q" => return Ok(0),
-            "" => continue,
-            msg => session.resume(msg.to_string()),
+        let event = rx.recv().map_err(|_| "input closed".to_string())?;
+        match event {
+            term::InputEvent::Line(line) => match line.trim() {
+                "/exit" | "/quit" | "/q" => return Ok(0),
+                "" => continue,
+                msg => session.resume(msg.to_string()),
+            },
+            term::InputEvent::Cancel | term::InputEvent::Eof => return Ok(0),
         }
     }
-}
-
-/// Run one turn with raw terminal mode so Esc (and Ctrl-C as a raw byte) can
-/// cancel it. Restores the terminal and stops the watcher afterwards.
-fn run_interactive_turn(session: &mut Session) -> Result<Turn, AgentError> {
-    let _raw = term::RawMode::enable().ok();
-    let stop = Arc::new(AtomicBool::new(false));
-    let watcher = term::spawn_esc_watcher(Arc::clone(&stop));
-    let result = session.run_turn();
-    stop.store(true, Ordering::SeqCst);
-    let _ = watcher.join();
-    result
 }
 
 fn main() {

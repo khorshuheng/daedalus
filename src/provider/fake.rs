@@ -58,6 +58,7 @@ impl Provider for FakeProvider {
         history: &[Message],
         _tools: &[Value],
         _cancel: &AtomicBool,
+        _on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion, ProviderError> {
         self.histories.lock().unwrap().push(history.to_vec());
         let mut q = self.responses.lock().unwrap();
@@ -89,20 +90,20 @@ mod tests {
             Response::Text("final".into()),
         ]);
         assert!(matches!(
-            p.complete(&[], &[], &AtomicBool::new(false))
+            p.complete(&[], &[], &AtomicBool::new(false), &mut |_| {})
                 .unwrap()
                 .response,
             Response::ToolCalls(_)
         ));
         assert_eq!(
-            p.complete(&[], &[], &AtomicBool::new(false))
+            p.complete(&[], &[], &AtomicBool::new(false), &mut |_| {})
                 .unwrap()
                 .response,
             Response::Text("final".into())
         );
         // Exhausted -> final "done".
         assert_eq!(
-            p.complete(&[], &[], &AtomicBool::new(false))
+            p.complete(&[], &[], &AtomicBool::new(false), &mut |_| {})
                 .unwrap()
                 .response,
             Response::Text("done".into())
@@ -116,7 +117,8 @@ mod tests {
             tool_call_id: "abc".into(),
             result: "r".into(),
         }];
-        p.complete(&hist, &[], &AtomicBool::new(false)).unwrap();
+        p.complete(&hist, &[], &AtomicBool::new(false), &mut |_| {})
+            .unwrap();
         assert_eq!(p.calls(), 1);
         assert!(p.saw_tool_result("abc"));
     }

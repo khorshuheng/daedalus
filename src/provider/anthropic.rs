@@ -121,6 +121,7 @@ fn to_anthropic_tools(tools: &[Value]) -> Value {
 fn parse_anthropic_stream(
     reader: &mut impl BufRead,
     cancel: &AtomicBool,
+    on_text: &mut dyn FnMut(&str),
 ) -> Result<Completion, ProviderError> {
     let mut texts = Vec::new();
     // (id, name, args_json), indexed by content-block index.
@@ -162,6 +163,7 @@ fn parse_anthropic_stream(
                         Some("text_delta") => {
                             if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
                                 texts.push(t.to_string());
+                                on_text(t);
                             }
                         }
                         Some("input_json_delta") => {
@@ -233,6 +235,7 @@ impl Provider for AnthropicProvider {
         history: &[Message],
         tools: &[Value],
         cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion, ProviderError> {
         let body = self.request(history, tools);
         let mut headers: Vec<(&str, &str)> = vec![("anthropic-version", "2023-06-01")];
@@ -247,7 +250,7 @@ impl Provider for AnthropicProvider {
             self.max_retries,
         )?;
         let mut buf = BufReader::new(reader);
-        parse_anthropic_stream(&mut buf, cancel)
+        parse_anthropic_stream(&mut buf, cancel, on_text)
     }
 }
 
@@ -269,7 +272,7 @@ mod tests {
                    event: message_stop\n\
                    data: {\"type\":\"message_stop\"}\n\n";
         let mut data = sse.as_bytes();
-        let r = parse_anthropic_stream(&mut data, &cancel).unwrap();
+        let r = parse_anthropic_stream(&mut data, &cancel, &mut |_| {}).unwrap();
         assert!(!r.aborted);
         assert_eq!(r.response, Response::Text("hi".into()));
         assert_eq!(r.prompt_tokens, Some(12));
@@ -283,7 +286,7 @@ mod tests {
                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
                    data: {\"type\":\"message_stop\"}\n\n";
         let mut data = sse.as_bytes();
-        let r = parse_anthropic_stream(&mut data, &cancel).unwrap();
+        let r = parse_anthropic_stream(&mut data, &cancel, &mut |_| {}).unwrap();
         match r.response {
             Response::ToolCalls(calls) => {
                 assert_eq!(calls.len(), 1);
@@ -303,7 +306,7 @@ mod tests {
                    data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
                    data: {\"type\":\"message_stop\"}\n\n";
         let mut data = sse.as_bytes();
-        let r = parse_anthropic_stream(&mut data, &cancel).unwrap();
+        let r = parse_anthropic_stream(&mut data, &cancel, &mut |_| {}).unwrap();
         assert!(matches!(r.response, Response::TruncatedToolCalls(_)));
     }
 

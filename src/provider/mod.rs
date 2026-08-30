@@ -94,12 +94,14 @@ pub trait Provider: Send + Sync {
     /// Send `history` plus the tool schemas and return the completion (text or
     /// tool calls) together with any reported prompt token usage. `cancel` is
     /// checked between streamed chunks; when set, the request is aborted and
-    /// `Completion.aborted` is set.
+    /// `Completion.aborted` is set. `on_text` receives text deltas as they
+    /// stream in.
     fn complete(
         &self,
         history: &[Message],
         tools: &[Value],
         cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion, ProviderError>;
 }
 

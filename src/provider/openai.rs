@@ -62,6 +62,7 @@ impl OpenAIProvider {
         body: Value,
         headers: &[(&str, &str)],
         cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion, ProviderError> {
         let reader = post_stream(
             &self.url(),
@@ -71,7 +72,7 @@ impl OpenAIProvider {
             self.max_retries,
         )?;
         let mut buf = BufReader::new(reader);
-        parse_openai_stream(&mut buf, cancel)
+        parse_openai_stream(&mut buf, cancel, on_text)
     }
 }
 
@@ -133,6 +134,7 @@ fn to_openai_tools(tools: &[Value]) -> Value {
 fn parse_openai_stream(
     reader: &mut impl BufRead,
     cancel: &AtomicBool,
+    on_text: &mut dyn FnMut(&str),
 ) -> Result<Completion, ProviderError> {
     let mut text = String::new();
     // (id, name, concatenated arguments JSON).
@@ -160,6 +162,7 @@ fn parse_openai_stream(
             if let Some(delta) = choice.get("delta") {
                 if let Some(t) = delta.get("content").and_then(|v| v.as_str()) {
                     text.push_str(t);
+                    on_text(t);
                 }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tcs {
@@ -226,6 +229,7 @@ impl Provider for OpenAIProvider {
         history: &[Message],
         tools: &[Value],
         cancel: &AtomicBool,
+        on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion, ProviderError> {
         let auth = self.api_key.as_ref().map(|k| format!("Bearer {k}"));
         let mut headers: Vec<(&str, &str)> = Vec::new();
@@ -234,7 +238,7 @@ impl Provider for OpenAIProvider {
         }
 
         let body = self.request(history, tools);
-        match self.stream(body, &headers, cancel) {
+        match self.stream(body, &headers, cancel, on_text) {
             Ok(completion) => Ok(completion),
             Err(e) if is_stream_options_unsupported(&e) => {
                 // Some OpenAI-compatible endpoints (older models, some
@@ -244,7 +248,7 @@ impl Provider for OpenAIProvider {
                 if let Some(obj) = body.as_object_mut() {
                     obj.remove("stream_options");
                 }
-                self.stream(body, &headers, cancel)
+                self.stream(body, &headers, cancel, on_text)
             }
             Err(e) => Err(e),
         }
@@ -283,16 +287,26 @@ mod tests {
     fn streams_text_response() {
         let cancel = AtomicBool::new(false);
         let mut data = text_sse().as_bytes();
-        let r = parse_openai_stream(&mut data, &cancel).unwrap();
+        let r = parse_openai_stream(&mut data, &cancel, &mut |_| {}).unwrap();
         assert!(!r.aborted);
         assert_eq!(r.response, Response::Text("hello world".into()));
+    }
+
+    #[test]
+    fn stream_emits_text_deltas() {
+        let cancel = AtomicBool::new(false);
+        let mut data = text_sse().as_bytes();
+        let mut emitted = String::new();
+        let r = parse_openai_stream(&mut data, &cancel, &mut |t| emitted.push_str(t)).unwrap();
+        assert_eq!(r.response, Response::Text("hello world".into()));
+        assert_eq!(emitted, "hello world");
     }
 
     #[test]
     fn streams_and_reassembles_tool_calls() {
         let cancel = AtomicBool::new(false);
         let mut data = tool_sse().as_bytes();
-        let r = parse_openai_stream(&mut data, &cancel).unwrap();
+        let r = parse_openai_stream(&mut data, &cancel, &mut |_| {}).unwrap();
         match r.response {
             Response::ToolCalls(calls) => {
                 assert_eq!(calls.len(), 1);
@@ -311,7 +325,7 @@ mod tests {
                    data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
                    data: [DONE]\n\n";
         let mut data = sse.as_bytes();
-        let r = parse_openai_stream(&mut data, &cancel).unwrap();
+        let r = parse_openai_stream(&mut data, &cancel, &mut |_| {}).unwrap();
         assert!(matches!(r.response, Response::TruncatedToolCalls(_)));
     }
 
@@ -328,7 +342,7 @@ mod tests {
             cancel: &cancel,
         };
         let mut buf = BufReader::new(reader);
-        let r = parse_openai_stream(&mut buf, &cancel).unwrap();
+        let r = parse_openai_stream(&mut buf, &cancel, &mut |_| {}).unwrap();
         assert!(r.aborted);
         if let Response::Text(t) = r.response {
             assert!(t.contains("hello"));
