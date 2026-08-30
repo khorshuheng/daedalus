@@ -12,6 +12,7 @@ pub mod fake;
 pub mod openai;
 
 use std::fmt;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -56,7 +57,6 @@ pub enum ProviderError {
     Timeout(String),
     Malformed(String),
     Http(String),
-    Message(String),
 }
 
 impl fmt::Display for ProviderError {
@@ -66,7 +66,6 @@ impl fmt::Display for ProviderError {
             ProviderError::Timeout(m) => write!(f, "request timed out: {m}"),
             ProviderError::Malformed(m) => write!(f, "malformed response: {m}"),
             ProviderError::Http(m) => write!(f, "http error: {m}"),
-            ProviderError::Message(m) => write!(f, "{m}"),
         }
     }
 }
@@ -89,5 +88,80 @@ pub fn from_config(config: &Config) -> Box<dyn Provider> {
         }
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(config)),
         ProviderKind::Fake => Box::new(fake::FakeProvider::new(vec![])),
+    }
+}
+
+/// Map an HTTP status code to a typed provider error.
+fn map_status_error(code: u16, text: String) -> ProviderError {
+    if code == 401 || code == 403 {
+        ProviderError::Auth(format!("status {code}: {text}"))
+    } else if code == 408 || code == 429 {
+        ProviderError::Timeout(format!("status {code}: {text}"))
+    } else {
+        ProviderError::Http(format!("status {code}: {text}"))
+    }
+}
+
+/// True when a status code indicates a transient failure worth retrying.
+fn is_transient_status(code: u16) -> bool {
+    code == 408 || code == 429 || (500..=599).contains(&code)
+}
+
+/// Classify a transport error, separating timeouts from generic HTTP failures.
+fn map_transport(t: &ureq::Transport) -> ProviderError {
+    let msg = t.to_string();
+    if t.kind() == ureq::ErrorKind::Io && msg.to_ascii_lowercase().contains("timed") {
+        ProviderError::Timeout(msg)
+    } else {
+        ProviderError::Http(msg)
+    }
+}
+
+fn backoff(attempt: usize) {
+    let ms = 250u64 << attempt.min(6);
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// POST a JSON body with a timeout and bounded retries on transient failures,
+/// returning the parsed JSON response body.
+pub(crate) fn post_json(
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Value,
+    timeout_secs: u64,
+    max_retries: usize,
+) -> Result<Value, ProviderError> {
+    let mut attempt = 0usize;
+    loop {
+        let mut req = ureq::post(url).set("Content-Type", "application/json");
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        req = req.timeout(Duration::from_secs(timeout_secs));
+
+        match req.send_json(body.clone()) {
+            Ok(resp) => {
+                return resp
+                    .into_json()
+                    .map_err(|e| ProviderError::Malformed(e.to_string()));
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let text = resp.into_string().unwrap_or_default();
+                if is_transient_status(code) && attempt < max_retries {
+                    attempt += 1;
+                    backoff(attempt);
+                    continue;
+                }
+                return Err(map_status_error(code, text));
+            }
+            Err(ureq::Error::Transport(t)) => {
+                if attempt < max_retries {
+                    attempt += 1;
+                    backoff(attempt);
+                    continue;
+                }
+                return Err(map_transport(&t));
+            }
+        }
     }
 }

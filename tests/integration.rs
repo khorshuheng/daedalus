@@ -60,7 +60,11 @@ fn integration_multi_step_session() {
             "write",
             serde_json::json!({"path": "a.txt", "content": "hello world"}),
         )]),
-        Response::ToolCalls(vec![call("r1", "read", serde_json::json!({"path": "a.txt"}))]),
+        Response::ToolCalls(vec![call(
+            "r1",
+            "read",
+            serde_json::json!({"path": "a.txt"}),
+        )]),
         Response::ToolCalls(vec![call(
             "e1",
             "edit",
@@ -82,7 +86,10 @@ fn integration_multi_step_session() {
     assert_eq!(fake.calls(), 5);
 
     // The tools actually mutated the workspace.
-    assert_eq!(std::fs::read_to_string(tmp.0.join("a.txt")).unwrap(), "hello there");
+    assert_eq!(
+        std::fs::read_to_string(tmp.0.join("a.txt")).unwrap(),
+        "hello there"
+    );
 
     // Each tool result was fed back to the model before the next call.
     for id in ["w1", "r1", "e1", "b1"] {
@@ -103,10 +110,26 @@ fn integration_iteration_cap() {
     let cfg = config_for(&tmp.0, 3);
 
     let fake = FakeProvider::new(vec![
-        Response::ToolCalls(vec![call("a", "bash", serde_json::json!({"command": "true"}))]),
-        Response::ToolCalls(vec![call("b", "bash", serde_json::json!({"command": "true"}))]),
-        Response::ToolCalls(vec![call("c", "bash", serde_json::json!({"command": "true"}))]),
-        Response::ToolCalls(vec![call("d", "bash", serde_json::json!({"command": "true"}))]),
+        Response::ToolCalls(vec![call(
+            "a",
+            "bash",
+            serde_json::json!({"command": "true"}),
+        )]),
+        Response::ToolCalls(vec![call(
+            "b",
+            "bash",
+            serde_json::json!({"command": "true"}),
+        )]),
+        Response::ToolCalls(vec![call(
+            "c",
+            "bash",
+            serde_json::json!({"command": "true"}),
+        )]),
+        Response::ToolCalls(vec![call(
+            "d",
+            "bash",
+            serde_json::json!({"command": "true"}),
+        )]),
     ]);
     let tools = ToolSet::new(1000);
     let agent = Agent::new(&fake, &tools, &ws, &cfg);

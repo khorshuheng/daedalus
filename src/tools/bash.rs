@@ -84,7 +84,9 @@ mod tests {
     fn captures_stderr_and_nonzero_exit() {
         let (ws, _dir) = setup("err");
         let tool = BashTool { max_output: 1000 };
-        let out = tool.run(&ws, &json!({"command": "echo boo 1>&2; exit 3"})).unwrap();
+        let out = tool
+            .run(&ws, &json!({"command": "echo boo 1>&2; exit 3"}))
+            .unwrap();
         assert!(out.content.contains("stderr:"));
         assert!(out.content.contains("boo"));
         assert!(out.content.contains("exit code: 3"));

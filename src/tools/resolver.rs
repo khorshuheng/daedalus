@@ -3,62 +3,69 @@
 
 use serde_json::{json, Value};
 
-use super::{bash::BashTool, edit::EditTool, read::ReadTool, write::WriteTool, Tool, ToolError, ToolOutput};
+use super::{
+    bash::BashTool, edit::EditTool, read::ReadTool, write::WriteTool, Tool, ToolError, ToolOutput,
+};
 use crate::workspace::Workspace;
+
+/// A registered tool: its name, a one-line description for the provider's
+/// `tools` field, and its executor. This table is the single source of truth
+/// for the closed tool set.
+type ToolEntry = (&'static str, &'static str, Box<dyn Tool>);
 
 /// The fixed, closed set of four tools, all sharing a single output cap.
 pub struct ToolSet {
-    read: ReadTool,
-    bash: BashTool,
-    edit: EditTool,
-    write: WriteTool,
+    tools: Vec<ToolEntry>,
 }
 
 impl ToolSet {
     pub fn new(max_output: usize) -> Self {
         Self {
-            read: ReadTool { max_output },
-            bash: BashTool { max_output },
-            edit: EditTool { max_output },
-            write: WriteTool { max_output },
+            tools: vec![
+                (
+                    "read",
+                    "Read a file (optionally a line range) in the workspace.",
+                    Box::new(ReadTool { max_output }),
+                ),
+                (
+                    "bash",
+                    "Run a shell command in the workspace directory.",
+                    Box::new(BashTool { max_output }),
+                ),
+                (
+                    "edit",
+                    "Apply precise, validated text replacements to a file.",
+                    Box::new(EditTool),
+                ),
+                (
+                    "write",
+                    "Create or overwrite a file in the workspace.",
+                    Box::new(WriteTool),
+                ),
+            ],
         }
     }
 
-    /// The names of the four built-in tools, in canonical order.
-    pub fn names(&self) -> [&'static str; 4] {
-        ["read", "bash", "edit", "write"]
-    }
-
     /// JSON Schemas describing each tool's arguments, wrapped with the tool's
-    /// name for the provider `tools` field.
+    /// name and description for the provider `tools` field.
     pub fn tool_schemas(&self) -> Vec<Value> {
-        self.names()
+        self.tools
             .iter()
-            .map(|&n| {
-                let s = self.tool(n).expect("tool exists").schema();
-                json!({ "name": n, "description": self.description(n), "parameters": s })
+            .map(|(name, description, tool)| {
+                json!({
+                    "name": *name,
+                    "description": *description,
+                    "parameters": tool.schema()
+                })
             })
             .collect()
     }
 
-    fn description(&self, name: &str) -> &'static str {
-        match name {
-            "read" => "Read a file (optionally a line range) in the workspace.",
-            "bash" => "Run a shell command in the workspace directory.",
-            "edit" => "Apply precise, validated text replacements to a file.",
-            "write" => "Create or overwrite a file in the workspace.",
-            _ => "A built-in crab tool.",
-        }
-    }
-
     pub fn tool(&self, name: &str) -> Option<&dyn Tool> {
-        match name {
-            "read" => Some(&self.read),
-            "bash" => Some(&self.bash),
-            "edit" => Some(&self.edit),
-            "write" => Some(&self.write),
-            _ => None,
-        }
+        self.tools
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, _, t)| t.as_ref())
     }
 
     /// Route `name`+`args` to the matching executor, or a clear error.
@@ -81,24 +88,27 @@ impl ToolSet {
 mod tests {
     use super::*;
 
-    #[test]
-    fn routes_to_correct_executor() {
-        let dir = std::env::temp_dir().join(format!("crab-resolver-{}", std::process::id()));
+    fn workspace(name: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("crab-resolver-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let ws = Workspace::new(dir.clone()).unwrap();
+        Workspace::new(dir).unwrap()
+    }
+
+    #[test]
+    fn routes_to_correct_executor() {
+        let ws = workspace("bash");
         let ts = ToolSet::new(1000);
 
-        let out = ts.execute(&ws, "bash", &json!({"command": "echo hi"})).unwrap();
+        let out = ts
+            .execute(&ws, "bash", &json!({"command": "echo hi"}))
+            .unwrap();
         assert!(out.content.contains("hi"));
     }
 
     #[test]
     fn unknown_tool_is_clear_error() {
-        let dir = std::env::temp_dir().join(format!("crab-resolver2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = Workspace::new(dir.clone()).unwrap();
+        let ws = workspace("unknown");
         let ts = ToolSet::new(1000);
         let err = ts.execute(&ws, "frobnicate", &json!({})).unwrap_err();
         assert!(err.to_string().contains("unknown tool 'frobnicate'"));
@@ -112,6 +122,7 @@ mod tests {
         assert_eq!(schemas.len(), 4);
         for s in &schemas {
             assert!(s.get("name").is_some());
+            assert!(s.get("description").is_some());
             assert!(s.get("parameters").is_some());
         }
     }

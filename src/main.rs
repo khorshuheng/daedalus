@@ -40,7 +40,7 @@ Precedence for config values: flags > env (CRAB_*) > config file > defaults.
 ";
 
 enum ParseOutcome {
-    Run(Cli),
+    Run(Box<Cli>),
     Help,
 }
 
@@ -91,12 +91,12 @@ fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         return Err("no prompt given".into());
     }
 
-    Ok(ParseOutcome::Run(Cli {
+    Ok(ParseOutcome::Run(Box::new(Cli {
         prompt: prompt_parts.join(" "),
         dir,
         config_path,
         flags,
-    }))
+    })))
 }
 
 /// If `--config` was not given, use `~/.config/crab/config.toml` when present.
@@ -150,7 +150,7 @@ fn main() {
             print!("{USAGE}");
             std::process::exit(0);
         }
-        Ok(ParseOutcome::Run(cli)) => cli,
+        Ok(ParseOutcome::Run(cli)) => *cli,
         Err(e) => {
             eprintln!("crab: {e}\n\n{USAGE}");
             std::process::exit(1);

@@ -81,6 +81,10 @@ pub struct Config {
     pub max_output_bytes: usize,
     /// Maximum tokens requested per completion (Anthropic requires this).
     pub max_tokens: usize,
+    /// Per-request timeout, in seconds.
+    pub timeout_secs: u64,
+    /// Number of retries for transient failures (timeouts, 429, 5xx).
+    pub max_retries: usize,
     /// The single root directory the agent is allowed to touch.
     pub workspace: PathBuf,
 }
@@ -98,6 +102,8 @@ impl Config {
             max_iterations: 30,
             max_output_bytes: 32_000,
             max_tokens: 2048,
+            timeout_secs: 60,
+            max_retries: 2,
             workspace,
         }
     }
@@ -118,6 +124,8 @@ pub struct Overrides {
     pub max_iterations: Option<usize>,
     pub max_output_bytes: Option<usize>,
     pub max_tokens: Option<usize>,
+    pub timeout_secs: Option<u64>,
+    pub max_retries: Option<usize>,
     pub workspace: Option<PathBuf>,
 }
 
@@ -133,6 +141,8 @@ struct FileConfig {
     max_iterations: Option<usize>,
     max_output_bytes: Option<usize>,
     max_tokens: Option<usize>,
+    timeout_secs: Option<u64>,
+    max_retries: Option<usize>,
     workspace: Option<PathBuf>,
 }
 
@@ -188,6 +198,12 @@ impl Overrides {
         if let Some(v) = fc.max_tokens {
             self.max_tokens = Some(v);
         }
+        if let Some(v) = fc.timeout_secs {
+            self.timeout_secs = Some(v);
+        }
+        if let Some(v) = fc.max_retries {
+            self.max_retries = Some(v);
+        }
         if let Some(v) = fc.workspace {
             self.workspace = Some(v);
         }
@@ -219,6 +235,12 @@ impl Overrides {
         if other.max_tokens.is_some() {
             self.max_tokens = other.max_tokens;
         }
+        if other.timeout_secs.is_some() {
+            self.timeout_secs = other.timeout_secs;
+        }
+        if other.max_retries.is_some() {
+            self.max_retries = other.max_retries;
+        }
         if other.workspace.is_some() {
             self.workspace = other.workspace;
         }
@@ -233,8 +255,12 @@ impl Overrides {
             },
         };
         // base_url defaults to the provider preset unless explicitly set.
-        let base_url = self.base_url.unwrap_or_else(|| provider.preset_base_url().to_string());
-        let model = self.model.unwrap_or_else(|| provider.preset_model().to_string());
+        let base_url = self
+            .base_url
+            .unwrap_or_else(|| provider.preset_base_url().to_string());
+        let model = self
+            .model
+            .unwrap_or_else(|| provider.preset_model().to_string());
         let workspace = self.workspace.unwrap_or(default_workspace);
 
         if workspace.as_os_str().is_empty() {
@@ -248,6 +274,11 @@ impl Overrides {
                 return Err(format!("temperature {t} out of range (0.0..=2.0)"));
             }
         }
+        if let Some(t) = self.timeout_secs {
+            if t == 0 {
+                return Err("timeout_secs must be >= 1".into());
+            }
+        }
 
         Ok(Config {
             provider,
@@ -258,6 +289,8 @@ impl Overrides {
             max_iterations: self.max_iterations.unwrap_or(30),
             max_output_bytes: self.max_output_bytes.unwrap_or(32_000),
             max_tokens: self.max_tokens.unwrap_or(2048),
+            timeout_secs: self.timeout_secs.unwrap_or(60),
+            max_retries: self.max_retries.unwrap_or(2),
             workspace,
         })
     }
@@ -298,6 +331,12 @@ impl Overrides {
         if let Ok(v) = std::env::var("CRAB_MAX_TOKENS") {
             o.max_tokens = v.parse().ok();
         }
+        if let Ok(v) = std::env::var("CRAB_TIMEOUT_SECS") {
+            o.timeout_secs = v.parse().ok();
+        }
+        if let Ok(v) = std::env::var("CRAB_MAX_RETRIES") {
+            o.max_retries = v.parse().ok();
+        }
         o
     }
 }
@@ -321,8 +360,10 @@ mod tests {
 
     #[test]
     fn deepseek_preset_applies_base_url_and_model() {
-        let mut flags = Overrides::default();
-        flags.provider = Some(ProviderKind::Deepseek);
+        let flags = Overrides {
+            provider: Some(ProviderKind::Deepseek),
+            ..Default::default()
+        };
         let c = Config::load(ws(), None, Overrides::default(), flags).unwrap();
         assert_eq!(c.provider, ProviderKind::Deepseek);
         assert_eq!(c.base_url, "https://api.deepseek.com");
@@ -331,9 +372,11 @@ mod tests {
 
     #[test]
     fn explicit_base_url_wins_over_preset() {
-        let mut flags = Overrides::default();
-        flags.provider = Some(ProviderKind::Deepseek);
-        flags.base_url = Some("http://localhost:9000".into());
+        let flags = Overrides {
+            provider: Some(ProviderKind::Deepseek),
+            base_url: Some("http://localhost:9000".into()),
+            ..Default::default()
+        };
         let c = Config::load(ws(), None, Overrides::default(), flags).unwrap();
         assert_eq!(c.base_url, "http://localhost:9000");
     }
@@ -350,18 +393,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "provider = \"nope\"\n").unwrap();
-        let err = Config::load(ws(), Some(&path), Overrides::default(), Overrides::default())
-            .unwrap_err();
+        let err = Config::load(
+            ws(),
+            Some(&path),
+            Overrides::default(),
+            Overrides::default(),
+        )
+        .unwrap_err();
         assert!(err.contains("unknown provider"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn flags_override_env_override_file() {
-        let mut env = Overrides::default();
-        env.model = Some("env-model".into());
-        let mut flags = Overrides::default();
-        flags.model = Some("flag-model".into());
+        let env = Overrides {
+            model: Some("env-model".into()),
+            ..Default::default()
+        };
+        let flags = Overrides {
+            model: Some("flag-model".into()),
+            ..Default::default()
+        };
         let c = Config::load(ws(), None, env, flags).unwrap();
         assert_eq!(c.model, "flag-model");
     }
@@ -376,7 +428,13 @@ mod tests {
             "provider = \"anthropic\"\nmodel = \"claude-x\"\nmax_iterations = 7\n",
         )
         .unwrap();
-        let c = Config::load(ws(), Some(&path), Overrides::default(), Overrides::default()).unwrap();
+        let c = Config::load(
+            ws(),
+            Some(&path),
+            Overrides::default(),
+            Overrides::default(),
+        )
+        .unwrap();
         assert_eq!(c.provider, ProviderKind::Anthropic);
         assert_eq!(c.base_url, "https://api.anthropic.com");
         assert_eq!(c.model, "claude-x");

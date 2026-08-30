@@ -15,6 +15,8 @@ pub struct OpenAIProvider {
     model: String,
     temperature: f32,
     max_tokens: usize,
+    timeout_secs: u64,
+    max_retries: usize,
 }
 
 impl OpenAIProvider {
@@ -25,6 +27,8 @@ impl OpenAIProvider {
             model: config.model.clone(),
             temperature: config.temperature,
             max_tokens: config.max_tokens,
+            timeout_secs: config.timeout_secs,
+            max_retries: config.max_retries,
         }
     }
 
@@ -131,8 +135,7 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
                 .pointer("/function/arguments")
                 .and_then(|v| v.as_str())
                 .unwrap_or("{}");
-            let args: Value =
-                serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
+            let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
             calls.push(ToolCall { id, name, args });
         }
         Ok(Response::ToolCalls(calls))
@@ -149,28 +152,19 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
 impl Provider for OpenAIProvider {
     fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Response, ProviderError> {
         let body = self.request(history, tools);
-        let mut req = ureq::post(&self.url()).set("Content-Type", "application/json");
-        if let Some(key) = &self.api_key {
-            req = req.set("Authorization", &format!("Bearer {key}"));
+        let auth = self.api_key.as_ref().map(|k| format!("Bearer {k}"));
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(a) = &auth {
+            headers.push(("Authorization", a.as_str()));
         }
-        match req.send_json(body) {
-            Ok(resp) => {
-                let value: Value =
-                    resp.into_json().map_err(|e| ProviderError::Malformed(e.to_string()))?;
-                parse_response(value)
-            }
-            Err(ureq::Error::Status(code, resp)) => {
-                let text = resp.into_string().unwrap_or_default();
-                if code == 401 || code == 403 {
-                    Err(ProviderError::Auth(format!("status {code}: {text}")))
-                } else if code == 408 || code == 429 {
-                    Err(ProviderError::Timeout(format!("status {code}: {text}")))
-                } else {
-                    Err(ProviderError::Http(format!("status {code}: {text}")))
-                }
-            }
-            Err(e) => Err(ProviderError::Http(e.to_string())),
-        }
+        let value = super::post_json(
+            &self.url(),
+            &headers,
+            body,
+            self.timeout_secs,
+            self.max_retries,
+        )?;
+        parse_response(value)
     }
 }
 
@@ -221,7 +215,10 @@ mod tests {
 
     #[test]
     fn message_conversion_produces_openai_shape() {
-        let m = Message::ToolResult { tool_call_id: "c".into(), result: "ok".into() };
+        let m = Message::ToolResult {
+            tool_call_id: "c".into(),
+            result: "ok".into(),
+        };
         let v = to_openai_message(&m);
         assert_eq!(v["role"], "tool");
         assert_eq!(v["tool_call_id"], "c");
@@ -232,10 +229,17 @@ mod tests {
     fn assistant_tool_calls_are_wrapped() {
         let m = Message::Assistant {
             text: None,
-            tool_calls: vec![ToolCall { id: "x".into(), name: "write".into(), args: json!({"path":"p"}) }],
+            tool_calls: vec![ToolCall {
+                id: "x".into(),
+                name: "write".into(),
+                args: json!({"path":"p"}),
+            }],
         };
         let v = to_openai_message(&m);
         assert_eq!(v["tool_calls"][0]["function"]["name"], "write");
-        assert_eq!(v["tool_calls"][0]["function"]["arguments"], "{\"path\":\"p\"}");
+        assert_eq!(
+            v["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"p\"}"
+        );
     }
 }

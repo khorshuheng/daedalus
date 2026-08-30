@@ -99,7 +99,5 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, ToolEr
 /// Resolve a tool-supplied path relative to the workspace, mapping an escape to
 /// a `ToolError::Escape`.
 pub(crate) fn resolve(workspace: &Workspace, rel: &Path) -> Result<std::path::PathBuf, ToolError> {
-    workspace
-        .resolve(rel)
-        .map_err(|e| ToolError::Escape(e))
+    workspace.resolve(rel).map_err(ToolError::Escape)
 }

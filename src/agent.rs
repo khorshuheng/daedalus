@@ -26,7 +26,10 @@ impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentError::IterationCap(n) => {
-                write!(f, "iteration cap exceeded: no final answer after {n} iterations")
+                write!(
+                    f,
+                    "iteration cap exceeded: no final answer after {n} iterations"
+                )
             }
             AgentError::Provider(e) => write!(f, "provider error: {e}"),
         }
@@ -89,18 +92,25 @@ impl<'a> Agent<'a> {
             match response {
                 Response::Text(text) => return Ok(text),
                 Response::ToolCalls(calls) => {
-                    for call in calls {
+                    // Execute every requested tool, then feed back one assistant
+                    // message carrying all tool calls followed by one tool-result
+                    // message per call (the shape OpenAI/Anthropic expect).
+                    let mut results = Vec::with_capacity(calls.len());
+                    for call in &calls {
                         let result = self.tools.execute(self.workspace, &call.name, &call.args);
                         let result_str = match result {
                             Ok(out) => out.content,
                             Err(e) => format!("tool error: {e}"),
                         };
-                        history.push(Message::Assistant {
-                            text: None,
-                            tool_calls: vec![call.clone()],
-                        });
+                        results.push((call.id.clone(), result_str));
+                    }
+                    history.push(Message::Assistant {
+                        text: None,
+                        tool_calls: calls,
+                    });
+                    for (id, result_str) in results {
                         history.push(Message::ToolResult {
-                            tool_call_id: call.id,
+                            tool_call_id: id,
                             result: result_str,
                         });
                     }
@@ -126,14 +136,22 @@ mod tests {
     }
 
     fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall { id: id.into(), name: name.into(), args }
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            args,
+        }
     }
 
     #[test]
     fn runs_multi_step_session_and_prints_final_answer() {
         let (_dir, ws) = workspace("multi");
         let fake = FakeProvider::new(vec![
-            Response::ToolCalls(vec![call("c1", "bash", serde_json::json!({"command": "echo hi"}))]),
+            Response::ToolCalls(vec![call(
+                "c1",
+                "bash",
+                serde_json::json!({"command": "echo hi"}),
+            )]),
             Response::Text("done here".into()),
         ]);
         let tools = ToolSet::new(1000);
@@ -158,12 +176,28 @@ mod tests {
     fn stops_after_max_iterations() {
         let (_dir, ws) = workspace("cap");
         let fake = FakeProvider::new(vec![
-            Response::ToolCalls(vec![call("c1", "bash", serde_json::json!({"command": "true"}))]),
-            Response::ToolCalls(vec![call("c2", "bash", serde_json::json!({"command": "true"}))]),
-            Response::ToolCalls(vec![call("c3", "bash", serde_json::json!({"command": "true"}))]),
+            Response::ToolCalls(vec![call(
+                "c1",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            )]),
+            Response::ToolCalls(vec![call(
+                "c2",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            )]),
+            Response::ToolCalls(vec![call(
+                "c3",
+                "bash",
+                serde_json::json!({"command": "true"}),
+            )]),
         ]);
         let tools = ToolSet::new(1000);
-        let cfg = Config { max_iterations: 2, workspace: _dir.clone(), ..Config::defaults(_dir.clone()) };
+        let cfg = Config {
+            max_iterations: 2,
+            workspace: _dir.clone(),
+            ..Config::defaults(_dir.clone())
+        };
         let agent = Agent::new(&fake, &tools, &ws, &cfg);
         let err = agent.run("keep going").unwrap_err();
         assert!(matches!(err, AgentError::IterationCap(2)));
@@ -177,13 +211,17 @@ mod tests {
             Response::Text("ok".into()),
         ]);
         let tools = ToolSet::new(1000);
-        let cfg = Config { max_iterations: 5, workspace: _dir.clone(), ..Config::defaults(_dir.clone()) };
+        let cfg = Config {
+            max_iterations: 5,
+            workspace: _dir.clone(),
+            ..Config::defaults(_dir.clone())
+        };
         let agent = Agent::new(&fake, &tools, &ws, &cfg);
         assert_eq!(agent.run("x").unwrap(), "ok");
         // The error was handed back as a tool result, not fatal.
         let last = fake.history(1);
-        assert!(last
-            .iter()
-            .any(|m| matches!(m, Message::ToolResult { result, .. } if result.contains("unknown tool"))));
+        assert!(last.iter().any(
+            |m| matches!(m, Message::ToolResult { result, .. } if result.contains("unknown tool"))
+        ));
     }
 }

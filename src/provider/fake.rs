@@ -40,7 +40,9 @@ impl FakeProvider {
         let h = self.histories.lock().unwrap();
         if let Some(last) = h.last() {
             last.iter().any(|m| match m {
-                Message::ToolResult { tool_call_id: id, .. } => id == tool_call_id,
+                Message::ToolResult {
+                    tool_call_id: id, ..
+                } => id == tool_call_id,
                 _ => false,
             })
         } else {
@@ -68,14 +70,21 @@ mod tests {
     #[test]
     fn plays_scripted_responses_then_final_text() {
         let p = FakeProvider::new(vec![
-            Response::ToolCalls(vec![ToolCall { id: "c".into(), name: "bash".into(), args: serde_json::json!({"command":"echo hi"}) }]),
+            Response::ToolCalls(vec![ToolCall {
+                id: "c".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command":"echo hi"}),
+            }]),
             Response::Text("final".into()),
         ]);
         assert!(matches!(
             p.complete(&[], &[]).unwrap(),
             Response::ToolCalls(_)
         ));
-        assert_eq!(p.complete(&[], &[]).unwrap(), Response::Text("final".into()));
+        assert_eq!(
+            p.complete(&[], &[]).unwrap(),
+            Response::Text("final".into())
+        );
         // Exhausted -> final "done".
         assert_eq!(p.complete(&[], &[]).unwrap(), Response::Text("done".into()));
     }
@@ -83,7 +92,10 @@ mod tests {
     #[test]
     fn records_history_and_tool_results() {
         let p = FakeProvider::new(vec![Response::Text("ok".into())]);
-        let hist = vec![Message::ToolResult { tool_call_id: "abc".into(), result: "r".into() }];
+        let hist = vec![Message::ToolResult {
+            tool_call_id: "abc".into(),
+            result: "r".into(),
+        }];
         p.complete(&hist, &[]).unwrap();
         assert_eq!(p.calls(), 1);
         assert!(p.saw_tool_result("abc"));

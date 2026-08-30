@@ -49,9 +49,7 @@ impl Tool for ReadTool {
                 String::new()
             } else {
                 lines[offset..std::cmp::min(offset + limit, lines.len())]
-                    .iter()
-                    .copied()
-                    .collect::<Vec<_>>()
+                    .to_vec()
                     .join("\n")
             }
         } else if offset == 0 {

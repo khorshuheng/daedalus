@@ -7,9 +7,7 @@ use serde_json::{json, Value};
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
 
-pub struct WriteTool {
-    pub max_output: usize,
-}
+pub struct WriteTool;
 
 impl Tool for WriteTool {
     fn name(&self) -> &'static str {
@@ -61,8 +59,9 @@ mod tests {
     #[test]
     fn creates_file() {
         let (ws, dir) = setup("create");
-        let tool = WriteTool { max_output: 1000 };
-        tool.run(&ws, &json!({"path": "b.txt", "content": "data"})).unwrap();
+        let tool = WriteTool;
+        tool.run(&ws, &json!({"path": "b.txt", "content": "data"}))
+            .unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "data");
     }
 
@@ -70,17 +69,21 @@ mod tests {
     fn overwrites_file() {
         let (ws, dir) = setup("overwrite");
         std::fs::write(dir.join("b.txt"), "old").unwrap();
-        let tool = WriteTool { max_output: 1000 };
-        tool.run(&ws, &json!({"path": "b.txt", "content": "new"})).unwrap();
+        let tool = WriteTool;
+        tool.run(&ws, &json!({"path": "b.txt", "content": "new"}))
+            .unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new");
     }
 
     #[test]
     fn creates_parent_dirs() {
         let (ws, dir) = setup("parents");
-        let tool = WriteTool { max_output: 1000 };
+        let tool = WriteTool;
         tool.run(&ws, &json!({"path": "a/b/c.txt", "content": "deep"}))
             .unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("a/b/c.txt")).unwrap(), "deep");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a/b/c.txt")).unwrap(),
+            "deep"
+        );
     }
 }

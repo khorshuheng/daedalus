@@ -21,7 +21,10 @@ impl Workspace {
             .canonicalize()
             .map_err(|e| format!("workspace '{}' cannot be resolved: {e}", root.display()))?;
         if !canon.is_dir() {
-            return Err(format!("workspace '{}' is not a directory", canon.display()));
+            return Err(format!(
+                "workspace '{}' is not a directory",
+                canon.display()
+            ));
         }
         Ok(Self { root: canon })
     }
