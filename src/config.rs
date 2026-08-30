@@ -66,6 +66,17 @@ impl ProviderKind {
             Self::Fake => "fake-model",
         }
     }
+
+    /// Default context-window size (input tokens) of the provider's default
+    /// model. Used to derive the history budget unless it is overridden.
+    pub fn preset_context_window(self) -> usize {
+        match self {
+            Self::Openai => 128_000,
+            Self::Deepseek => 64_000,
+            Self::Anthropic => 200_000,
+            Self::Fake => 128_000,
+        }
+    }
 }
 
 /// Fully-resolved configuration passed to the provider and the agent loop.
@@ -107,7 +118,8 @@ impl Config {
             max_tokens: 2048,
             timeout_secs: 60,
             max_retries: 2,
-            max_context_tokens: 64_000,
+            // Leave headroom for the completion output (max_tokens).
+            max_context_tokens: provider.preset_context_window().saturating_sub(4_096),
             workspace,
         }
     }
@@ -291,7 +303,10 @@ impl Overrides {
                 return Err("timeout_secs must be >= 1".into());
             }
         }
-        if self.max_context_tokens.unwrap_or(64_000) == 0 {
+        let max_context_tokens = self
+            .max_context_tokens
+            .unwrap_or_else(|| provider.preset_context_window().saturating_sub(4_096));
+        if max_context_tokens == 0 {
             return Err("max_context_tokens must be >= 1".into());
         }
 
@@ -306,7 +321,7 @@ impl Overrides {
             max_tokens: self.max_tokens.unwrap_or(2048),
             timeout_secs: self.timeout_secs.unwrap_or(60),
             max_retries: self.max_retries.unwrap_or(2),
-            max_context_tokens: self.max_context_tokens.unwrap_or(64_000),
+            max_context_tokens,
             workspace,
         })
     }
@@ -375,7 +390,7 @@ mod tests {
         assert_eq!(c.provider, ProviderKind::Openai);
         assert_eq!(c.base_url, "https://api.openai.com");
         assert_eq!(c.max_iterations, 30);
-        assert_eq!(c.max_context_tokens, 64_000);
+        assert_eq!(c.max_context_tokens, 128_000 - 4_096);
     }
 
     #[test]
@@ -388,6 +403,7 @@ mod tests {
         assert_eq!(c.provider, ProviderKind::Deepseek);
         assert_eq!(c.base_url, "https://api.deepseek.com");
         assert_eq!(c.model, "deepseek-chat");
+        assert_eq!(c.max_context_tokens, 64_000 - 4_096);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use serde_json::Value;
 
-use super::{Message, Provider, ProviderError, Response};
+use super::{Completion, Message, Provider, ProviderError, Response};
 
 pub struct FakeProvider {
     responses: Mutex<VecDeque<Response>>,
@@ -52,13 +52,17 @@ impl FakeProvider {
 }
 
 impl Provider for FakeProvider {
-    fn complete(&self, history: &[Message], _tools: &[Value]) -> Result<Response, ProviderError> {
+    fn complete(&self, history: &[Message], _tools: &[Value]) -> Result<Completion, ProviderError> {
         self.histories.lock().unwrap().push(history.to_vec());
         let mut q = self.responses.lock().unwrap();
-        match q.pop_front() {
-            Some(r) => Ok(r),
-            None => Ok(Response::Text("done".into())),
-        }
+        let response = match q.pop_front() {
+            Some(r) => r,
+            None => Response::Text("done".into()),
+        };
+        Ok(Completion {
+            response,
+            prompt_tokens: None,
+        })
     }
 }
 
@@ -78,15 +82,18 @@ mod tests {
             Response::Text("final".into()),
         ]);
         assert!(matches!(
-            p.complete(&[], &[]).unwrap(),
+            p.complete(&[], &[]).unwrap().response,
             Response::ToolCalls(_)
         ));
         assert_eq!(
-            p.complete(&[], &[]).unwrap(),
+            p.complete(&[], &[]).unwrap().response,
             Response::Text("final".into())
         );
         // Exhausted -> final "done".
-        assert_eq!(p.complete(&[], &[]).unwrap(), Response::Text("done".into()));
+        assert_eq!(
+            p.complete(&[], &[]).unwrap().response,
+            Response::Text("done".into())
+        );
     }
 
     #[test]

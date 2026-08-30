@@ -53,6 +53,15 @@ pub enum Response {
     TruncatedToolCalls(Vec<ToolCall>),
 }
 
+/// A provider completion: the response plus the exact prompt/input token count
+/// reported by the provider. The token count anchors context budgeting; it is
+/// `None` when the provider does not report it (e.g. the fake provider).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Completion {
+    pub response: Response,
+    pub prompt_tokens: Option<usize>,
+}
+
 /// Typed provider errors, surfaced clearly at the loop boundary.
 #[derive(Debug)]
 pub enum ProviderError {
@@ -78,8 +87,9 @@ impl std::error::Error for ProviderError {}
 /// A chat + tool-calling backend. Implementations must be `Send + Sync` so the
 /// loop can hold them behind `Box<dyn Provider>`.
 pub trait Provider: Send + Sync {
-    /// Send `history` plus the tool schemas and return text or tool calls.
-    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Response, ProviderError>;
+    /// Send `history` plus the tool schemas and return the completion (text or
+    /// tool calls) together with any reported prompt token usage.
+    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Completion, ProviderError>;
 }
 
 /// Build the provider selected by `config`. DeepSeek reuses the OpenAI client

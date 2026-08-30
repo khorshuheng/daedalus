@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use super::{Message, Provider, ProviderError, Response, ToolCall};
+use super::{Completion, Message, Provider, ProviderError, Response, ToolCall};
 use crate::config::Config;
 
 pub struct AnthropicProvider {
@@ -159,7 +159,7 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
 }
 
 impl Provider for AnthropicProvider {
-    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Response, ProviderError> {
+    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Completion, ProviderError> {
         let body = self.request(history, tools);
         let mut headers: Vec<(&str, &str)> = vec![("anthropic-version", "2023-06-01")];
         if let Some(key) = self.api_key.as_deref() {
@@ -172,7 +172,16 @@ impl Provider for AnthropicProvider {
             self.timeout_secs,
             self.max_retries,
         )?;
-        parse_response(value)
+        let prompt_tokens = value
+            .get("usage")
+            .and_then(|u| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let response = parse_response(value)?;
+        Ok(Completion {
+            response,
+            prompt_tokens,
+        })
     }
 }
 

@@ -67,11 +67,31 @@ fn total_tokens(messages: &[Message]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+/// Estimate the total tokens of `history`, using `anchor_tokens` as the exact
+/// count of `history[..anchor_len]` (reported by the last provider completion)
+/// plus a chars/4 estimate of anything appended since.
+fn anchored_total(history: &[Message], anchor_tokens: usize, anchor_len: usize) -> usize {
+    if anchor_len > history.len() {
+        // The anchor was invalidated by trimming; fall back to a full estimate.
+        return total_tokens(history);
+    }
+    anchor_tokens + total_tokens(&history[anchor_len..])
+}
+
 /// Drop the oldest assistant-turn blocks (an `Assistant` tool-call message
 /// followed by its `ToolResult` messages) while the history exceeds `budget`.
-/// The system + user seed (`seed_len`) is never dropped.
-fn trim_history(history: &mut Vec<Message>, seed_len: usize, budget: usize) {
-    while total_tokens(history) > budget && history.len() > seed_len {
+/// The system + user seed (`seed_len`) is never dropped. Removing part of the
+/// measured prefix invalidates the usage anchor, which the next completion
+/// re-anchors with an exact count.
+fn trim_history(
+    history: &mut Vec<Message>,
+    seed_len: usize,
+    budget: usize,
+    anchor_tokens: &mut usize,
+    anchor_len: &mut usize,
+) {
+    while anchored_total(history, *anchor_tokens, *anchor_len) > budget && history.len() > seed_len
+    {
         let Some(first_assistant) = history
             .iter()
             .position(|m| matches!(m, Message::Assistant { .. }))
@@ -81,6 +101,10 @@ fn trim_history(history: &mut Vec<Message>, seed_len: usize, budget: usize) {
         let mut end = first_assistant + 1;
         while end < history.len() && matches!(history[end], Message::ToolResult { .. }) {
             end += 1;
+        }
+        if first_assistant < *anchor_len {
+            *anchor_tokens = 0;
+            *anchor_len = 0;
         }
         history.drain(first_assistant..end);
     }
@@ -155,18 +179,32 @@ impl<'a> Agent<'a> {
         let seed_len = history.len();
         let schemas = self.tools.tool_schemas();
         let mut iterations = 0usize;
+        // Exact token count of history[..anchor_len], reported by the last
+        // provider completion. Before the first completion we estimate all.
+        let mut anchor_tokens = 0usize;
+        let mut anchor_len = 0usize;
 
         loop {
             if iterations >= self.config.max_iterations {
                 return Err(AgentError::IterationCap(self.config.max_iterations));
             }
-            trim_history(&mut history, seed_len, self.config.max_context_tokens);
-            let response = self
+            trim_history(
+                &mut history,
+                seed_len,
+                self.config.max_context_tokens,
+                &mut anchor_tokens,
+                &mut anchor_len,
+            );
+            let completion = self
                 .provider
                 .complete(&history, &schemas)
                 .map_err(AgentError::Provider)?;
+            if let Some(tokens) = completion.prompt_tokens {
+                anchor_tokens = tokens;
+                anchor_len = history.len();
+            }
 
-            match response {
+            match completion.response {
                 Response::Text(text) => return Ok(text),
                 Response::ToolCalls(calls) => self.push_tool_results(&mut history, calls, false),
                 Response::TruncatedToolCalls(calls) => {
@@ -331,7 +369,9 @@ mod tests {
                 result: "x".repeat(400),
             },
         ];
-        trim_history(&mut h, 2, 130);
+        let mut anchor_tokens = 0;
+        let mut anchor_len = 0;
+        trim_history(&mut h, 2, 130, &mut anchor_tokens, &mut anchor_len);
         assert_eq!(h.len(), 4);
         assert!(matches!(&h[0], Message::System(_)));
         assert!(matches!(&h[1], Message::User(_)));
@@ -339,5 +379,15 @@ mod tests {
             Message::Assistant { tool_calls, .. } => assert_eq!(tool_calls[0].id, "b"),
             _ => panic!("expected assistant message"),
         }
+    }
+
+    #[test]
+    fn anchored_total_prefers_exact_anchor() {
+        let h = vec![Message::System("s".into()), Message::User("p".into())];
+        // The exact anchor (5 tokens for the whole 2-message prefix) is used
+        // directly rather than re-estimated.
+        assert_eq!(anchored_total(&h, 5, 2), 5);
+        // An anchor pointing past the history is invalid, so we estimate all.
+        assert!(anchored_total(&h, 5, 99) > 0);
     }
 }
