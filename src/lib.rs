@@ -7,6 +7,7 @@
 //! - `agent` (CRAB-104): the bounded orchestration loop.
 //! - `main` (CRAB-101): the CLI entrypoint.
 
+pub mod agent;
 pub mod config;
 pub mod provider;
 pub mod tools;
