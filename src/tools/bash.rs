@@ -1,4 +1,8 @@
 //! The `bash` tool: run a shell command in the workspace directory.
+//!
+//! Known limitation: a command that backgrounds a process while keeping
+//! stdout/stderr open (e.g. `sh -c "sleep 100 &"`) will block until that
+//! process exits, because the readers wait for the pipes to reach EOF.
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -51,8 +55,11 @@ fn run_command(command: &str, cwd: &Path, timeout_secs: Option<u64>) -> Result<O
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        let _ = out_handle.join();
-                        let _ = err_handle.join();
+                        // Do NOT join the reader threads here: a grandchild of
+                        // `sh` (e.g. `sh -c "a && b"`) may still hold the pipe
+                        // write end open, so joining would block past the
+                        // deadline. The threads are abandoned and finish once
+                        // every writer has exited.
                         return Err(ToolError::Timeout(format!(
                             "after {} seconds",
                             timeout_secs.unwrap()
@@ -221,5 +228,20 @@ mod tests {
             .run(&ws, &json!({"command": "sleep 5", "timeout": 1}))
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    #[test]
+    fn timeout_returns_promptly_when_command_forks() {
+        let (ws, _dir) = setup("timeout-fork");
+        let tool = BashTool { max_output: 1000 };
+        let start = std::time::Instant::now();
+        let err = tool
+            .run(
+                &ws,
+                &json!({"command": "sleep 2 && echo done", "timeout": 1}),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Timeout(_)));
+        assert!(start.elapsed() < std::time::Duration::from_millis(1500));
     }
 }

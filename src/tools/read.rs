@@ -81,6 +81,12 @@ impl Tool for ReadTool {
         let total_lines = lines.len();
         let start = offset - 1; // 0-based
 
+        if total_lines == 0 {
+            return Ok(ToolOutput {
+                content: "(empty file)".to_string(),
+            });
+        }
+
         if start >= total_lines {
             return Err(ToolError::Argument(format!(
                 "offset {offset} is beyond end of file ({total_lines} lines total)"
@@ -194,6 +200,14 @@ mod tests {
             out.content,
             "l0\nl1\n\n[3 more lines in file. Use offset=3 to continue.]"
         );
+    }
+
+    #[test]
+    fn reads_empty_file() {
+        let (ws, _dir) = setup("empty", "");
+        let tool = ReadTool { max_output: 1000 };
+        let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
+        assert_eq!(out.content, "(empty file)");
     }
 
     #[test]
