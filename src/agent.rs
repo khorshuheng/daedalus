@@ -8,12 +8,12 @@
 //! deterministic.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 
 use crate::config::Config;
 use crate::provider::{Message, Provider, ProviderError, Response, ToolCall};
 use crate::tools::resolver::ToolSet;
+use crate::tools::ToolError;
 use crate::workspace::Workspace;
 
 /// Terminal failures of a session.
@@ -119,49 +119,6 @@ pub struct Agent<'a> {
     config: &'a Config,
 }
 
-/// Shared steering state between the stdin reader thread and the agent loop.
-/// `steer` posts a message and cancels the in-flight generation; the loop
-/// consumes the message on the next turn and resumes.
-pub struct Steering {
-    cancel: AtomicBool,
-    message: Mutex<Option<String>>,
-}
-
-impl Default for Steering {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Steering {
-    pub fn new() -> Self {
-        Self {
-            cancel: AtomicBool::new(false),
-            message: Mutex::new(None),
-        }
-    }
-
-    /// Post a steering message and request cancellation of the current turn.
-    pub fn steer(&self, msg: String) {
-        *self.message.lock().unwrap() = Some(msg);
-        self.cancel.store(true, Ordering::SeqCst);
-    }
-
-    /// The cancel flag checked by providers between streamed chunks.
-    pub fn cancel_flag(&self) -> &AtomicBool {
-        &self.cancel
-    }
-
-    /// Take the pending steering message, clearing the cancel flag if present.
-    pub fn take_message(&self) -> Option<String> {
-        let msg = self.message.lock().unwrap().take();
-        if msg.is_some() {
-            self.cancel.store(false, Ordering::SeqCst);
-        }
-        msg
-    }
-}
-
 impl<'a> Agent<'a> {
     pub fn new(
         provider: &'a dyn Provider,
@@ -197,12 +154,20 @@ impl<'a> Agent<'a> {
 
     /// Execute a batch of tool calls (or, when `fail_all`, report each as not
     /// executed because the response was truncated) and append the assistant
-    /// message plus one tool-result per call to `history`.
-    fn push_tool_results(&self, history: &mut Vec<Message>, calls: Vec<ToolCall>, fail_all: bool) {
+    /// message plus one tool-result per call to `history`. Returns true if a
+    /// tool was cancelled.
+    fn push_tool_results(
+        &self,
+        history: &mut Vec<Message>,
+        calls: Vec<ToolCall>,
+        fail_all: bool,
+        cancel: &AtomicBool,
+    ) -> bool {
         history.push(Message::Assistant {
             text: None,
             tool_calls: calls.clone(),
         });
+        let mut cancelled = false;
         for call in &calls {
             let result_str = if fail_all {
                 format!(
@@ -210,9 +175,15 @@ impl<'a> Agent<'a> {
                     call.name
                 )
             } else {
-                match self.tools.execute(self.workspace, &call.name, &call.args) {
+                match self
+                    .tools
+                    .execute(self.workspace, &call.name, &call.args, cancel)
+                {
                     Ok(out) => out.content,
-                    Err(e) => format!("tool error: {e}"),
+                    Err(e) => {
+                        cancelled = matches!(e, ToolError::Cancelled);
+                        format!("tool error: {e}")
+                    }
                 }
             };
             history.push(Message::ToolResult {
@@ -220,53 +191,85 @@ impl<'a> Agent<'a> {
                 result: result_str,
             });
         }
+        cancelled
     }
 
-    /// Run a bounded agentic session for `prompt`, returning the final answer.
+    /// Run a one-shot, non-interactive session and return the final answer.
     pub fn run(&self, prompt: &str) -> Result<String, AgentError> {
-        self.run_impl(prompt, None)
+        let cancel = AtomicBool::new(false);
+        let mut session = Session::new(self, prompt, &cancel);
+        match session.run_turn()? {
+            Turn::Final(text) => Ok(text),
+            Turn::Cancelled(_) => Ok(String::new()),
+        }
     }
+}
 
-    /// Run a session that can be steered: the `Steering` handle is checked for
-    /// a pending user message and cancellation between turns and mid-stream.
-    pub fn run_steered(&self, prompt: &str, steering: &Steering) -> Result<String, AgentError> {
-        self.run_impl(prompt, Some(steering))
-    }
+/// The outcome of a single agent turn.
+pub enum Turn {
+    /// A final answer from the model.
+    Final(String),
+    /// The turn was cancelled; `String` holds any partial text (kept).
+    Cancelled(String),
+}
 
-    fn run_impl(&self, prompt: &str, steering: Option<&Steering>) -> Result<String, AgentError> {
-        let mut history = vec![
-            Message::System(self.system_prompt()),
+/// A persistent agent session that owns the message history, so a cancelled
+/// turn can be steered and resumed (the REPL model).
+pub struct Session<'a, 'inner> {
+    agent: &'a Agent<'inner>,
+    history: Vec<Message>,
+    schemas: Vec<serde_json::Value>,
+    anchor_tokens: usize,
+    anchor_len: usize,
+    cancel: &'a AtomicBool,
+}
+
+impl<'a, 'inner> Session<'a, 'inner> {
+    pub fn new(agent: &'a Agent<'inner>, prompt: &str, cancel: &'a AtomicBool) -> Self {
+        let history = vec![
+            Message::System(agent.system_prompt()),
             Message::User(prompt.to_string()),
         ];
-        let seed_len = history.len();
-        let schemas = self.tools.tool_schemas();
-        let mut iterations = 0usize;
-        // Exact token count of history[..anchor_len], reported by the last
-        // provider completion. Before the first completion we estimate all.
-        let mut anchor_tokens = 0usize;
-        let mut anchor_len = 0usize;
-        // A dummy cancel flag for non-interactive runs.
-        let no_cancel = AtomicBool::new(false);
-        let cancel = steering.map(|s| s.cancel_flag()).unwrap_or(&no_cancel);
+        let schemas = agent.tools.tool_schemas();
+        Self {
+            agent,
+            history,
+            schemas,
+            anchor_tokens: 0,
+            anchor_len: 0,
+            cancel,
+        }
+    }
 
+    /// Inject a follow-up user message for the next turn.
+    pub fn resume(&mut self, msg: String) {
+        self.history.push(Message::User(msg));
+    }
+
+    /// Run one turn (complete -> tools -> repeat) until a final answer,
+    /// cancellation, or error.
+    pub fn run_turn(&mut self) -> Result<Turn, AgentError> {
+        let seed_len = 2; // [System, first User] are never trimmed.
+        let mut iterations = 0usize;
         loop {
-            if iterations >= self.config.max_iterations {
-                return Err(AgentError::IterationCap(self.config.max_iterations));
+            if iterations >= self.agent.config.max_iterations {
+                return Err(AgentError::IterationCap(self.agent.config.max_iterations));
             }
             trim_history(
-                &mut history,
+                &mut self.history,
                 seed_len,
-                self.config.max_context_tokens,
-                &mut anchor_tokens,
-                &mut anchor_len,
+                self.agent.config.max_context_tokens,
+                &mut self.anchor_tokens,
+                &mut self.anchor_len,
             );
             let completion = self
+                .agent
                 .provider
-                .complete(&history, &schemas, cancel)
+                .complete(&self.history, &self.schemas, self.cancel)
                 .map_err(AgentError::Provider)?;
             if let Some(tokens) = completion.prompt_tokens {
-                anchor_tokens = tokens;
-                anchor_len = history.len();
+                self.anchor_tokens = tokens;
+                self.anchor_len = self.history.len();
             }
 
             if completion.aborted {
@@ -276,26 +279,27 @@ impl<'a> Agent<'a> {
                 };
                 // Keep the partial text so the model sees what it was saying.
                 if !partial.is_empty() {
-                    history.push(Message::Assistant {
+                    self.history.push(Message::Assistant {
                         text: Some(partial.clone()),
                         tool_calls: vec![],
                     });
                 }
-                if let Some(s) = steering {
-                    if let Some(msg) = s.take_message() {
-                        history.push(Message::User(msg));
-                        continue;
-                    }
-                }
-                // Cancelled with no steering message: stop and return what we had.
-                return Ok(partial);
+                return Ok(Turn::Cancelled(partial));
             }
 
             match completion.response {
-                Response::Text(text) => return Ok(text),
-                Response::ToolCalls(calls) => self.push_tool_results(&mut history, calls, false),
+                Response::Text(text) => return Ok(Turn::Final(text)),
+                Response::ToolCalls(calls) => {
+                    if self
+                        .agent
+                        .push_tool_results(&mut self.history, calls, false, self.cancel)
+                    {
+                        return Ok(Turn::Cancelled(String::new()));
+                    }
+                }
                 Response::TruncatedToolCalls(calls) => {
-                    self.push_tool_results(&mut history, calls, true)
+                    self.agent
+                        .push_tool_results(&mut self.history, calls, true, self.cancel);
                 }
             }
             iterations += 1;
@@ -308,6 +312,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::provider::{fake::FakeProvider, ToolCall};
+    use std::sync::Mutex;
 
     fn workspace(name: &str) -> (std::path::PathBuf, Workspace) {
         let dir = std::env::temp_dir().join(format!("crab-agent-{name}-{}", std::process::id()));
@@ -506,9 +511,9 @@ mod tests {
     }
 
     #[test]
-    fn steering_injects_message_and_resumes() {
-        let (_dir, ws) = workspace("steer");
-        let steering = Steering::new();
+    fn session_cancel_then_resume() {
+        let (_dir, ws) = workspace("session");
+        let cancel = AtomicBool::new(false);
 
         let provider = ScriptedProvider {
             completions: Mutex::new(std::collections::VecDeque::from([
@@ -534,18 +539,25 @@ mod tests {
         };
         let agent = Agent::new(&provider, &tools, &ws, &cfg);
 
-        steering.steer("stop, do this instead".into());
-        let answer = agent.run_steered("initial prompt", &steering).unwrap();
-        assert_eq!(answer, "fixed answer");
+        let mut session = Session::new(&agent, "initial prompt", &cancel);
+        let first = session.run_turn().unwrap();
+        assert!(matches!(first, Turn::Cancelled(_)));
+
+        session.resume("stop, do this instead".into());
+        let second = session.run_turn().unwrap();
+        match second {
+            Turn::Final(text) => assert_eq!(text, "fixed answer"),
+            _ => panic!("expected final answer"),
+        }
 
         // The second completion saw the partial assistant text + steering line.
         let histories = provider.histories.lock().unwrap();
         assert_eq!(histories.len(), 2);
-        let second = &histories[1];
-        assert!(second.iter().any(
+        let second_history = &histories[1];
+        assert!(second_history.iter().any(
             |m| matches!(m, Message::Assistant { text: Some(t), .. } if t == "going the wrong way")
         ));
-        assert!(second
+        assert!(second_history
             .iter()
             .any(|m| matches!(m, Message::User(u) if u == "stop, do this instead")));
     }

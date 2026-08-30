@@ -10,5 +10,6 @@
 pub mod agent;
 pub mod config;
 pub mod provider;
+pub mod term;
 pub mod tools;
 pub mod workspace;

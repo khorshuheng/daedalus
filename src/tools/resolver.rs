@@ -1,6 +1,8 @@
 //! The resolver maps a `{name, args}` pair to the correct tool executor and
 //! surfaces unknown-tool / bad-args / not-found errors clearly.
 
+use std::sync::atomic::AtomicBool;
+
 use serde_json::{json, Value};
 
 use super::{
@@ -74,9 +76,10 @@ impl ToolSet {
         workspace: &Workspace,
         name: &str,
         args: &Value,
+        cancel: &AtomicBool,
     ) -> Result<ToolOutput, ToolError> {
         match self.tool(name) {
-            Some(tool) => tool.run(workspace, args),
+            Some(tool) => tool.run(workspace, args, cancel),
             None => Err(ToolError::Argument(format!(
                 "unknown tool '{name}' (expected read, bash, edit, write)"
             ))),
@@ -101,7 +104,12 @@ mod tests {
         let ts = ToolSet::new(1000);
 
         let out = ts
-            .execute(&ws, "bash", &json!({"command": "echo hi"}))
+            .execute(
+                &ws,
+                "bash",
+                &json!({"command": "echo hi"}),
+                &AtomicBool::new(false),
+            )
             .unwrap();
         assert!(out.content.contains("hi"));
     }
@@ -110,7 +118,9 @@ mod tests {
     fn unknown_tool_is_clear_error() {
         let ws = workspace("unknown");
         let ts = ToolSet::new(1000);
-        let err = ts.execute(&ws, "frobnicate", &json!({})).unwrap_err();
+        let err = ts
+            .execute(&ws, "frobnicate", &json!({}), &AtomicBool::new(false))
+            .unwrap_err();
         assert!(err.to_string().contains("unknown tool 'frobnicate'"));
         assert!(err.to_string().contains("read, bash, edit, write"));
     }

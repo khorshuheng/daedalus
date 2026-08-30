@@ -12,6 +12,7 @@ pub mod write;
 
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
@@ -40,6 +41,8 @@ pub enum ToolError {
     Command(String),
     /// A command exceeded its timeout.
     Timeout(String),
+    /// The tool was interrupted by a cancellation request.
+    Cancelled,
 }
 
 impl fmt::Display for ToolError {
@@ -52,6 +55,7 @@ impl fmt::Display for ToolError {
             ToolError::Escape(m) => write!(f, "path escaped: {m}"),
             ToolError::Command(m) => write!(f, "{m}"),
             ToolError::Timeout(m) => write!(f, "command timed out: {m}"),
+            ToolError::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -64,7 +68,12 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     /// JSON Schema describing the accepted arguments.
     fn schema(&self) -> Value;
-    fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError>;
+    fn run(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError>;
 }
 
 /// Truncate `s` to at most `max` bytes keeping the *tail* (last bytes),

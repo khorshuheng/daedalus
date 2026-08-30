@@ -146,6 +146,7 @@ fn cli_smoke_fake_provider() {
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hello", "--provider", "fake", "--dir"])
         .arg(&tmp.0)
+        .stdin(std::process::Stdio::null())
         .output()
         .expect("run crab binary");
     assert!(
@@ -164,6 +165,7 @@ fn cli_smoke_unknown_provider_fails() {
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hi", "--provider", "nope", "--dir"])
         .arg(&tmp.0)
+        .stdin(std::process::Stdio::null())
         .output()
         .expect("run crab binary");
     assert!(!out.status.success());

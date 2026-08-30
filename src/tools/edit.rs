@@ -8,6 +8,7 @@
 //! together, so disjoint replacements cannot interfere.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
@@ -209,7 +210,12 @@ impl Tool for EditTool {
         })
     }
 
-    fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        _cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let edits: Vec<(String, String)> =
             if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
@@ -324,6 +330,7 @@ mod tests {
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "world", "newText": "there"}),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(read(&dir), "hello there");
@@ -337,6 +344,7 @@ mod tests {
             .run(
                 &ws,
                 &json!({"path": "a.txt", "oldText": "zzz", "newText": "x"}),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
@@ -350,6 +358,7 @@ mod tests {
             .run(
                 &ws,
                 &json!({"path": "a.txt", "oldText": "a", "newText": "b"}),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
@@ -365,6 +374,7 @@ mod tests {
                 {"oldText": "one", "newText": "1"},
                 {"oldText": "three", "newText": "3"}
             ]}),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(read(&dir), "1 two 3");
@@ -377,6 +387,7 @@ mod tests {
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "line two", "newText": "LINE TWO"}),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(read(&dir), "line one\r\nLINE TWO\r\nline three\r\n");
@@ -390,6 +401,7 @@ mod tests {
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "don't", "newText": "do not"}),
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(read(&dir), "do not panic");
@@ -406,6 +418,7 @@ mod tests {
                     {"oldText": "hello", "newText": "hi"},
                     {"oldText": "hello world", "newText": "bye"}
                 ]}),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));

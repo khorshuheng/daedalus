@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
@@ -19,7 +20,12 @@ pub struct BashTool {
 /// Run `sh -c <command>` capturing stdout/stderr, with an optional timeout in
 /// seconds. Both pipes are drained on background threads so a chatty child
 /// cannot deadlock the parent on a full pipe buffer while we wait.
-fn run_command(command: &str, cwd: &Path, timeout_secs: Option<u64>) -> Result<Output, ToolError> {
+fn run_command(
+    command: &str,
+    cwd: &Path,
+    timeout_secs: Option<u64>,
+    cancel: &AtomicBool,
+) -> Result<Output, ToolError> {
     use std::io::Read;
     use std::time::{Duration, Instant};
 
@@ -51,6 +57,11 @@ fn run_command(command: &str, cwd: &Path, timeout_secs: Option<u64>) -> Result<O
         match child.try_wait().map_err(|e| ToolError::Io(e.to_string()))? {
             Some(status) => break status,
             None => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ToolError::Cancelled);
+                }
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
@@ -114,7 +125,12 @@ impl Tool for BashTool {
         })
     }
 
-    fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError> {
         let command = arg_string(args, "command")?;
         let timeout = match arg_usize(args, "timeout")? {
             Some(0) => return Err(ToolError::Argument("'timeout' must be >= 1".into())),
@@ -122,7 +138,7 @@ impl Tool for BashTool {
             None => None,
         };
 
-        let output = run_command(&command, workspace.root(), timeout)?;
+        let output = run_command(&command, workspace.root(), timeout, cancel)?;
 
         let mut text = String::new();
         if !output.stdout.is_empty() {
@@ -181,7 +197,13 @@ mod tests {
     fn captures_stdout_and_exit_code() {
         let (ws, _dir) = setup("out");
         let tool = BashTool { max_output: 1000 };
-        let out = tool.run(&ws, &json!({"command": "echo hello"})).unwrap();
+        let out = tool
+            .run(
+                &ws,
+                &json!({"command": "echo hello"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("exit code: 0"));
     }
@@ -191,7 +213,11 @@ mod tests {
         let (ws, _dir) = setup("err");
         let tool = BashTool { max_output: 1000 };
         let err = tool
-            .run(&ws, &json!({"command": "echo boo 1>&2; exit 3"}))
+            .run(
+                &ws,
+                &json!({"command": "echo boo 1>&2; exit 3"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("stderr:"));
@@ -204,7 +230,13 @@ mod tests {
         let (ws, dir) = setup("pwd");
         std::fs::write(dir.join("marker.txt"), "x").unwrap();
         let tool = BashTool { max_output: 1000 };
-        let out = tool.run(&ws, &json!({"command": "ls"})).unwrap();
+        let out = tool
+            .run(
+                &ws,
+                &json!({"command": "ls"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert!(out.content.contains("marker.txt"));
     }
 
@@ -214,7 +246,11 @@ mod tests {
         let tool = BashTool { max_output: 64 };
         // 10000 '1's: the tail (last bytes) is kept, the head is dropped.
         let out = tool
-            .run(&ws, &json!({"command": "printf '%.0s1' {1..10000}"}))
+            .run(
+                &ws,
+                &json!({"command": "printf '%.0s1' {1..10000}"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap();
         assert!(out.content.contains("[truncated"));
         assert!(out.content.contains("[full output:"));
@@ -225,7 +261,11 @@ mod tests {
         let (ws, _dir) = setup("timeout");
         let tool = BashTool { max_output: 1000 };
         let err = tool
-            .run(&ws, &json!({"command": "sleep 5", "timeout": 1}))
+            .run(
+                &ws,
+                &json!({"command": "sleep 5", "timeout": 1}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
     }
@@ -239,9 +279,27 @@ mod tests {
             .run(
                 &ws,
                 &json!({"command": "sleep 2 && echo done", "timeout": 1}),
+                &std::sync::atomic::AtomicBool::new(false),
             )
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
         assert!(start.elapsed() < std::time::Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn cancel_kills_running_command() {
+        use std::sync::atomic::Ordering;
+
+        let (ws, _dir) = setup("cancel");
+        let tool = BashTool { max_output: 1000 };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel2 = std::sync::Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
+            tool.run(&ws, &json!({"command": "sleep 5"}), cancel2.as_ref())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        cancel.store(true, Ordering::SeqCst);
+        let result = handle.join().unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 }

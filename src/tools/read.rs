@@ -1,6 +1,7 @@
 //! The `read` tool: read a file, optionally a line range.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
@@ -57,7 +58,12 @@ impl Tool for ReadTool {
         })
     }
 
-    fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        _cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let offset = arg_usize(args, "offset")?.unwrap_or(1);
         if offset == 0 {
@@ -155,7 +161,13 @@ mod tests {
     fn reads_full_file() {
         let (ws, _dir) = setup("full", "line1\nline2\nline3\n");
         let tool = ReadTool { max_output: 1000 };
-        let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "a.txt"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert_eq!(out.content, "line1\nline2\nline3");
     }
 
@@ -165,7 +177,11 @@ mod tests {
         let tool = ReadTool { max_output: 1000 };
         // offset=4 starts at "l3"; limit=2 reaches the end of the file.
         let out = tool
-            .run(&ws, &json!({"path": "a.txt", "offset": 4, "limit": 2}))
+            .run(
+                &ws,
+                &json!({"path": "a.txt", "offset": 4, "limit": 2}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(out.content, "l3\nl4");
     }
@@ -175,7 +191,11 @@ mod tests {
         let (ws, _dir) = setup("missing", "x\n");
         let tool = ReadTool { max_output: 1000 };
         assert!(matches!(
-            tool.run(&ws, &json!({"path": "nope.txt"})),
+            tool.run(
+                &ws,
+                &json!({"path": "nope.txt"}),
+                &std::sync::atomic::AtomicBool::new(false)
+            ),
             Err(ToolError::NotFound(_))
         ));
     }
@@ -184,7 +204,13 @@ mod tests {
     fn caps_output_and_reports_continuation_offset() {
         let (ws, _dir) = setup("cap", &"y\n".repeat(5000));
         let tool = ReadTool { max_output: 64 };
-        let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "a.txt"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert!(out.content.contains("[Showing lines 1-"));
         assert!(out.content.contains("Use offset="));
     }
@@ -194,7 +220,11 @@ mod tests {
         let (ws, _dir) = setup("limit", "l0\nl1\nl2\nl3\nl4\n");
         let tool = ReadTool { max_output: 1000 };
         let out = tool
-            .run(&ws, &json!({"path": "a.txt", "offset": 1, "limit": 2}))
+            .run(
+                &ws,
+                &json!({"path": "a.txt", "offset": 1, "limit": 2}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
             .unwrap();
         assert_eq!(
             out.content,
@@ -206,7 +236,13 @@ mod tests {
     fn reads_empty_file() {
         let (ws, _dir) = setup("empty", "");
         let tool = ReadTool { max_output: 1000 };
-        let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "a.txt"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert_eq!(out.content, "(empty file)");
     }
 
@@ -214,7 +250,13 @@ mod tests {
     fn huge_single_line_gets_targeted_hint() {
         let (ws, _dir) = setup("hugeline", &"z".repeat(5000));
         let tool = ReadTool { max_output: 64 };
-        let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "a.txt"}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap();
         assert!(out.content.contains("exceeds 64 limit"));
         assert!(out.content.contains("sed -n '1p'"));
     }

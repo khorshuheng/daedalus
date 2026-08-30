@@ -1,6 +1,7 @@
 //! The `write` tool: create or overwrite a file in the workspace.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 use serde_json::{json, Value};
 
@@ -25,7 +26,12 @@ impl Tool for WriteTool {
         })
     }
 
-    fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        _cancel: &AtomicBool,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let content = args
             .get("content")
@@ -60,8 +66,12 @@ mod tests {
     fn creates_file() {
         let (ws, dir) = setup("create");
         let tool = WriteTool;
-        tool.run(&ws, &json!({"path": "b.txt", "content": "data"}))
-            .unwrap();
+        tool.run(
+            &ws,
+            &json!({"path": "b.txt", "content": "data"}),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "data");
     }
 
@@ -70,8 +80,12 @@ mod tests {
         let (ws, dir) = setup("overwrite");
         std::fs::write(dir.join("b.txt"), "old").unwrap();
         let tool = WriteTool;
-        tool.run(&ws, &json!({"path": "b.txt", "content": "new"}))
-            .unwrap();
+        tool.run(
+            &ws,
+            &json!({"path": "b.txt", "content": "new"}),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new");
     }
 
@@ -79,8 +93,12 @@ mod tests {
     fn creates_parent_dirs() {
         let (ws, dir) = setup("parents");
         let tool = WriteTool;
-        tool.run(&ws, &json!({"path": "a/b/c.txt", "content": "deep"}))
-            .unwrap();
+        tool.run(
+            &ws,
+            &json!({"path": "a/b/c.txt", "content": "deep"}),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("a/b/c.txt")).unwrap(),
             "deep"
