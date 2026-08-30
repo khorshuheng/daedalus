@@ -4,11 +4,40 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use super::{arg_string, arg_usize, resolve, truncate, Tool, ToolError, ToolOutput};
+use super::{arg_string, arg_usize, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
+
+/// Maximum number of lines returned per read (matches pi's default).
+const MAX_LINES: usize = 2000;
 
 pub struct ReadTool {
     pub max_output: usize,
+}
+
+/// Keep whole lines from the head that fit within `max_lines` and `max_bytes`
+/// (the byte count accounts for the newlines that `join("\n")` will insert).
+fn head_truncate<'a>(
+    lines: &[&'a str],
+    max_lines: usize,
+    max_bytes: usize,
+) -> (Vec<&'a str>, bool) {
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated = false;
+    for (i, line) in lines.iter().enumerate() {
+        if i >= max_lines {
+            truncated = true;
+            break;
+        }
+        let add = line.len() + usize::from(i > 0);
+        if bytes + add > max_bytes {
+            truncated = true;
+            break;
+        }
+        kept.push(*line);
+        bytes += add;
+    }
+    (kept, truncated)
 }
 
 impl Tool for ReadTool {
@@ -21,7 +50,7 @@ impl Tool for ReadTool {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Path to read, relative to the workspace." },
-                "offset": { "type": "integer", "minimum": 0, "description": "0-based starting line." },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-indexed starting line." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to return." }
             },
             "required": ["path"]
@@ -30,8 +59,14 @@ impl Tool for ReadTool {
 
     fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
-        let offset = arg_usize(args, "offset")?.unwrap_or(0);
+        let offset = arg_usize(args, "offset")?.unwrap_or(1);
+        if offset == 0 {
+            return Err(ToolError::Argument("'offset' must be >= 1".into()));
+        }
         let limit = arg_usize(args, "limit")?;
+        if limit == Some(0) {
+            return Err(ToolError::Argument("'limit' must be >= 1".into()));
+        }
 
         let resolved = resolve(workspace, Path::new(&path))?;
         let content = match std::fs::read_to_string(&resolved) {
@@ -43,30 +78,57 @@ impl Tool for ReadTool {
         };
 
         let lines: Vec<&str> = content.lines().collect();
+        let total_lines = lines.len();
+        let start = offset - 1; // 0-based
 
-        let selected: String = if let Some(limit) = limit {
-            if offset >= lines.len() {
-                String::new()
-            } else {
-                lines[offset..std::cmp::min(offset + limit, lines.len())]
-                    .to_vec()
-                    .join("\n")
-            }
-        } else if offset == 0 {
-            lines.join("\n")
-        } else if offset >= lines.len() {
-            String::new()
-        } else {
-            lines[offset..].join("\n")
-        };
+        if start >= total_lines {
+            return Err(ToolError::Argument(format!(
+                "offset {offset} is beyond end of file ({total_lines} lines total)"
+            )));
+        }
 
-        let body = truncate(selected, self.max_output);
-        let content = if body.contains("[truncated") {
-            format!("{body}\n[file has {} lines]", lines.len())
-        } else {
-            body
+        let end = match limit {
+            Some(l) => std::cmp::min(start + l, total_lines),
+            None => total_lines,
         };
-        Ok(ToolOutput { content })
+        let selected = &lines[start..end];
+
+        let (kept, truncated) = head_truncate(selected, MAX_LINES, self.max_output);
+        let shown_start = start + 1; // 1-based
+        let shown_end = start + kept.len();
+
+        // A single line larger than the whole cap gets a targeted hint instead
+        // of an empty result.
+        if kept.is_empty() {
+            let line = selected[0];
+            return Ok(ToolOutput {
+                content: format!(
+                    "[Line {shown_start} is {} bytes, exceeds {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
+                    line.len(),
+                    self.max_output,
+                    shown_start,
+                    path,
+                    self.max_output
+                ),
+            });
+        }
+
+        let body = kept.join("\n");
+        let mut out = body;
+        if truncated {
+            let next_offset = shown_end + 1;
+            out = format!(
+                "{out}\n\n[Showing lines {shown_start}-{shown_end} of {total_lines}. Use offset={next_offset} to continue.]"
+            );
+        } else if end < total_lines {
+            let remaining = total_lines - end;
+            let next_offset = end + 1;
+            out = format!(
+                "{out}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
+            );
+        }
+
+        Ok(ToolOutput { content: out })
     }
 }
 
@@ -92,13 +154,14 @@ mod tests {
     }
 
     #[test]
-    fn respects_offset_and_limit() {
+    fn respects_one_based_offset_and_limit() {
         let (ws, _dir) = setup("range", "l0\nl1\nl2\nl3\nl4\n");
         let tool = ReadTool { max_output: 1000 };
+        // offset=4 starts at "l3"; limit=2 reaches the end of the file.
         let out = tool
-            .run(&ws, &json!({"path": "a.txt", "offset": 1, "limit": 2}))
+            .run(&ws, &json!({"path": "a.txt", "offset": 4, "limit": 2}))
             .unwrap();
-        assert_eq!(out.content, "l1\nl2");
+        assert_eq!(out.content, "l3\nl4");
     }
 
     #[test]
@@ -112,10 +175,33 @@ mod tests {
     }
 
     #[test]
-    fn caps_output() {
-        let (ws, _dir) = setup("cap", &"y".repeat(5000));
+    fn caps_output_and_reports_continuation_offset() {
+        let (ws, _dir) = setup("cap", &"y\n".repeat(5000));
         let tool = ReadTool { max_output: 64 };
         let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
-        assert!(out.content.contains("[truncated"));
+        assert!(out.content.contains("[Showing lines 1-"));
+        assert!(out.content.contains("Use offset="));
+    }
+
+    #[test]
+    fn reports_remaining_lines_after_limit() {
+        let (ws, _dir) = setup("limit", "l0\nl1\nl2\nl3\nl4\n");
+        let tool = ReadTool { max_output: 1000 };
+        let out = tool
+            .run(&ws, &json!({"path": "a.txt", "offset": 1, "limit": 2}))
+            .unwrap();
+        assert_eq!(
+            out.content,
+            "l0\nl1\n\n[3 more lines in file. Use offset=3 to continue.]"
+        );
+    }
+
+    #[test]
+    fn huge_single_line_gets_targeted_hint() {
+        let (ws, _dir) = setup("hugeline", &"z".repeat(5000));
+        let tool = ReadTool { max_output: 64 };
+        let out = tool.run(&ws, &json!({"path": "a.txt"})).unwrap();
+        assert!(out.content.contains("exceeds 64 limit"));
+        assert!(out.content.contains("sed -n '1p'"));
     }
 }

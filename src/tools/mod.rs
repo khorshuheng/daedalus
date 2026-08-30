@@ -36,6 +36,10 @@ pub enum ToolError {
     Io(String),
     /// A path escapes the workspace.
     Escape(String),
+    /// A command failed (non-zero exit or killed by signal).
+    Command(String),
+    /// A command exceeded its timeout.
+    Timeout(String),
 }
 
 impl fmt::Display for ToolError {
@@ -46,6 +50,8 @@ impl fmt::Display for ToolError {
             ToolError::Invalid(m) => write!(f, "invalid: {m}"),
             ToolError::Io(m) => write!(f, "io error: {m}"),
             ToolError::Escape(m) => write!(f, "path escaped: {m}"),
+            ToolError::Command(m) => write!(f, "{m}"),
+            ToolError::Timeout(m) => write!(f, "command timed out: {m}"),
         }
     }
 }
@@ -61,17 +67,27 @@ pub trait Tool: Send + Sync {
     fn run(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError>;
 }
 
-/// Truncate `s` to at most `max` bytes on a UTF-8 boundary, appending an
-/// ellipsis note when truncated, so a single result cannot blow up the context.
-pub(crate) fn truncate(s: String, max: usize) -> String {
+/// Truncate `s` to at most `max` bytes keeping the *tail* (last bytes),
+/// prepending an ellipsis note when truncated. Suitable for command output,
+/// where errors and final results appear at the end.
+pub(crate) fn truncate_tail(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
-        return s;
+        return (s.to_string(), false);
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
     }
-    format!("{}…[truncated: {} bytes total]", &s[..end], s.len())
+    let kept = &s[start..];
+    (
+        format!(
+            "…[truncated: {} bytes total, showing last {} bytes]\n{}",
+            s.len(),
+            kept.len(),
+            kept
+        ),
+        true,
+    )
 }
 
 /// Require a string argument.

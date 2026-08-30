@@ -48,6 +48,9 @@ pub enum Message {
 pub enum Response {
     Text(String),
     ToolCalls(Vec<ToolCall>),
+    /// Tool calls from a response that was cut off by the output token limit;
+    /// their arguments may be incomplete and must not be executed.
+    TruncatedToolCalls(Vec<ToolCall>),
 }
 
 /// Typed provider errors, surfaced clearly at the loop boundary.

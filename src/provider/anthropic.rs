@@ -115,6 +115,11 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
         .get("content")
         .and_then(|c| c.as_array())
         .ok_or_else(|| ProviderError::Malformed("missing 'content' array".into()))?;
+    let truncated = resp
+        .get("stop_reason")
+        .and_then(|v| v.as_str())
+        .map(|r| r == "max_tokens")
+        .unwrap_or(false);
 
     let mut texts = Vec::new();
     let mut calls = Vec::new();
@@ -143,7 +148,11 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
     }
 
     if !calls.is_empty() {
-        Ok(Response::ToolCalls(calls))
+        if truncated {
+            Ok(Response::TruncatedToolCalls(calls))
+        } else {
+            Ok(Response::ToolCalls(calls))
+        }
     } else {
         Ok(Response::Text(texts.join("\n")))
     }
@@ -194,6 +203,18 @@ mod tests {
             }
             _ => panic!("expected tool calls"),
         }
+    }
+
+    #[test]
+    fn parses_truncated_tool_use_response() {
+        let r = parse_response(json!({
+            "stop_reason": "max_tokens",
+            "content": [
+                {"type": "tool_use", "id": "t_1", "name": "read", "input": {"path": "a.txt"}}
+            ]
+        }))
+        .unwrap();
+        assert!(matches!(r, Response::TruncatedToolCalls(_)));
     }
 
     #[test]

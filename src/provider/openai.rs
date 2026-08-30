@@ -107,10 +107,17 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
         .get("choices")
         .and_then(|c| c.as_array())
         .ok_or_else(|| ProviderError::Malformed("missing 'choices' array".into()))?;
-    let message = &choices
+    let choice = choices
         .first()
-        .and_then(|c| c.get("message"))
+        .ok_or_else(|| ProviderError::Malformed("missing choice[0]".into()))?;
+    let message = choice
+        .get("message")
         .ok_or_else(|| ProviderError::Malformed("missing choice[0].message".into()))?;
+    let truncated = choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .map(|r| r == "length" || r == "max_tokens")
+        .unwrap_or(false);
 
     let tool_calls = message
         .get("tool_calls")
@@ -138,7 +145,11 @@ fn parse_response(resp: Value) -> Result<Response, ProviderError> {
             let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
             calls.push(ToolCall { id, name, args });
         }
-        Ok(Response::ToolCalls(calls))
+        if truncated {
+            Ok(Response::TruncatedToolCalls(calls))
+        } else {
+            Ok(Response::ToolCalls(calls))
+        }
     } else {
         let text = message
             .get("content")
@@ -206,6 +217,21 @@ mod tests {
             }
             _ => panic!("expected tool calls"),
         }
+    }
+
+    #[test]
+    fn parses_truncated_tool_call_response() {
+        let truncated = json!({
+            "choices": [{"finish_reason": "length", "message": {
+                "content": null,
+                "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"}}
+                ]
+            }}]
+        });
+        let r = parse_response(truncated).unwrap();
+        assert!(matches!(r, Response::TruncatedToolCalls(_)));
     }
 
     #[test]

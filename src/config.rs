@@ -85,6 +85,9 @@ pub struct Config {
     pub timeout_secs: u64,
     /// Number of retries for transient failures (timeouts, 429, 5xx).
     pub max_retries: usize,
+    /// Rough token budget for the conversation history. The oldest tool turns
+    /// are dropped once exceeded so a session cannot blow the model context.
+    pub max_context_tokens: usize,
     /// The single root directory the agent is allowed to touch.
     pub workspace: PathBuf,
 }
@@ -104,6 +107,7 @@ impl Config {
             max_tokens: 2048,
             timeout_secs: 60,
             max_retries: 2,
+            max_context_tokens: 64_000,
             workspace,
         }
     }
@@ -126,6 +130,7 @@ pub struct Overrides {
     pub max_tokens: Option<usize>,
     pub timeout_secs: Option<u64>,
     pub max_retries: Option<usize>,
+    pub max_context_tokens: Option<usize>,
     pub workspace: Option<PathBuf>,
 }
 
@@ -143,6 +148,7 @@ struct FileConfig {
     max_tokens: Option<usize>,
     timeout_secs: Option<u64>,
     max_retries: Option<usize>,
+    max_context_tokens: Option<usize>,
     workspace: Option<PathBuf>,
 }
 
@@ -204,6 +210,9 @@ impl Overrides {
         if let Some(v) = fc.max_retries {
             self.max_retries = Some(v);
         }
+        if let Some(v) = fc.max_context_tokens {
+            self.max_context_tokens = Some(v);
+        }
         if let Some(v) = fc.workspace {
             self.workspace = Some(v);
         }
@@ -240,6 +249,9 @@ impl Overrides {
         }
         if other.max_retries.is_some() {
             self.max_retries = other.max_retries;
+        }
+        if other.max_context_tokens.is_some() {
+            self.max_context_tokens = other.max_context_tokens;
         }
         if other.workspace.is_some() {
             self.workspace = other.workspace;
@@ -279,6 +291,9 @@ impl Overrides {
                 return Err("timeout_secs must be >= 1".into());
             }
         }
+        if self.max_context_tokens.unwrap_or(64_000) == 0 {
+            return Err("max_context_tokens must be >= 1".into());
+        }
 
         Ok(Config {
             provider,
@@ -291,6 +306,7 @@ impl Overrides {
             max_tokens: self.max_tokens.unwrap_or(2048),
             timeout_secs: self.timeout_secs.unwrap_or(60),
             max_retries: self.max_retries.unwrap_or(2),
+            max_context_tokens: self.max_context_tokens.unwrap_or(64_000),
             workspace,
         })
     }
@@ -337,6 +353,9 @@ impl Overrides {
         if let Ok(v) = std::env::var("CRAB_MAX_RETRIES") {
             o.max_retries = v.parse().ok();
         }
+        if let Ok(v) = std::env::var("CRAB_MAX_CONTEXT_TOKENS") {
+            o.max_context_tokens = v.parse().ok();
+        }
         o
     }
 }
@@ -356,6 +375,7 @@ mod tests {
         assert_eq!(c.provider, ProviderKind::Openai);
         assert_eq!(c.base_url, "https://api.openai.com");
         assert_eq!(c.max_iterations, 30);
+        assert_eq!(c.max_context_tokens, 64_000);
     }
 
     #[test]
