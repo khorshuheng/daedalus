@@ -3,6 +3,10 @@ name = "crab"
 version = "0.1.0"
 edition = "2021"
 description = "A minimal coding agent in Rust, modeled on the pi coding agent."
+# Minimum supported Rust version (first 2025 release). Cargo's MSRV-aware
+# resolver keeps dependencies compatible with this floor, so the project stays
+# buildable on older rust even as Arch keeps updating the installed toolchain.
+rust-version = "1.85"
 
 [[bin]]
 name = "crab"
@@ -16,6 +20,7 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-# Pin HTTP stack so transitive url/icu crates stay Rust-1.86 compatible.
-ureq = { version = "=2.9.1", features = ["json"] }
+ureq = { version = "2", features = ["json"] }
+# Pin url to 2.4.x: url >=2.5 pulls idna 1.x -> icu 2.x, which needs rust >=1.88
+# and would exceed the project's 1.85 MSRV.
 url = "=2.4.1"
