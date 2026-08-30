@@ -3,6 +3,7 @@
 //! records every history it receives so tests can assert on result feedback.
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
 use serde_json::Value;
@@ -52,7 +53,12 @@ impl FakeProvider {
 }
 
 impl Provider for FakeProvider {
-    fn complete(&self, history: &[Message], _tools: &[Value]) -> Result<Completion, ProviderError> {
+    fn complete(
+        &self,
+        history: &[Message],
+        _tools: &[Value],
+        _cancel: &AtomicBool,
+    ) -> Result<Completion, ProviderError> {
         self.histories.lock().unwrap().push(history.to_vec());
         let mut q = self.responses.lock().unwrap();
         let response = match q.pop_front() {
@@ -62,6 +68,7 @@ impl Provider for FakeProvider {
         Ok(Completion {
             response,
             prompt_tokens: None,
+            aborted: false,
         })
     }
 }
@@ -82,16 +89,22 @@ mod tests {
             Response::Text("final".into()),
         ]);
         assert!(matches!(
-            p.complete(&[], &[]).unwrap().response,
+            p.complete(&[], &[], &AtomicBool::new(false))
+                .unwrap()
+                .response,
             Response::ToolCalls(_)
         ));
         assert_eq!(
-            p.complete(&[], &[]).unwrap().response,
+            p.complete(&[], &[], &AtomicBool::new(false))
+                .unwrap()
+                .response,
             Response::Text("final".into())
         );
         // Exhausted -> final "done".
         assert_eq!(
-            p.complete(&[], &[]).unwrap().response,
+            p.complete(&[], &[], &AtomicBool::new(false))
+                .unwrap()
+                .response,
             Response::Text("done".into())
         );
     }
@@ -103,7 +116,7 @@ mod tests {
             tool_call_id: "abc".into(),
             result: "r".into(),
         }];
-        p.complete(&hist, &[]).unwrap();
+        p.complete(&hist, &[], &AtomicBool::new(false)).unwrap();
         assert_eq!(p.calls(), 1);
         assert!(p.saw_tool_result("abc"));
     }

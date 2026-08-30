@@ -8,6 +8,8 @@
 //! deterministic.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::config::Config;
 use crate::provider::{Message, Provider, ProviderError, Response, ToolCall};
@@ -117,6 +119,49 @@ pub struct Agent<'a> {
     config: &'a Config,
 }
 
+/// Shared steering state between the stdin reader thread and the agent loop.
+/// `steer` posts a message and cancels the in-flight generation; the loop
+/// consumes the message on the next turn and resumes.
+pub struct Steering {
+    cancel: AtomicBool,
+    message: Mutex<Option<String>>,
+}
+
+impl Default for Steering {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Steering {
+    pub fn new() -> Self {
+        Self {
+            cancel: AtomicBool::new(false),
+            message: Mutex::new(None),
+        }
+    }
+
+    /// Post a steering message and request cancellation of the current turn.
+    pub fn steer(&self, msg: String) {
+        *self.message.lock().unwrap() = Some(msg);
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// The cancel flag checked by providers between streamed chunks.
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    /// Take the pending steering message, clearing the cancel flag if present.
+    pub fn take_message(&self) -> Option<String> {
+        let msg = self.message.lock().unwrap().take();
+        if msg.is_some() {
+            self.cancel.store(false, Ordering::SeqCst);
+        }
+        msg
+    }
+}
+
 impl<'a> Agent<'a> {
     pub fn new(
         provider: &'a dyn Provider,
@@ -179,6 +224,16 @@ impl<'a> Agent<'a> {
 
     /// Run a bounded agentic session for `prompt`, returning the final answer.
     pub fn run(&self, prompt: &str) -> Result<String, AgentError> {
+        self.run_impl(prompt, None)
+    }
+
+    /// Run a session that can be steered: the `Steering` handle is checked for
+    /// a pending user message and cancellation between turns and mid-stream.
+    pub fn run_steered(&self, prompt: &str, steering: &Steering) -> Result<String, AgentError> {
+        self.run_impl(prompt, Some(steering))
+    }
+
+    fn run_impl(&self, prompt: &str, steering: Option<&Steering>) -> Result<String, AgentError> {
         let mut history = vec![
             Message::System(self.system_prompt()),
             Message::User(prompt.to_string()),
@@ -190,6 +245,9 @@ impl<'a> Agent<'a> {
         // provider completion. Before the first completion we estimate all.
         let mut anchor_tokens = 0usize;
         let mut anchor_len = 0usize;
+        // A dummy cancel flag for non-interactive runs.
+        let no_cancel = AtomicBool::new(false);
+        let cancel = steering.map(|s| s.cancel_flag()).unwrap_or(&no_cancel);
 
         loop {
             if iterations >= self.config.max_iterations {
@@ -204,11 +262,33 @@ impl<'a> Agent<'a> {
             );
             let completion = self
                 .provider
-                .complete(&history, &schemas)
+                .complete(&history, &schemas, cancel)
                 .map_err(AgentError::Provider)?;
             if let Some(tokens) = completion.prompt_tokens {
                 anchor_tokens = tokens;
                 anchor_len = history.len();
+            }
+
+            if completion.aborted {
+                let partial = match completion.response {
+                    Response::Text(t) => t,
+                    _ => String::new(),
+                };
+                // Keep the partial text so the model sees what it was saying.
+                if !partial.is_empty() {
+                    history.push(Message::Assistant {
+                        text: Some(partial.clone()),
+                        tool_calls: vec![],
+                    });
+                }
+                if let Some(s) = steering {
+                    if let Some(msg) = s.take_message() {
+                        history.push(Message::User(msg));
+                        continue;
+                    }
+                }
+                // Cancelled with no steering message: stop and return what we had.
+                return Ok(partial);
             }
 
             match completion.response {
@@ -396,5 +476,77 @@ mod tests {
         assert_eq!(anchored_total(&h, 5, 2), 5);
         // An anchor pointing past the history is invalid, so we estimate all.
         assert!(anchored_total(&h, 5, 99) > 0);
+    }
+
+    /// A provider that plays a scripted sequence of `Completion`s.
+    struct ScriptedProvider {
+        completions: Mutex<std::collections::VecDeque<crate::provider::Completion>>,
+        histories: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn complete(
+            &self,
+            history: &[Message],
+            _tools: &[serde_json::Value],
+            _cancel: &AtomicBool,
+        ) -> Result<crate::provider::Completion, ProviderError> {
+            self.histories.lock().unwrap().push(history.to_vec());
+            Ok(self
+                .completions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| crate::provider::Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                }))
+        }
+    }
+
+    #[test]
+    fn steering_injects_message_and_resumes() {
+        let (_dir, ws) = workspace("steer");
+        let steering = Steering::new();
+
+        let provider = ScriptedProvider {
+            completions: Mutex::new(std::collections::VecDeque::from([
+                crate::provider::Completion {
+                    response: Response::Text("going the wrong way".into()),
+                    prompt_tokens: None,
+                    aborted: true,
+                },
+                crate::provider::Completion {
+                    response: Response::Text("fixed answer".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                },
+            ])),
+            histories: Mutex::new(Vec::new()),
+        };
+
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: _dir.clone(),
+            ..Config::defaults(_dir.clone())
+        };
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+
+        steering.steer("stop, do this instead".into());
+        let answer = agent.run_steered("initial prompt", &steering).unwrap();
+        assert_eq!(answer, "fixed answer");
+
+        // The second completion saw the partial assistant text + steering line.
+        let histories = provider.histories.lock().unwrap();
+        assert_eq!(histories.len(), 2);
+        let second = &histories[1];
+        assert!(second.iter().any(
+            |m| matches!(m, Message::Assistant { text: Some(t), .. } if t == "going the wrong way")
+        ));
+        assert!(second
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "stop, do this instead")));
     }
 }

@@ -11,9 +11,11 @@
 //!   1 — hard error (bad config/flags, provider unreachable)
 //!   2 — iteration cap exceeded
 
+use std::io::BufRead;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use crab::agent::{Agent, AgentError};
+use crab::agent::{Agent, AgentError, Steering};
 use crab::config::{Config, Overrides, ProviderKind};
 use crab::provider;
 use crab::tools::resolver::ToolSet;
@@ -130,7 +132,28 @@ fn run(cli: Cli) -> Result<i32, String> {
     let tools = ToolSet::new(config.max_output_bytes);
     let agent = Agent::new(provider.as_ref(), &tools, &workspace, &config);
 
-    match agent.run(&cli.prompt) {
+    // A background reader turns any non-empty stdin line into a steering
+    // message that cancels the in-flight generation and resumes with it.
+    let steering = Arc::new(Steering::new());
+    {
+        let steering = Arc::clone(&steering);
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                match line {
+                    Ok(l) => {
+                        let l = l.trim().to_string();
+                        if !l.is_empty() {
+                            steering.steer(l);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    match agent.run_steered(&cli.prompt, &steering) {
         Ok(answer) => {
             println!("{answer}");
             Ok(0)

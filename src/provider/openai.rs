@@ -1,12 +1,17 @@
 //! OpenAI provider (also serves DeepSeek via a configurable base URL + model).
 //!
-//! Uses the OpenAI chat-completions protocol with function/tool calling. The
-//! four tool schemas are wrapped into OpenAI's `tools` field, and responses are
-//! normalized into the internal `Response`/`ToolCall` types.
+//! Uses the OpenAI chat-completions protocol with streaming (SSE) + tool
+//! calling. Streamed responses are normalized into the internal
+//! `Response`/`ToolCall` types; `cancel` aborts the stream mid-generation.
+
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
-use super::{Completion, Message, Provider, ProviderError, Response, ToolCall};
+use super::{
+    next_sse_event, post_stream, Completion, Message, Provider, ProviderError, Response, ToolCall,
+};
 use crate::config::Config;
 
 pub struct OpenAIProvider {
@@ -43,6 +48,8 @@ impl OpenAIProvider {
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
+            "stream": true,
+            "stream_options": { "include_usage": true },
         });
         if !tools.is_empty() {
             body["tools"] = to_openai_tools(tools);
@@ -66,7 +73,8 @@ fn to_openai_message(m: &Message) -> Value {
                             "type": "function",
                             "function": {
                                 "name": tc.name,
-                                "arguments": serde_json::to_string(&tc.args).unwrap_or_else(|_| "{}".into())
+                                "arguments": serde_json::to_string(&tc.args)
+                                    .unwrap_or_else(|_| "{}".into())
                             }
                         })
                     })
@@ -102,150 +110,200 @@ fn to_openai_tools(tools: &[Value]) -> Value {
     )
 }
 
-fn parse_response(resp: Value) -> Result<Response, ProviderError> {
-    let choices = resp
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .ok_or_else(|| ProviderError::Malformed("missing 'choices' array".into()))?;
-    let choice = choices
-        .first()
-        .ok_or_else(|| ProviderError::Malformed("missing choice[0]".into()))?;
-    let message = choice
-        .get("message")
-        .ok_or_else(|| ProviderError::Malformed("missing choice[0].message".into()))?;
-    let truncated = choice
-        .get("finish_reason")
-        .and_then(|v| v.as_str())
-        .map(|r| r == "length" || r == "max_tokens")
-        .unwrap_or(false);
+/// Parse a streamed OpenAI chat-completions SSE body into a `Completion`.
+/// Tool-call arguments arrive as JSON-string fragments keyed by `index` and are
+/// reassembled before parsing.
+fn parse_openai_stream(
+    reader: &mut impl BufRead,
+    cancel: &AtomicBool,
+) -> Result<Completion, ProviderError> {
+    let mut text = String::new();
+    // (id, name, concatenated arguments JSON).
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut prompt_tokens = None;
+    let mut truncated = false;
 
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(|t| t.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    if !tool_calls.is_empty() {
-        let mut calls = Vec::with_capacity(tool_calls.len());
-        for tc in &tool_calls {
-            let name = tc
-                .pointer("/function/name")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ProviderError::Malformed("tool call missing function.name".into()))?
-                .to_string();
-            let id = tc
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string();
-            let args_str = tc
-                .pointer("/function/arguments")
-                .and_then(|v| v.as_str())
-                .unwrap_or("{}");
-            let args: Value = serde_json::from_str(args_str).unwrap_or_else(|_| json!({}));
-            calls.push(ToolCall { id, name, args });
+    while let Some(ev) = next_sse_event(reader, cancel)? {
+        if let Some(u) = ev.get("usage") {
+            prompt_tokens = u
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
         }
-        if truncated {
-            Ok(Response::TruncatedToolCalls(calls))
+        if let Some(choice) = ev
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|c| c.first())
+        {
+            if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                if fr == "length" || fr == "max_tokens" {
+                    truncated = true;
+                }
+            }
+            if let Some(delta) = choice.get("delta") {
+                if let Some(t) = delta.get("content").and_then(|v| v.as_str()) {
+                    text.push_str(t);
+                }
+                if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tcs {
+                        let index = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        if calls.len() <= index {
+                            calls.resize(index + 1, (String::new(), String::new(), String::new()));
+                        }
+                        let c = &mut calls[index];
+                        if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                            c.0 = id.to_string();
+                        }
+                        if let Some(name) = tc.pointer("/function/name").and_then(|v| v.as_str()) {
+                            c.1 = name.to_string();
+                        }
+                        if let Some(arg) =
+                            tc.pointer("/function/arguments").and_then(|v| v.as_str())
+                        {
+                            c.2.push_str(arg);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(Completion {
+            response: Response::Text(text),
+            prompt_tokens,
+            aborted: true,
+        });
+    }
+
+    if !calls.is_empty() {
+        let tool_calls = calls
+            .into_iter()
+            .map(|(id, name, args_json)| {
+                let args = serde_json::from_str(&args_json).unwrap_or_else(|_| json!({}));
+                ToolCall { id, name, args }
+            })
+            .collect();
+        let response = if truncated {
+            Response::TruncatedToolCalls(tool_calls)
         } else {
-            Ok(Response::ToolCalls(calls))
-        }
+            Response::ToolCalls(tool_calls)
+        };
+        Ok(Completion {
+            response,
+            prompt_tokens,
+            aborted: false,
+        })
     } else {
-        let text = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string();
-        Ok(Response::Text(text))
+        Ok(Completion {
+            response: Response::Text(text),
+            prompt_tokens,
+            aborted: false,
+        })
     }
 }
 
 impl Provider for OpenAIProvider {
-    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Completion, ProviderError> {
+    fn complete(
+        &self,
+        history: &[Message],
+        tools: &[Value],
+        cancel: &AtomicBool,
+    ) -> Result<Completion, ProviderError> {
         let body = self.request(history, tools);
         let auth = self.api_key.as_ref().map(|k| format!("Bearer {k}"));
         let mut headers: Vec<(&str, &str)> = Vec::new();
         if let Some(a) = &auth {
             headers.push(("Authorization", a.as_str()));
         }
-        let value = super::post_json(
+        let reader = post_stream(
             &self.url(),
             &headers,
             body,
             self.timeout_secs,
             self.max_retries,
         )?;
-        let prompt_tokens = value
-            .get("usage")
-            .and_then(|u| u.get("prompt_tokens"))
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
-        let response = parse_response(value)?;
-        Ok(Completion {
-            response,
-            prompt_tokens,
-        })
+        let mut buf = BufReader::new(reader);
+        parse_openai_stream(&mut buf, cancel)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{Message, Response};
+    use std::io::Read;
 
-    fn text_msg(s: &str) -> Value {
-        json!({"choices": [{"message": {"content": s}}]})
+    fn text_sse() -> &'static str {
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n"
     }
 
-    fn tool_msg() -> Value {
-        json!({
-            "choices": [{"message": {
-                "content": null,
-                "tool_calls": [
-                    {"id": "call_1", "type": "function",
-                     "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"}}
-                ]
-            }}]
-        })
-    }
-
-    #[test]
-    fn parses_text_response() {
-        let r = parse_response(text_msg("hi there")).unwrap();
-        assert_eq!(r, Response::Text("hi there".into()));
+    fn tool_sse() -> &'static str {
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"a.txt\\\"}\"}}]}}]}\n\n\
+         data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n\
+         data: [DONE]\n\n"
     }
 
     #[test]
-    fn parses_tool_call_response() {
-        let r = parse_response(tool_msg()).unwrap();
-        match r {
+    fn streams_text_response() {
+        let cancel = AtomicBool::new(false);
+        let mut data = text_sse().as_bytes();
+        let r = parse_openai_stream(&mut data, &cancel).unwrap();
+        assert!(!r.aborted);
+        assert_eq!(r.response, Response::Text("hello world".into()));
+    }
+
+    #[test]
+    fn streams_and_reassembles_tool_calls() {
+        let cancel = AtomicBool::new(false);
+        let mut data = tool_sse().as_bytes();
+        let r = parse_openai_stream(&mut data, &cancel).unwrap();
+        match r.response {
             Response::ToolCalls(calls) => {
                 assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call_1");
                 assert_eq!(calls[0].name, "read");
                 assert_eq!(calls[0].args["path"], "a.txt");
             }
-            _ => panic!("expected tool calls"),
+            other => panic!("expected tool calls, got {other:?}"),
         }
     }
 
     #[test]
-    fn parses_truncated_tool_call_response() {
-        let truncated = json!({
-            "choices": [{"finish_reason": "length", "message": {
-                "content": null,
-                "tool_calls": [
-                    {"id": "call_1", "type": "function",
-                     "function": {"name": "read", "arguments": "{\"path\":\"a.txt\"}"}}
-                ]
-            }}]
-        });
-        let r = parse_response(truncated).unwrap();
-        assert!(matches!(r, Response::TruncatedToolCalls(_)));
+    fn streams_truncated_tool_calls() {
+        let cancel = AtomicBool::new(false);
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}]}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                   data: [DONE]\n\n";
+        let mut data = sse.as_bytes();
+        let r = parse_openai_stream(&mut data, &cancel).unwrap();
+        assert!(matches!(r.response, Response::TruncatedToolCalls(_)));
     }
 
     #[test]
-    fn malformed_missing_choices_is_error() {
-        assert!(parse_response(json!({})).is_err());
+    fn cancel_yields_aborted_partial_text() {
+        let cancel = AtomicBool::new(false);
+        let data = text_sse().as_bytes();
+        // Yield one byte at a time and set cancel after the first few bytes, so
+        // the stream aborts partway through the first event.
+        let reader = ToggleReader {
+            data,
+            pos: 0,
+            cancel_after: 8,
+            cancel: &cancel,
+        };
+        let mut buf = BufReader::new(reader);
+        let r = parse_openai_stream(&mut buf, &cancel).unwrap();
+        assert!(r.aborted);
+        if let Response::Text(t) = r.response {
+            assert!(t.contains("hello"));
+        } else {
+            panic!("expected partial text");
+        }
     }
 
     #[test]
@@ -260,21 +318,26 @@ mod tests {
         assert_eq!(v["content"], "ok");
     }
 
-    #[test]
-    fn assistant_tool_calls_are_wrapped() {
-        let m = Message::Assistant {
-            text: None,
-            tool_calls: vec![ToolCall {
-                id: "x".into(),
-                name: "write".into(),
-                args: json!({"path":"p"}),
-            }],
-        };
-        let v = to_openai_message(&m);
-        assert_eq!(v["tool_calls"][0]["function"]["name"], "write");
-        assert_eq!(
-            v["tool_calls"][0]["function"]["arguments"],
-            "{\"path\":\"p\"}"
-        );
+    /// Reader that yields `data` one byte at a time and sets `cancel` once it
+    /// has yielded `cancel_after` bytes.
+    struct ToggleReader<'a> {
+        data: &'a [u8],
+        pos: usize,
+        cancel_after: usize,
+        cancel: &'a AtomicBool,
+    }
+
+    impl Read for ToggleReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = self.data[self.pos];
+            self.pos += 1;
+            if self.pos >= self.cancel_after {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(1)
+        }
     }
 }

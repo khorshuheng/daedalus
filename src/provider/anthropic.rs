@@ -1,8 +1,13 @@
-//! Anthropic provider (Messages API + tool use).
+//! Anthropic provider (Messages API + tool use), with streaming (SSE).
+
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{json, Value};
 
-use super::{Completion, Message, Provider, ProviderError, Response, ToolCall};
+use super::{
+    next_sse_event, post_stream, Completion, Message, Provider, ProviderError, Response, ToolCall,
+};
 use crate::config::Config;
 
 pub struct AnthropicProvider {
@@ -51,6 +56,7 @@ impl AnthropicProvider {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
+            "stream": true,
             "messages": messages,
         });
         if !system.is_empty() {
@@ -110,78 +116,138 @@ fn to_anthropic_tools(tools: &[Value]) -> Value {
     )
 }
 
-fn parse_response(resp: Value) -> Result<Response, ProviderError> {
-    let content = resp
-        .get("content")
-        .and_then(|c| c.as_array())
-        .ok_or_else(|| ProviderError::Malformed("missing 'content' array".into()))?;
-    let truncated = resp
-        .get("stop_reason")
-        .and_then(|v| v.as_str())
-        .map(|r| r == "max_tokens")
-        .unwrap_or(false);
-
+/// Parse a streamed Anthropic Messages SSE body into a `Completion`. Tool-use
+/// arguments arrive as `input_json_delta` fragments and are reassembled.
+fn parse_anthropic_stream(
+    reader: &mut impl BufRead,
+    cancel: &AtomicBool,
+) -> Result<Completion, ProviderError> {
     let mut texts = Vec::new();
-    let mut calls = Vec::new();
-    for block in content {
-        match block.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-                    texts.push(t.to_string());
+    // (id, name, args_json), indexed by content-block index.
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut prompt_tokens = None;
+    let mut truncated = false;
+
+    while let Some(ev) = next_sse_event(reader, cancel)? {
+        match ev.get("type").and_then(|v| v.as_str()) {
+            Some("message_start") => {
+                if let Some(u) = ev.pointer("/message/usage/input_tokens") {
+                    prompt_tokens = u.as_u64().map(|n| n as usize);
                 }
             }
-            Some("tool_use") => calls.push(ToolCall {
-                id: block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                name: block
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ProviderError::Malformed("tool_use missing name".into()))?
-                    .to_string(),
-                args: block.get("input").cloned().unwrap_or_else(|| json!({})),
-            }),
+            Some("content_block_start") => {
+                let index = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(block) = ev.get("content_block") {
+                    if block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        if calls.len() <= index {
+                            calls.resize(index + 1, (String::new(), String::new(), String::new()));
+                        }
+                        calls[index].0 = block
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        calls[index].1 = block
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                }
+            }
+            Some("content_block_delta") => {
+                let index = ev.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(delta) = ev.get("delta") {
+                    match delta.get("type").and_then(|v| v.as_str()) {
+                        Some("text_delta") => {
+                            if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                texts.push(t.to_string());
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if calls.len() <= index {
+                                calls.resize(
+                                    index + 1,
+                                    (String::new(), String::new(), String::new()),
+                                );
+                            }
+                            if let Some(p) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                calls[index].2.push_str(p);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Some("message_delta") => {
+                if let Some(d) = ev.get("delta") {
+                    if let Some(sr) = d.get("stop_reason").and_then(|v| v.as_str()) {
+                        if sr == "max_tokens" {
+                            truncated = true;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(Completion {
+            response: Response::Text(texts.join("\n")),
+            prompt_tokens,
+            aborted: true,
+        });
+    }
+
     if !calls.is_empty() {
-        if truncated {
-            Ok(Response::TruncatedToolCalls(calls))
+        let tool_calls = calls
+            .into_iter()
+            .map(|(id, name, args_json)| {
+                let args = serde_json::from_str(&args_json).unwrap_or_else(|_| json!({}));
+                ToolCall { id, name, args }
+            })
+            .collect();
+        let response = if truncated {
+            Response::TruncatedToolCalls(tool_calls)
         } else {
-            Ok(Response::ToolCalls(calls))
-        }
+            Response::ToolCalls(tool_calls)
+        };
+        Ok(Completion {
+            response,
+            prompt_tokens,
+            aborted: false,
+        })
     } else {
-        Ok(Response::Text(texts.join("\n")))
+        Ok(Completion {
+            response: Response::Text(texts.join("\n")),
+            prompt_tokens,
+            aborted: false,
+        })
     }
 }
 
 impl Provider for AnthropicProvider {
-    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Completion, ProviderError> {
+    fn complete(
+        &self,
+        history: &[Message],
+        tools: &[Value],
+        cancel: &AtomicBool,
+    ) -> Result<Completion, ProviderError> {
         let body = self.request(history, tools);
         let mut headers: Vec<(&str, &str)> = vec![("anthropic-version", "2023-06-01")];
         if let Some(key) = self.api_key.as_deref() {
             headers.push(("x-api-key", key));
         }
-        let value = super::post_json(
+        let reader = post_stream(
             &self.url(),
             &headers,
             body,
             self.timeout_secs,
             self.max_retries,
         )?;
-        let prompt_tokens = value
-            .get("usage")
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64())
-            .map(|n| n as usize);
-        let response = parse_response(value)?;
-        Ok(Completion {
-            response,
-            prompt_tokens,
-        })
+        let mut buf = BufReader::new(reader);
+        parse_anthropic_stream(&mut buf, cancel)
     }
 }
 
@@ -190,40 +256,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_text_response() {
-        let r = parse_response(json!({"content": [{"type": "text", "text": "hi"}]})).unwrap();
-        assert_eq!(r, Response::Text("hi".into()));
+    fn streams_text_response() {
+        let cancel = AtomicBool::new(false);
+        let sse = "event: message_start\n\
+                   data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":12}}}\n\n\
+                   event: content_block_start\n\
+                   data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+                   event: content_block_delta\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+                   event: message_delta\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n\
+                   event: message_stop\n\
+                   data: {\"type\":\"message_stop\"}\n\n";
+        let mut data = sse.as_bytes();
+        let r = parse_anthropic_stream(&mut data, &cancel).unwrap();
+        assert!(!r.aborted);
+        assert_eq!(r.response, Response::Text("hi".into()));
+        assert_eq!(r.prompt_tokens, Some(12));
     }
 
     #[test]
-    fn parses_tool_use_response() {
-        let r = parse_response(json!({
-            "content": [
-                {"type": "text", "text": "reading"},
-                {"type": "tool_use", "id": "t_1", "name": "read", "input": {"path": "a.txt"}}
-            ]
-        }))
-        .unwrap();
-        match r {
+    fn streams_and_reassembles_tool_use() {
+        let cancel = AtomicBool::new(false);
+        let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"read\",\"input\":{}}}\n\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}\n\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n\
+                   data: {\"type\":\"message_stop\"}\n\n";
+        let mut data = sse.as_bytes();
+        let r = parse_anthropic_stream(&mut data, &cancel).unwrap();
+        match r.response {
             Response::ToolCalls(calls) => {
                 assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "t_1");
                 assert_eq!(calls[0].name, "read");
                 assert_eq!(calls[0].args["path"], "a.txt");
             }
-            _ => panic!("expected tool calls"),
+            other => panic!("expected tool calls, got {other:?}"),
         }
     }
 
     #[test]
-    fn parses_truncated_tool_use_response() {
-        let r = parse_response(json!({
-            "stop_reason": "max_tokens",
-            "content": [
-                {"type": "tool_use", "id": "t_1", "name": "read", "input": {"path": "a.txt"}}
-            ]
-        }))
-        .unwrap();
-        assert!(matches!(r, Response::TruncatedToolCalls(_)));
+    fn streams_truncated_tool_use() {
+        let cancel = AtomicBool::new(false);
+        let sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t_1\",\"name\":\"read\",\"input\":{}}}\n\n\
+                   data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}\n\n\
+                   data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n\
+                   data: {\"type\":\"message_stop\"}\n\n";
+        let mut data = sse.as_bytes();
+        let r = parse_anthropic_stream(&mut data, &cancel).unwrap();
+        assert!(matches!(r.response, Response::TruncatedToolCalls(_)));
     }
 
     #[test]
@@ -256,5 +337,6 @@ mod tests {
         let body = p.request(&hist, &[]);
         assert_eq!(body["system"], "be nice");
         assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["stream"], true);
     }
 }

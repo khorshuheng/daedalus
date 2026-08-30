@@ -12,6 +12,8 @@ pub mod fake;
 pub mod openai;
 
 use std::fmt;
+use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,8 @@ pub enum Response {
 pub struct Completion {
     pub response: Response,
     pub prompt_tokens: Option<usize>,
+    /// True when the generation was interrupted mid-stream (user steering).
+    pub aborted: bool,
 }
 
 /// Typed provider errors, surfaced clearly at the loop boundary.
@@ -88,8 +92,15 @@ impl std::error::Error for ProviderError {}
 /// loop can hold them behind `Box<dyn Provider>`.
 pub trait Provider: Send + Sync {
     /// Send `history` plus the tool schemas and return the completion (text or
-    /// tool calls) together with any reported prompt token usage.
-    fn complete(&self, history: &[Message], tools: &[Value]) -> Result<Completion, ProviderError>;
+    /// tool calls) together with any reported prompt token usage. `cancel` is
+    /// checked between streamed chunks; when set, the request is aborted and
+    /// `Completion.aborted` is set.
+    fn complete(
+        &self,
+        history: &[Message],
+        tools: &[Value],
+        cancel: &AtomicBool,
+    ) -> Result<Completion, ProviderError>;
 }
 
 /// Build the provider selected by `config`. DeepSeek reuses the OpenAI client
@@ -154,15 +165,16 @@ fn backoff(attempt: usize) {
     std::thread::sleep(Duration::from_millis(ms));
 }
 
-/// POST a JSON body with a timeout and bounded retries on transient failures,
-/// returning the parsed JSON response body.
-pub(crate) fn post_json(
+/// Send a JSON body and return the response body as a blocking reader for
+/// streaming (SSE), with the same timeout + retry policy as the old
+/// non-streaming `post_json`.
+fn post_stream(
     url: &str,
     headers: &[(&str, &str)],
     body: Value,
     timeout_secs: u64,
     max_retries: usize,
-) -> Result<Value, ProviderError> {
+) -> Result<Box<dyn Read + Send + Sync>, ProviderError> {
     let mut attempt = 0usize;
     loop {
         let mut req = ureq::post(url).set("Content-Type", "application/json");
@@ -172,11 +184,7 @@ pub(crate) fn post_json(
         req = req.timeout(Duration::from_secs(timeout_secs));
 
         match req.send_json(body.clone()) {
-            Ok(resp) => {
-                return resp
-                    .into_json()
-                    .map_err(|e| ProviderError::Malformed(e.to_string()));
-            }
+            Ok(resp) => return Ok(resp.into_reader()),
             Err(ureq::Error::Status(code, resp)) => {
                 let text = resp.into_string().unwrap_or_default();
                 if is_quota_or_billing(&text)
@@ -189,13 +197,47 @@ pub(crate) fn post_json(
                 backoff(attempt);
             }
             Err(ureq::Error::Transport(t)) => {
-                if attempt < max_retries {
-                    attempt += 1;
-                    backoff(attempt);
-                    continue;
+                if attempt >= max_retries {
+                    return Err(map_transport(&t));
                 }
-                return Err(map_transport(&t));
+                attempt += 1;
+                backoff(attempt);
             }
+        }
+    }
+}
+
+/// Read the next SSE `data:` payload as a parsed JSON value, returning `None`
+/// at end of stream or `[DONE]`, or when `cancel` is set. `event:` lines,
+/// comments, and empty lines are skipped.
+fn next_sse_event(
+    reader: &mut impl std::io::BufRead,
+    cancel: &AtomicBool,
+) -> Result<Option<Value>, ProviderError> {
+    let mut line = String::new();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let trimmed = line.trim();
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            let data = data.trim();
+            if data == "[DONE]" {
+                return Ok(None);
+            }
+            if data.is_empty() {
+                continue;
+            }
+            let value: Value =
+                serde_json::from_str(data).map_err(|e| ProviderError::Malformed(e.to_string()))?;
+            return Ok(Some(value));
         }
     }
 }
