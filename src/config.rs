@@ -20,6 +20,7 @@ pub enum ProviderKind {
     Openai,
     Anthropic,
     Deepseek,
+    Fake,
 }
 
 impl ProviderKind {
@@ -30,8 +31,9 @@ impl ProviderKind {
             "openai" => Ok(Self::Openai),
             "anthropic" => Ok(Self::Anthropic),
             "deepseek" => Ok(Self::Deepseek),
+            "fake" => Ok(Self::Fake),
             other => Err(format!(
-                "unknown provider '{other}' (supported: openai, anthropic, deepseek)"
+                "unknown provider '{other}' (supported: openai, anthropic, deepseek, fake)"
             )),
         }
     }
@@ -41,6 +43,7 @@ impl ProviderKind {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Deepseek => "deepseek",
+            Self::Fake => "fake",
         }
     }
 
@@ -50,6 +53,7 @@ impl ProviderKind {
             Self::Openai => "https://api.openai.com",
             Self::Deepseek => "https://api.deepseek.com",
             Self::Anthropic => "https://api.anthropic.com",
+            Self::Fake => "",
         }
     }
 
@@ -59,6 +63,7 @@ impl ProviderKind {
             Self::Openai => "gpt-4o-mini",
             Self::Deepseek => "deepseek-chat",
             Self::Anthropic => "claude-3-5-sonnet-latest",
+            Self::Fake => "fake-model",
         }
     }
 }

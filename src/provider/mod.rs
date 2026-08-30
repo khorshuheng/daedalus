@@ -88,5 +88,6 @@ pub fn from_config(config: &Config) -> Box<dyn Provider> {
             Box::new(openai::OpenAIProvider::new(config))
         }
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(config)),
+        ProviderKind::Fake => Box::new(fake::FakeProvider::new(vec![])),
     }
 }
