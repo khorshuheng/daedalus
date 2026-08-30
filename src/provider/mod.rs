@@ -120,6 +120,25 @@ fn is_transient_status(code: u16) -> bool {
     code == 408 || code == 429 || (500..=599).contains(&code)
 }
 
+/// True when an error body indicates a quota/billing limit rather than a
+/// transient failure, so it is never retried (mirrors pi's non-retryable
+/// provider-limit patterns in `ai/src/utils/retry.ts`).
+fn is_quota_or_billing(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    [
+        "insufficient_quota",
+        "out of budget",
+        "quota exceeded",
+        "billing",
+        "usage limit",
+        "available balance",
+        "free usage limit",
+        "monthly usage",
+    ]
+    .iter()
+    .any(|p| t.contains(p))
+}
+
 /// Classify a transport error, separating timeouts from generic HTTP failures.
 fn map_transport(t: &ureq::Transport) -> ProviderError {
     let msg = t.to_string();
@@ -160,12 +179,14 @@ pub(crate) fn post_json(
             }
             Err(ureq::Error::Status(code, resp)) => {
                 let text = resp.into_string().unwrap_or_default();
-                if is_transient_status(code) && attempt < max_retries {
-                    attempt += 1;
-                    backoff(attempt);
-                    continue;
+                if is_quota_or_billing(&text)
+                    || !is_transient_status(code)
+                    || attempt >= max_retries
+                {
+                    return Err(map_status_error(code, text));
                 }
-                return Err(map_status_error(code, text));
+                attempt += 1;
+                backoff(attempt);
             }
             Err(ureq::Error::Transport(t)) => {
                 if attempt < max_retries {

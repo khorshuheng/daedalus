@@ -13,6 +13,24 @@ pub struct Workspace {
     root: PathBuf, // canonicalized absolute path
 }
 
+/// Normalize common path confusables that models sometimes emit — Unicode
+/// spaces and a leading `@` — so e.g. `foo\u{00A0}bar` resolves to `foo bar`
+/// (mirrors pi's `normalizeToolPath`).
+fn normalize_path(rel: &Path) -> PathBuf {
+    let mut s = rel.to_string_lossy().to_string();
+    if let Some(stripped) = s.strip_prefix('@') {
+        s = stripped.to_string();
+    }
+    let normalized: String = s
+        .chars()
+        .map(|c| match c {
+            '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect();
+    PathBuf::from(normalized)
+}
+
 impl Workspace {
     /// Construct a workspace from `root`, canonicalizing it and verifying it is
     /// a directory.
@@ -41,10 +59,11 @@ impl Workspace {
     /// existing ancestor is canonicalized and checked, then the non-existing
     /// remainder is re-appended.
     pub fn resolve(&self, rel: &Path) -> Result<PathBuf, String> {
-        let joined = if rel.is_absolute() {
-            rel.to_path_buf()
+        let normalized = normalize_path(rel);
+        let joined = if normalized.is_absolute() {
+            normalized
         } else {
-            self.root.join(rel)
+            self.root.join(&normalized)
         };
 
         // Find the deepest existing ancestor and canonicalize it (resolving
@@ -149,5 +168,15 @@ mod tests {
         let p = ws.resolve(Path::new("sub/deep/new.txt")).unwrap();
         assert_eq!(p, dir.join("sub/deep/new.txt"));
         assert!(p.starts_with(&dir));
+    }
+
+    #[test]
+    fn normalizes_unicode_spaces_in_paths() {
+        let (_guard, dir) = tempdir("nbsp");
+        std::fs::write(dir.join("a b.txt"), "x").unwrap();
+        let ws = Workspace::new(dir.clone()).unwrap();
+        // A non-breaking space in the filename is treated as a regular space.
+        let p = ws.resolve(Path::new("a\u{00A0}b.txt")).unwrap();
+        assert_eq!(p, dir.join("a b.txt"));
     }
 }

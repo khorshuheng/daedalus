@@ -135,10 +135,17 @@ impl<'a> Agent<'a> {
     /// The system prompt seeding every session: workspace + tool rules.
     pub fn system_prompt(&self) -> String {
         format!(
-            "You are crab, a minimal coding agent working in the directory '{}'.\n\
-             You may only use these four tools: read, bash, edit, write.\n\
-             All file paths are relative to the workspace and must stay inside it.\n\
-             Use the tools to inspect and modify the code, then give a final answer.",
+            "You are crab, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
+             You have exactly four tools and no others: read, bash, edit, write.\n\
+             - read: read a file or a line range (use offset to page through long files).\n\
+             - bash: run a shell command in the workspace; check results before trusting them.\n\
+             - edit: apply precise text replacements; each oldText must match exactly once.\n\
+             - write: create or overwrite a file.\n\
+             Rules:\n\
+             - All file paths are relative to the workspace and must stay inside it.\n\
+             - Read before editing; verify changes with bash.\n\
+             - Make the smallest change that satisfies the request.\n\
+             - When finished, give a concise final answer.",
             self.workspace.root().display()
         )
     }
