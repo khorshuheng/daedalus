@@ -8,6 +8,7 @@
 //! deterministic.
 
 use std::fmt;
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
 use crate::config::Config;
@@ -134,6 +135,11 @@ impl<'a> Agent<'a> {
         }
     }
 
+    /// The canonical workspace root; used to key persisted sessions.
+    pub fn workspace_root(&self) -> &Path {
+        self.workspace.root()
+    }
+
     /// The system prompt seeding every session: workspace + tool rules.
     pub fn system_prompt(&self) -> String {
         format!(
@@ -238,6 +244,17 @@ impl<'a, 'inner> Session<'a, 'inner> {
             Message::System(agent.system_prompt()),
             Message::User(prompt.to_string()),
         ];
+        Self::with_history(agent, history, cancel)
+    }
+
+    /// Build a session from an existing history, e.g. one loaded from disk by
+    /// `/resume` (CRAB-110). The history must start with the system prompt,
+    /// which (with the first user message) is the seed trimming never drops.
+    pub fn with_history(
+        agent: &'a Agent<'inner>,
+        history: Vec<Message>,
+        cancel: &'a AtomicBool,
+    ) -> Self {
         let schemas = agent.tools.tool_schemas();
         Self {
             agent,
@@ -247,6 +264,12 @@ impl<'a, 'inner> Session<'a, 'inner> {
             anchor_len: 0,
             cancel,
         }
+    }
+
+    /// The full message history (system prompt, user turns, assistant answers,
+    /// tool calls and results) — what auto-save persists and `/resume` loads.
+    pub fn history(&self) -> &[Message] {
+        &self.history
     }
 
     /// Inject a follow-up user message for the next turn.
@@ -624,5 +647,50 @@ mod tests {
         assert!(second
             .iter()
             .any(|m| matches!(m, Message::Assistant { text: Some(t), .. } if t == "first answer")));
+    }
+
+    #[test]
+    fn resumed_session_starts_from_loaded_history() {
+        // A history exactly as `load_previous` returns it (CRAB-109): the
+        // system prompt first, then prior turns. `with_history` must feed it
+        // through to the provider unchanged, so `/resume` restores context.
+        let (_dir, ws) = workspace("resume");
+        let cancel = AtomicBool::new(false);
+        let provider = ScriptedProvider {
+            completions: Mutex::new(std::collections::VecDeque::from([
+                crate::provider::Completion {
+                    response: Response::Text("resumed answer".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                },
+            ])),
+            histories: Mutex::new(Vec::new()),
+        };
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: _dir.clone(),
+            ..Config::defaults(_dir.clone())
+        };
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+
+        let history = vec![
+            Message::System("you are crab in /ws".into()),
+            Message::User("first question".into()),
+            Message::Assistant {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+            },
+            Message::User("second question".into()),
+        ];
+        let mut session = Session::with_history(&agent, history.clone(), &cancel);
+        assert_eq!(session.history(), history.as_slice());
+        match session.run_turn(&mut |_| {}).unwrap() {
+            Turn::Final(text) => assert_eq!(text, "resumed answer"),
+            _ => panic!("expected final answer"),
+        }
+        // The provider saw the full loaded history, unchanged.
+        let histories = provider.histories.lock().unwrap();
+        assert_eq!(histories[0].len(), 4);
     }
 }

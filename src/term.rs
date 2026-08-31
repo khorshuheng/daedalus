@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
@@ -92,8 +91,10 @@ fn input_loop(busy: Arc<AtomicBool>, tx: mpsc::Sender<InputEvent>) {
     let mut byte = [0u8; 1];
     loop {
         if std::io::stdin().read(&mut byte).unwrap_or(0) == 0 {
-            std::thread::sleep(Duration::from_millis(20));
-            continue;
+            // Real EOF (piped/closed stdin), not Ctrl-D: report it once so an
+            // idle REPL exits instead of waiting forever, then end the thread.
+            let _ = tx.send(InputEvent::Eof);
+            return;
         }
         let b = byte[0];
         let idle = !busy.load(Ordering::Relaxed);

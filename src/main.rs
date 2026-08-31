@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crab::agent::{Agent, AgentError, Session, Stream, Turn};
 use crab::config::{Config, Overrides, ProviderKind};
 use crab::provider;
+use crab::session;
 use crab::term;
 use crab::tools::resolver::ToolSet;
 use crab::workspace::Workspace;
@@ -153,6 +154,17 @@ fn run(cli: Cli) -> Result<i32, String> {
     run_repl(&agent, &cli.prompt)
 }
 
+/// Persist the current session history to disk (auto-save on exit, CRAB-109).
+/// A failure to save is a warning only — quitting must never be blocked by
+/// persistence.
+fn auto_save(agent: &Agent, session: &Session) {
+    let root = session::default_root();
+    match session::save_session(&root, agent.workspace_root(), session.history()) {
+        Ok(path) => eprintln!("session saved: {}", path.display()),
+        Err(e) => eprintln!("crab: warning: could not save session: {e}"),
+    }
+}
+
 /// The interactive REPL. Raw input mode is on for the whole session; a single
 /// input thread line-edits and reports Line/Cancel/Eof. While a turn runs,
 /// Esc/Ctrl-C cancel it; at the prompt, they terminate.
@@ -191,11 +203,17 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
         let event = rx.recv().map_err(|_| "input closed".to_string())?;
         match event {
             term::InputEvent::Line(line) => match line.trim() {
-                "/exit" | "/quit" | "/q" => return Ok(0),
+                "/exit" | "/quit" | "/q" => {
+                    auto_save(agent, &session);
+                    return Ok(0);
+                }
                 "" => continue,
                 msg => session.resume(msg.to_string()),
             },
-            term::InputEvent::Cancel | term::InputEvent::Eof => return Ok(0),
+            term::InputEvent::Cancel | term::InputEvent::Eof => {
+                auto_save(agent, &session);
+                return Ok(0);
+            }
         }
     }
 }
