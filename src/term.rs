@@ -90,55 +90,83 @@ fn input_loop(busy: Arc<AtomicBool>, tx: mpsc::Sender<InputEvent>) {
     let mut buf: Vec<u8> = Vec::new();
     let mut byte = [0u8; 1];
     loop {
-        if std::io::stdin().read(&mut byte).unwrap_or(0) == 0 {
-            // Real EOF (piped/closed stdin), not Ctrl-D: report it once so an
-            // idle REPL exits instead of waiting forever, then end the thread.
+        // Raw mode (VMIN=0) makes read() return 0 both when the input buffer
+        // is empty AND at EOF, so poll first to tell them apart. Readable
+        // data is drained before EOF is declared: poll reports POLLIN|POLLHUP
+        // together when the peer closed with bytes still buffered, and those
+        // bytes must be processed. A timeout means nothing was typed yet; a
+        // readable fd with a zero-byte read is EOF too (regular files have no
+        // HUP).
+        let events = poll_stdin(100).unwrap_or(0);
+        if events & libc::POLLIN != 0 {
+            if std::io::stdin().read(&mut byte).unwrap_or(0) == 0 {
+                let _ = tx.send(InputEvent::Eof);
+                return;
+            }
+            let b = byte[0];
+            let idle = !busy.load(Ordering::Relaxed);
+            match b {
+                0x0A | 0x0D => {
+                    if idle {
+                        let line = String::from_utf8_lossy(&buf).into_owned();
+                        buf.clear();
+                        let _ = std::io::stdout().write_all(b"\n");
+                        let _ = std::io::stdout().flush();
+                        if tx.send(InputEvent::Line(line)).is_err() {
+                            return;
+                        }
+                    }
+                }
+                0x1B | 0x03 => {
+                    if idle {
+                        if tx.send(InputEvent::Cancel).is_err() {
+                            return;
+                        }
+                    } else {
+                        request_cancel();
+                    }
+                }
+                0x04 => {
+                    if idle && buf.is_empty() && tx.send(InputEvent::Eof).is_err() {
+                        return;
+                    }
+                }
+                0x7F | 0x08 => {
+                    if idle && !buf.is_empty() {
+                        buf.pop();
+                        let _ = std::io::stdout().write_all(b"\x08 \x08");
+                        let _ = std::io::stdout().flush();
+                    }
+                }
+                b if idle && ((0x20..=0x7E).contains(&b) || b >= 0x80) => {
+                    buf.push(b);
+                    let _ = std::io::stdout().write_all(&[b]);
+                    let _ = std::io::stdout().flush();
+                }
+                _ => {}
+            }
+        } else if events & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            // Peer closed and no data left to drain: real EOF.
             let _ = tx.send(InputEvent::Eof);
             return;
         }
-        let b = byte[0];
-        let idle = !busy.load(Ordering::Relaxed);
-        match b {
-            0x0A | 0x0D => {
-                if idle {
-                    let line = String::from_utf8_lossy(&buf).into_owned();
-                    buf.clear();
-                    let _ = std::io::stdout().write_all(b"\n");
-                    let _ = std::io::stdout().flush();
-                    if tx.send(InputEvent::Line(line)).is_err() {
-                        return;
-                    }
-                }
-            }
-            0x1B | 0x03 => {
-                if idle {
-                    if tx.send(InputEvent::Cancel).is_err() {
-                        return;
-                    }
-                } else {
-                    request_cancel();
-                }
-            }
-            0x04 => {
-                if idle && buf.is_empty() && tx.send(InputEvent::Eof).is_err() {
-                    return;
-                }
-            }
-            0x7F | 0x08 => {
-                if idle && !buf.is_empty() {
-                    buf.pop();
-                    let _ = std::io::stdout().write_all(b"\x08 \x08");
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            b if idle && ((0x20..=0x7E).contains(&b) || b >= 0x80) => {
-                buf.push(b);
-                let _ = std::io::stdout().write_all(&[b]);
-                let _ = std::io::stdout().flush();
-            }
-            _ => {}
-        }
     }
+}
+
+/// Poll stdin for readability, returning the `revents` mask. Timeout bounds
+/// the wait so the loop can re-check the busy flag and idle conditions.
+#[cfg(unix)]
+fn poll_stdin(timeout_ms: i32) -> std::io::Result<i16> {
+    let mut fds = libc::pollfd {
+        fd: libc::STDIN_FILENO,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut fds, 1, timeout_ms) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(fds.revents)
 }
 
 // Non-Unix fallback: no raw mode, no Esc. Ctrl-C keeps the default SIGINT

@@ -352,8 +352,9 @@ pub fn load_previous(root: &Path, cwd: &Path) -> Result<Option<Vec<Message>>, Se
     }
 }
 
-/// Delete the most recent saved session for `cwd` (used by `/clear` so a
-/// subsequent `/resume` cannot resurrect a cleared conversation). Idempotent:
+/// Delete the most recent saved session for `cwd`. Available for callers
+/// that want to forget the previous conversation; `/clear` itself resets only
+/// the in-memory context and leaves saved sessions in place. Idempotent:
 /// no session -> no-op.
 pub fn clear_previous(root: &Path, cwd: &Path) -> Result<(), SessionError> {
     if let Some(path) = previous_session_file(root, cwd)? {

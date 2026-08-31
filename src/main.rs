@@ -12,13 +12,13 @@
 //!   2 — iteration cap exceeded
 
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crab::agent::{Agent, AgentError, Session, Stream, Turn};
 use crab::config::{Config, Overrides, ProviderKind};
-use crab::provider;
+use crab::provider::{self, Message};
 use crab::session;
 use crab::term;
 use crab::tools::resolver::ToolSet;
@@ -157,61 +157,155 @@ fn run(cli: Cli) -> Result<i32, String> {
 /// Persist the current session history to disk (auto-save on exit, CRAB-109).
 /// A failure to save is a warning only — quitting must never be blocked by
 /// persistence.
-fn auto_save(agent: &Agent, session: &Session) {
-    let root = session::default_root();
-    match session::save_session(&root, agent.workspace_root(), session.history()) {
+fn auto_save(agent: &Agent, session: &Session, root: &Path) {
+    match session::save_session(root, agent.workspace_root(), session.history()) {
         Ok(path) => eprintln!("session saved: {}", path.display()),
         Err(e) => eprintln!("crab: warning: could not save session: {e}"),
     }
 }
 
+/// How the REPL reacts to a slash command.
+enum CommandOutcome {
+    /// `/exit`/`/quit` — leave the REPL (after auto-saving).
+    Exit,
+    /// Show this message to the user.
+    Message(String),
+    /// Show this error to the user.
+    Error(String),
+}
+
+/// The built-in command list shown by `/help` and after an unknown command.
+const COMMANDS: &str = "\
+Commands:
+  /resume  Continue the previous session for this workspace
+  /clear   Reset the conversation to a fresh context
+  /help    Show this help
+  /exit    Quit and save the session (also /quit, /q)";
+
+/// True when the history contains at least one assistant message — i.e. the
+/// conversation actually produced output. A session holding only the system
+/// prompt (or an unanswered user message) is not worth resuming.
+fn has_conversation(history: &[Message]) -> bool {
+    history.iter().any(|m| matches!(m, Message::Assistant { .. }))
+}
+
+/// Dispatch a `/`-prefixed line to its handler (CRAB-110). Adding a command
+/// is one match arm plus a handler; there is no plugin mechanism.
+fn dispatch_command<'a, 'inner>(
+    agent: &'a Agent<'inner>,
+    session: &mut Session<'a, 'inner>,
+    root: &Path,
+    cmd: &str,
+) -> CommandOutcome {
+    match cmd {
+        "/exit" | "/quit" | "/q" => CommandOutcome::Exit,
+        "/help" => CommandOutcome::Message(COMMANDS.to_string()),
+        "/resume" => CommandOutcome::Message(handle_resume(agent, session, root)),
+        "/clear" => CommandOutcome::Message(handle_clear(agent, session)),
+        other => CommandOutcome::Error(format!("unknown command '{other}'\n{COMMANDS}")),
+    }
+}
+
+/// `/resume`: replace the running history with the previous session's, so the
+/// next turn continues where that session left off. Reports clearly when
+/// there is no previous session (or only an empty one) for this workspace.
+fn handle_resume<'a, 'inner>(
+    agent: &'a Agent<'inner>,
+    session: &mut Session<'a, 'inner>,
+    root: &Path,
+) -> String {
+    match session::load_previous(root, agent.workspace_root()) {
+        Ok(Some(history)) if has_conversation(&history) => {
+            let discarding = has_conversation(session.history());
+            let n = history.len();
+            *session = Session::with_history(agent, history, term::cancel_flag());
+            if discarding {
+                format!("resumed previous session ({n} messages); current conversation discarded")
+            } else {
+                format!("resumed previous session ({n} messages)")
+            }
+        }
+        Ok(Some(_)) => "previous session has no conversation to resume".to_string(),
+        Ok(None) => "no previous session for this workspace".to_string(),
+        Err(e) => format!("could not load previous session: {e}"),
+    }
+}
+
+/// `/clear`: reset the conversation to a fresh context — just the system
+/// prompt, so the next message becomes the first user turn. Saved sessions
+/// are left untouched (clear is a context reset, not a deletion).
+fn handle_clear<'a, 'inner>(agent: &'a Agent<'inner>, session: &mut Session<'a, 'inner>) -> String {
+    let fresh = vec![Message::System(agent.system_prompt())];
+    *session = Session::with_history(agent, fresh, term::cancel_flag());
+    "conversation cleared".to_string()
+}
+
 /// The interactive REPL. Raw input mode is on for the whole session; a single
 /// input thread line-edits and reports Line/Cancel/Eof. While a turn runs,
-/// Esc/Ctrl-C cancel it; at the prompt, they terminate.
+/// Esc/Ctrl-C cancel it; at the prompt, they terminate. A line beginning
+/// with `/` is a slash command (CRAB-110); anything else is a follow-up
+/// message. The session is auto-saved on exit (CRAB-109).
 fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
     let _raw = term::RawMode::enable().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let busy = Arc::new(AtomicBool::new(false));
     let (rx, _input) = term::spawn_input(Arc::clone(&busy));
+    let root = session::default_root();
 
     let mut session = Session::new(agent, initial, term::cancel_flag());
     loop {
         term::clear_cancel();
-        busy.store(true, Ordering::SeqCst);
+        // A turn runs only when the conversation has an unanswered user
+        // message (the initial prompt or a follow-up). Commands like /resume
+        // and /clear change the history without adding one, so the loop just
+        // waits for the next input instead of firing a spurious turn.
+        if session.history().last().is_some_and(|m| matches!(m, Message::User(_))) {
+            busy.store(true, Ordering::SeqCst);
 
-        let mut emit = |ev: Stream| match ev {
-            Stream::Text(t) => {
-                print!("{t}");
-                let _ = std::io::stdout().flush();
+            let mut emit = |ev: Stream| match ev {
+                Stream::Text(t) => {
+                    print!("{t}");
+                    let _ = std::io::stdout().flush();
+                }
+                Stream::Tools(names) => {
+                    print!("\n⚙ {}", names.join(", "));
+                    let _ = std::io::stdout().flush();
+                }
+            };
+            match session.run_turn(&mut emit) {
+                Ok(Turn::Final(answer)) => println!("{answer}"),
+                Ok(Turn::Cancelled(_)) => println!("\n(interrupted)"),
+                Err(AgentError::IterationCap(n)) => {
+                    eprintln!("\ncrab: iteration cap exceeded after {n} iterations")
+                }
+                Err(e) => eprintln!("\ncrab: {e}"),
             }
-            Stream::Tools(names) => {
-                print!("\n⚙ {}", names.join(", "));
-                let _ = std::io::stdout().flush();
-            }
-        };
-        match session.run_turn(&mut emit) {
-            Ok(Turn::Final(answer)) => println!("{answer}"),
-            Ok(Turn::Cancelled(_)) => println!("\n(interrupted)"),
-            Err(AgentError::IterationCap(n)) => {
-                eprintln!("\ncrab: iteration cap exceeded after {n} iterations")
-            }
-            Err(e) => eprintln!("\ncrab: {e}"),
+            busy.store(false, Ordering::SeqCst);
         }
-        busy.store(false, Ordering::SeqCst);
 
         print!("> ");
         let _ = std::io::stdout().flush();
         let event = rx.recv().map_err(|_| "input closed".to_string())?;
         match event {
-            term::InputEvent::Line(line) => match line.trim() {
-                "/exit" | "/quit" | "/q" => {
-                    auto_save(agent, &session);
-                    return Ok(0);
+            term::InputEvent::Line(line) => {
+                let trimmed = line.trim();
+                if trimmed.starts_with('/') {
+                    // A line beginning with `/` is a command, known or not.
+                    match dispatch_command(agent, &mut session, &root, trimmed) {
+                        CommandOutcome::Exit => {
+                            auto_save(agent, &session, &root);
+                            return Ok(0);
+                        }
+                        CommandOutcome::Message(m) => println!("{m}"),
+                        CommandOutcome::Error(e) => eprintln!("{e}"),
+                    }
+                } else if trimmed.is_empty() {
+                    continue;
+                } else {
+                    session.resume(trimmed.to_string());
                 }
-                "" => continue,
-                msg => session.resume(msg.to_string()),
-            },
+            }
             term::InputEvent::Cancel | term::InputEvent::Eof => {
-                auto_save(agent, &session);
+                auto_save(agent, &session, &root);
                 return Ok(0);
             }
         }
@@ -219,8 +313,7 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = match parse_args(&args) {
+    let args: Vec<String> = std::env::args().skip(1).collect();    let cli = match parse_args(&args) {
         Ok(ParseOutcome::Help) => {
             print!("{USAGE}");
             std::process::exit(0);
@@ -240,4 +333,216 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crab::config::Config;
+    use crab::provider::{Provider, ProviderError, Response};
+    use crab::tools::resolver::ToolSet;
+    use crab::workspace::Workspace;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+
+    /// A provider that records every history it is given and answers "done".
+    struct RecordingProvider {
+        histories: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl Provider for RecordingProvider {
+        fn complete(
+            &self,
+            history: &[Message],
+            _tools: &[serde_json::Value],
+            _cancel: &AtomicBool,
+            _on_text: &mut dyn FnMut(&str),
+        ) -> Result<crab::provider::Completion, ProviderError> {
+            self.histories.lock().unwrap().push(history.to_vec());
+            Ok(crab::provider::Completion {
+                response: Response::Text("done".into()),
+                prompt_tokens: None,
+                aborted: false,
+            })
+        }
+    }
+
+    /// Build a temp workspace + sessions root + a recording provider.
+    fn setup(name: &str) -> (PathBuf, PathBuf, RecordingProvider, ToolSet, Workspace, Config) {
+        let dir = std::env::temp_dir().join(format!("crab-main-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("sessions");
+        let provider = RecordingProvider {
+            histories: Mutex::new(Vec::new()),
+        };
+        let tools = ToolSet::new(1000);
+        let ws = Workspace::new(dir.clone()).unwrap();
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: dir.clone(),
+            ..Config::defaults(dir.clone())
+        };
+        (dir, root, provider, tools, ws, cfg)
+    }
+
+    fn run_turn(session: &mut Session) {
+        assert!(matches!(
+            session.run_turn(&mut |_| {}).unwrap(),
+            Turn::Final(_)
+        ));
+    }
+
+    #[test]
+    fn clear_resets_history_for_the_next_message() {
+        let (_dir, _root, provider, tools, ws, cfg) = setup("clear");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "initial prompt", term::cancel_flag());
+        run_turn(&mut session); // establishes a conversation
+
+        let msg = handle_clear(&agent, &mut session);
+        assert!(msg.contains("cleared"));
+        assert_eq!(session.history().len(), 1); // just the system prompt
+
+        // The next message starts a fresh conversation the model cannot
+        // confuse with the cleared one.
+        session.resume("follow-up after clear".into());
+        run_turn(&mut session);
+
+        let histories = provider.histories.lock().unwrap();
+        let second = &histories[1];
+        assert!(second
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "follow-up after clear")));
+        assert!(!second
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "initial prompt")));
+    }
+
+    #[test]
+    fn resume_loads_the_previous_session() {
+        let (_dir, root, provider, tools, ws, cfg) = setup("resume");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let prior = vec![
+            Message::System("sys".into()),
+            Message::User("q1".into()),
+            Message::Assistant {
+                text: Some("a1".into()),
+                tool_calls: vec![],
+            },
+            Message::User("q2".into()),
+            Message::Assistant {
+                text: Some("a2".into()),
+                tool_calls: vec![],
+            },
+        ];
+        session::save_session(&root, agent.workspace_root(), &prior).unwrap();
+
+        let mut session = Session::new(&agent, "trigger prompt", term::cancel_flag());
+        let msg = handle_resume(&agent, &mut session, &root);
+        assert!(msg.contains("resumed previous session (5 messages)"));
+        // The running history is replaced; the trigger prompt is gone.
+        assert_eq!(session.history(), prior.as_slice());
+
+        // The next turn shows the provider the resumed history.
+        session.resume("q3".into());
+        run_turn(&mut session);
+        let histories = provider.histories.lock().unwrap();
+        let seen = &histories[0];
+        assert!(seen.iter().any(|m| matches!(m, Message::User(u) if u == "q1")));
+        assert!(!seen
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "trigger prompt")));
+    }
+
+    #[test]
+    fn resume_notes_when_the_current_conversation_is_discarded() {
+        let (_dir, root, provider, tools, ws, cfg) = setup("resume-discard");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        session::save_session(
+            &root,
+            agent.workspace_root(),
+            &[
+                Message::System("sys".into()),
+                Message::User("q1".into()),
+                Message::Assistant {
+                    text: Some("a1".into()),
+                    tool_calls: vec![],
+                },
+            ],
+        )
+        .unwrap();
+
+        // The current session already produced a conversation; resuming must
+        // say it is being discarded.
+        let mut session = Session::new(&agent, "initial", term::cancel_flag());
+        run_turn(&mut session);
+        let msg = handle_resume(&agent, &mut session, &root);
+        assert!(msg.contains("resumed previous session (3 messages)"));
+        assert!(msg.contains("current conversation discarded"));
+        assert_eq!(session.history().len(), 3); // the loaded session
+    }
+
+    #[test]
+    fn resume_with_no_previous_session_reports_clearly() {
+        let (_dir, root, provider, tools, ws, cfg) = setup("resume-none");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "x", term::cancel_flag());
+        let msg = handle_resume(&agent, &mut session, &root);
+        assert!(msg.contains("no previous session for this workspace"));
+        assert_eq!(session.history().len(), 2); // untouched
+    }
+
+    #[test]
+    fn resume_skips_a_session_with_no_conversation() {
+        let (_dir, root, provider, tools, ws, cfg) = setup("resume-empty");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        // A saved session that is only the system prompt (what /clear followed
+        // by exit leaves behind) is not resumable.
+        session::save_session(
+            &root,
+            agent.workspace_root(),
+            &[Message::System("sys".into())],
+        )
+        .unwrap();
+
+        let mut session = Session::new(&agent, "x", term::cancel_flag());
+        let msg = handle_resume(&agent, &mut session, &root);
+        assert!(msg.contains("no conversation to resume"));
+        assert_eq!(session.history().len(), 2); // untouched
+    }
+
+    #[test]
+    fn unknown_command_is_reported_with_the_command_list() {
+        let (_dir, root, provider, tools, ws, cfg) = setup("unknown");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "x", term::cancel_flag());
+        match dispatch_command(&agent, &mut session, &root, "/nope") {
+            CommandOutcome::Error(e) => {
+                assert!(e.contains("unknown command '/nope'"));
+                assert!(e.contains("/resume"));
+                assert!(e.contains("/help"));
+            }
+            _ => panic!("expected an error outcome"),
+        }
+    }
+
+    #[test]
+    fn help_lists_the_commands_and_exit_returns_exit() {
+        for cmd in ["/resume", "/clear", "/help", "/exit", "/quit"] {
+            assert!(COMMANDS.contains(cmd), "missing {cmd} in help");
+        }
+        let (_dir, root, provider, tools, ws, cfg) = setup("help");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "x", term::cancel_flag());
+        match dispatch_command(&agent, &mut session, &root, "/exit") {
+            CommandOutcome::Exit => {}
+            _ => panic!("expected exit outcome"),
+        }
+        match dispatch_command(&agent, &mut session, &root, "/help") {
+            CommandOutcome::Message(m) => assert_eq!(m, COMMANDS),
+            _ => panic!("expected message outcome"),
+        }
+    }
 }
