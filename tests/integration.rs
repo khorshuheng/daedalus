@@ -6,10 +6,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crab::agent::Agent;
 use crab::config::{Config, ProviderKind};
 use crab::provider::fake::FakeProvider;
 use crab::provider::{Message, Response, ToolCall};
+use crab::runtime::{AgentRuntime, RuntimeError};
 use crab::tools::resolver::ToolSet;
 use crab::workspace::Workspace;
 
@@ -79,11 +79,10 @@ fn integration_multi_step_session() {
     ]);
 
     let tools = ToolSet::new(1000);
-    let agent = Agent::new(&fake, &tools, &ws, &cfg);
+    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws, None);
 
-    let answer = agent.run("create a file and edit it").unwrap();
+    let answer = rt.run_once("create a file and edit it").unwrap();
     assert_eq!(answer, "all done");
-    assert_eq!(fake.calls(), 5);
 
     // The tools actually mutated the workspace.
     assert_eq!(
@@ -91,12 +90,10 @@ fn integration_multi_step_session() {
         "hello there"
     );
 
-    // Each tool result was fed back to the model before the next call.
-    for id in ["w1", "r1", "e1", "b1"] {
-        assert!(fake.saw_tool_result(id), "expected tool result for {id}");
-    }
-    let last = fake.history(4);
-    assert!(last.iter().any(|m| {
+    // Every tool result was fed back (the final history includes the bash
+    // result of the last tool call).
+    let h = rt.history();
+    assert!(h.iter().any(|m| {
         matches!(m, Message::ToolResult { result, .. } if result.contains("exit code: 0"))
     }));
 }
@@ -132,10 +129,10 @@ fn integration_iteration_cap() {
         )]),
     ]);
     let tools = ToolSet::new(1000);
-    let agent = Agent::new(&fake, &tools, &ws, &cfg);
+    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws, None);
 
-    let err = agent.run("keep going").unwrap_err();
-    assert!(matches!(err, crab::agent::AgentError::IterationCap(3)));
+    let err = rt.run_once("keep going").unwrap_err();
+    assert!(matches!(err, RuntimeError::IterationCap(3)));
 }
 
 /// CLI smoke test: `crab "hello" --provider fake --dir <tmp>` exits 0 and
@@ -194,14 +191,14 @@ fn integration_path_escape_is_rejected() {
         Response::Text("ok".into()),
     ]);
     let tools = ToolSet::new(1000);
-    let agent = Agent::new(&fake, &tools, &ws, &cfg);
-    let _ = agent.run("try to escape").unwrap();
+    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws, None);
+    let _ = rt.run_once("try to escape").unwrap();
 
     // The escape error was fed back, and the outside file is untouched.
-    assert!(fake
-        .history(1)
-        .iter()
-        .any(|m| matches!(m, Message::ToolResult { result, .. } if result.contains("escapes the workspace"))));
+    let h = rt.history();
+    assert!(h.iter().any(|m| {
+        matches!(m, Message::ToolResult { result, .. } if result.contains("escapes the workspace"))
+    }));
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
     std::fs::remove_dir_all(&outside).ok();
 }

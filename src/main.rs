@@ -2,9 +2,10 @@
 //!
 //! Takes a positional `<prompt>` and a workspace directory (`--dir`, defaulting
 //! to cwd) plus `--model`, `--provider`, `--max-iterations`, and `--config`.
-//! Builds the app from config (CRAB-105), constructs the agent loop (CRAB-104)
-//! with the selected provider (CRAB-103) and tools (CRAB-102), runs it, and
-//! prints the final answer to stdout.
+//! Builds the app from config (CRAB-105), constructs the AgentRuntime
+//! (CRAB-116) with the selected provider (CRAB-103) and tools (CRAB-102), and
+//! drives it: piped stdin runs one prompt to completion; an interactive
+//! terminal runs a REPL that consumes runtime events and sends commands.
 //!
 //! Exit codes:
 //!   0 — clean final answer
@@ -14,13 +15,14 @@
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
-use crab::agent::{Agent, AgentError, Session, Stream, Turn};
 use crab::config::{Config, Overrides, ProviderKind};
 use crab::memory;
 use crab::provider::{self, Message};
 use crab::reflect;
+use crab::runtime::{AgentRuntime, Event, RuntimeError};
 use crab::session;
 use crab::term;
 use crab::tools::resolver::ToolSet;
@@ -136,24 +138,19 @@ fn run(cli: Cli) -> Result<i32, String> {
     let provider = provider::from_config(&config);
     let tools = ToolSet::new(config.max_output_bytes);
     // Memory injection (CRAB-114): real sessions rank lessons for the
-    // workspace into the system prompt; tests use Agent::new (no memory).
-    let agent = Agent::with_memory_root(
-        provider.as_ref(),
-        &tools,
-        &workspace,
-        &config,
-        Some(memory::default_root()),
-    );
+    // workspace into the system prompt.
+    let memory_root = Some(memory::default_root());
 
     // Interactive terminal -> REPL (Ctrl-C/Esc cancel while busy, terminate at
     // the prompt, /exit to quit). Piped stdin -> one-shot.
     if !std::io::stdin().is_terminal() {
-        return match agent.run(&cli.prompt) {
+        let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+        return match rt.run_once(&cli.prompt) {
             Ok(answer) => {
                 println!("{answer}");
                 Ok(0)
             }
-            Err(AgentError::IterationCap(n)) => {
+            Err(RuntimeError::IterationCap(n)) => {
                 eprintln!("crab: iteration cap exceeded: no final answer after {n} iterations");
                 Ok(2)
             }
@@ -161,15 +158,22 @@ fn run(cli: Cli) -> Result<i32, String> {
         };
     }
 
-    run_repl(&agent, &cli.prompt)
+    run_repl(config, provider, tools, workspace, memory_root, &cli.prompt)
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Persist the current session history to disk (auto-save on exit, CRAB-109)
 /// and, when the conversation produced output, reflect it into memory
 /// (auto-reflect at session end, CRAB-112). Failures are warnings only —
 /// quitting must never be blocked by persistence or reflection.
-fn auto_save(agent: &Agent, session: &Session, root: &Path, memory_root: &Path) {
-    let saved = match session::save_session(root, agent.workspace_root(), session.history()) {
+fn auto_save(rt: &AgentRuntime, root: &Path, memory_root: &Path) {
+    let saved = match session::save_session(root, &rt.workspace_root(), &rt.history()) {
         Ok(path) => {
             eprintln!("session saved: {}", path.display());
             Some(path)
@@ -179,17 +183,19 @@ fn auto_save(agent: &Agent, session: &Session, root: &Path, memory_root: &Path) 
             None
         }
     };
-    if !has_conversation(session.history()) {
+    if !has_conversation(&rt.history()) {
         return;
     }
     // The session was just saved, so lessons can carry its real id.
     let source = saved.as_deref().and_then(session::file_id);
+    let history = rt.history();
+    let ws = rt.workspace_root();
     match reflect::reflect_and_store(
         memory_root,
-        agent.workspace_root(),
-        agent.provider(),
+        &ws,
+        rt.provider().as_ref(),
         term::cancel_flag(),
-        session.history(),
+        &history,
         source,
         now_millis(),
     ) {
@@ -229,9 +235,8 @@ fn has_conversation(history: &[Message]) -> bool {
 
 /// Dispatch a `/`-prefixed line to its handler (CRAB-110). Adding a command
 /// is one match arm plus a handler; there is no plugin mechanism.
-fn dispatch_command<'a, 'inner>(
-    agent: &'a Agent<'inner>,
-    session: &mut Session<'a, 'inner>,
+fn dispatch_command(
+    rt: &AgentRuntime,
     root: &Path,
     memory_root: &Path,
     cmd: &str,
@@ -239,9 +244,9 @@ fn dispatch_command<'a, 'inner>(
     match cmd {
         "/exit" | "/quit" | "/q" => CommandOutcome::Exit,
         "/help" => CommandOutcome::Message(COMMANDS.to_string()),
-        "/resume" => CommandOutcome::Message(handle_resume(agent, session, root)),
-        "/clear" => CommandOutcome::Message(handle_clear(agent, session)),
-        "/reflect" => CommandOutcome::Message(handle_reflect(agent, session, root, memory_root)),
+        "/resume" => CommandOutcome::Message(handle_resume(rt, root)),
+        "/clear" => CommandOutcome::Message(handle_clear(rt)),
+        "/reflect" => CommandOutcome::Message(handle_reflect(rt, root, memory_root)),
         other => CommandOutcome::Error(format!("unknown command '{other}'\n{COMMANDS}")),
     }
 }
@@ -249,16 +254,12 @@ fn dispatch_command<'a, 'inner>(
 /// `/resume`: replace the running history with the previous session's, so the
 /// next turn continues where that session left off. Reports clearly when
 /// there is no previous session (or only an empty one) for this workspace.
-fn handle_resume<'a, 'inner>(
-    agent: &'a Agent<'inner>,
-    session: &mut Session<'a, 'inner>,
-    root: &Path,
-) -> String {
-    match session::load_previous(root, agent.workspace_root()) {
+fn handle_resume(rt: &AgentRuntime, root: &Path) -> String {
+    match session::load_previous(root, &rt.workspace_root()) {
         Ok(Some(history)) if has_conversation(&history) => {
-            let discarding = has_conversation(session.history());
+            let discarding = has_conversation(&rt.history());
             let n = history.len();
-            *session = Session::with_history(agent, history, term::cancel_flag());
+            rt.replace_history(history);
             if discarding {
                 format!("resumed previous session ({n} messages); current conversation discarded")
             } else {
@@ -273,42 +274,32 @@ fn handle_resume<'a, 'inner>(
 
 /// `/clear`: reset the conversation to a fresh context — just the system
 /// prompt, so the next message becomes the first user turn. Saved sessions
-/// are left untouched (clear is a context reset, not a deletion).
-fn handle_clear<'a, 'inner>(agent: &'a Agent<'inner>, session: &mut Session<'a, 'inner>) -> String {
-    let fresh = vec![Message::System(agent.system_prompt())];
-    *session = Session::with_history(agent, fresh, term::cancel_flag());
+/// are left untouched (clear is a context reset, not a deletion). Runs
+/// synchronously because the REPL only issues it while the worker is idle.
+fn handle_clear(rt: &AgentRuntime) -> String {
+    rt.reset_sync();
     "conversation cleared".to_string()
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// `/reflect`: reflect on the running conversation (auto-saving it first so
 /// lessons carry a real session id as provenance) and append new lessons to
 /// memory. On-demand trigger (CRAB-112).
-fn handle_reflect<'a, 'inner>(
-    agent: &'a Agent<'inner>,
-    session: &Session<'a, 'inner>,
-    root: &Path,
-    memory_root: &Path,
-) -> String {
-    if !has_conversation(session.history()) {
+fn handle_reflect(rt: &AgentRuntime, root: &Path, memory_root: &Path) -> String {
+    if !has_conversation(&rt.history()) {
         return "no conversation to reflect on".to_string();
     }
-    let path = match session::save_session(root, agent.workspace_root(), session.history()) {
+    let path = match session::save_session(root, &rt.workspace_root(), &rt.history()) {
         Ok(p) => p,
         Err(e) => return format!("could not save session: {e}"),
     };
+    let history = rt.history();
+    let ws = rt.workspace_root();
     match reflect::reflect_and_store(
         memory_root,
-        agent.workspace_root(),
-        agent.provider(),
+        &ws,
+        rt.provider().as_ref(),
         term::cancel_flag(),
-        session.history(),
+        &history,
         session::file_id(&path),
         now_millis(),
     ) {
@@ -318,64 +309,88 @@ fn handle_reflect<'a, 'inner>(
     }
 }
 
-/// The interactive REPL. Raw input mode is on for the whole session; a single
-/// input thread line-edits and reports Line/Cancel/Eof. While a turn runs,
-/// Esc/Ctrl-C cancel it; at the prompt, they terminate. A line beginning
-/// with `/` is a slash command (CRAB-110); anything else is a follow-up
-/// message. The session is auto-saved on exit (CRAB-109).
-fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
+/// Consume runtime events until the agent settles, printing text deltas and
+/// tool markers. Returns the settled text (empty when interrupted).
+fn consume_until_settled(rx: &Receiver<Event>, busy: &AtomicBool) -> String {
+    busy.store(true, Ordering::SeqCst);
+    let mut text = String::new();
+    loop {
+        match rx.recv() {
+            Ok(Event::TextDelta { text: t }) => {
+                print!("{t}");
+                text.push_str(&t);
+                let _ = std::io::stdout().flush();
+            }
+            Ok(Event::ToolStart { name, .. }) => {
+                print!("\n⚙ {name}");
+                let _ = std::io::stdout().flush();
+            }
+            Ok(Event::ToolEnd { ok, .. }) => {
+                if !ok {
+                    print!(" ✗");
+                    let _ = std::io::stdout().flush();
+                }
+            }
+            Ok(Event::AgentSettled { text: t, .. }) => {
+                busy.store(false, Ordering::SeqCst);
+                return if t.is_empty() { text } else { t };
+            }
+            Ok(Event::Error { message }) => {
+                eprintln!("\ncrab: {message}");
+                busy.store(false, Ordering::SeqCst);
+                return String::new();
+            }
+            Ok(_) => {}
+            Err(_) => {
+                busy.store(false, Ordering::SeqCst);
+                return String::new();
+            }
+        }
+    }
+}
+
+/// The interactive REPL (CRAB-110) on top of the runtime (CRAB-116). Raw
+/// input mode is on for the whole session; a single input thread line-edits
+/// and reports Line/Cancel/Eof. While a turn runs, Esc/Ctrl-C abort it; at
+/// the prompt, they terminate. A line beginning with `/` is a slash command;
+/// anything else is a follow-up. The session is auto-saved on exit.
+fn run_repl(
+    config: Config,
+    provider: Box<dyn crab::provider::Provider>,
+    tools: ToolSet,
+    workspace: Workspace,
+    memory_root: Option<PathBuf>,
+    initial: &str,
+) -> Result<i32, String> {
     let _raw = term::RawMode::enable().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let busy = Arc::new(AtomicBool::new(false));
-    let (rx, _input) = term::spawn_input(Arc::clone(&busy));
+    let (rx_input, _input) = term::spawn_input(Arc::clone(&busy));
     let root = session::default_root();
-    let memory_root = memory::default_root();
+    let mem = memory_root.clone().unwrap_or_else(memory::default_root);
 
-    let mut session = Session::new(agent, initial, term::cancel_flag());
+    let (rt, rx_events) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+    let worker = rt.clone();
+    let _worker_handle = std::thread::spawn(move || worker.run_forever());
+
+    // First message: the initial prompt.
+    rt.prompt(initial);
+    let mut last_answer = consume_until_settled(&rx_events, &busy);
+    if !last_answer.is_empty() {
+        println!("{last_answer}");
+    }
+
     loop {
-        term::clear_cancel();
-        // A turn runs only when the conversation has an unanswered user
-        // message (the initial prompt or a follow-up). Commands like /resume
-        // and /clear change the history without adding one, so the loop just
-        // waits for the next input instead of firing a spurious turn.
-        if session
-            .history()
-            .last()
-            .is_some_and(|m| matches!(m, Message::User(_)))
-        {
-            busy.store(true, Ordering::SeqCst);
-
-            let mut emit = |ev: Stream| match ev {
-                Stream::Text(t) => {
-                    print!("{t}");
-                    let _ = std::io::stdout().flush();
-                }
-                Stream::Tools(names) => {
-                    print!("\n⚙ {}", names.join(", "));
-                    let _ = std::io::stdout().flush();
-                }
-            };
-            match session.run_turn(&mut emit) {
-                Ok(Turn::Final(answer)) => println!("{answer}"),
-                Ok(Turn::Cancelled(_)) => println!("\n(interrupted)"),
-                Err(AgentError::IterationCap(n)) => {
-                    eprintln!("\ncrab: iteration cap exceeded after {n} iterations")
-                }
-                Err(e) => eprintln!("\ncrab: {e}"),
-            }
-            busy.store(false, Ordering::SeqCst);
-        }
-
         print!("> ");
         let _ = std::io::stdout().flush();
-        let event = rx.recv().map_err(|_| "input closed".to_string())?;
+        let event = rx_input.recv().map_err(|_| "input closed".to_string())?;
         match event {
             term::InputEvent::Line(line) => {
                 let trimmed = line.trim();
                 if trimmed.starts_with('/') {
-                    // A line beginning with `/` is a command, known or not.
-                    match dispatch_command(agent, &mut session, &root, &memory_root, trimmed) {
+                    match dispatch_command(&rt, &root, &mem, trimmed) {
                         CommandOutcome::Exit => {
-                            auto_save(agent, &session, &root, &memory_root);
+                            auto_save(&rt, &root, &mem);
+                            rt.shutdown();
                             return Ok(0);
                         }
                         CommandOutcome::Message(m) => println!("{m}"),
@@ -383,12 +398,24 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
                     }
                 } else if trimmed.is_empty() {
                     continue;
+                } else if busy.load(Ordering::Relaxed) {
+                    // Typing while the agent runs steers it (CRAB-116).
+                    rt.steer(trimmed);
                 } else {
-                    session.resume(trimmed.to_string());
+                    rt.prompt(trimmed);
+                    last_answer = consume_until_settled(&rx_events, &busy);
+                    if !last_answer.is_empty() {
+                        println!("{last_answer}");
+                    }
                 }
             }
             term::InputEvent::Cancel | term::InputEvent::Eof => {
-                auto_save(agent, &session, &root, &memory_root);
+                if busy.load(Ordering::Relaxed) {
+                    rt.abort();
+                    let _ = consume_until_settled(&rx_events, &busy);
+                }
+                auto_save(&rt, &root, &mem);
+                rt.shutdown();
                 return Ok(0);
             }
         }
@@ -424,6 +451,7 @@ mod tests {
     use super::*;
     use crab::config::Config;
     use crab::provider::{Provider, ProviderError, Response};
+    use crab::runtime::AgentRuntime;
     use crab::tools::resolver::ToolSet;
     use crab::workspace::Workspace;
     use std::path::PathBuf;
@@ -452,198 +480,7 @@ mod tests {
         }
     }
 
-    /// Build a temp workspace + sessions root + a recording provider.
-    fn setup(
-        name: &str,
-    ) -> (
-        PathBuf,
-        PathBuf,
-        RecordingProvider,
-        ToolSet,
-        Workspace,
-        Config,
-    ) {
-        let dir = std::env::temp_dir().join(format!("crab-main-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("sessions");
-        let provider = RecordingProvider {
-            histories: Mutex::new(Vec::new()),
-        };
-        let tools = ToolSet::new(1000);
-        let ws = Workspace::new(dir.clone()).unwrap();
-        let cfg = Config {
-            max_iterations: 10,
-            workspace: dir.clone(),
-            ..Config::defaults(dir.clone())
-        };
-        (dir, root, provider, tools, ws, cfg)
-    }
-
-    fn run_turn(session: &mut Session) {
-        assert!(matches!(
-            session.run_turn(&mut |_| {}).unwrap(),
-            Turn::Final(_)
-        ));
-    }
-
-    #[test]
-    fn clear_resets_history_for_the_next_message() {
-        let (_dir, _root, provider, tools, ws, cfg) = setup("clear");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let mut session = Session::new(&agent, "initial prompt", term::cancel_flag());
-        run_turn(&mut session); // establishes a conversation
-
-        let msg = handle_clear(&agent, &mut session);
-        assert!(msg.contains("cleared"));
-        assert_eq!(session.history().len(), 1); // just the system prompt
-
-        // The next message starts a fresh conversation the model cannot
-        // confuse with the cleared one.
-        session.resume("follow-up after clear".into());
-        run_turn(&mut session);
-
-        let histories = provider.histories.lock().unwrap();
-        let second = &histories[1];
-        assert!(second
-            .iter()
-            .any(|m| matches!(m, Message::User(u) if u == "follow-up after clear")));
-        assert!(!second
-            .iter()
-            .any(|m| matches!(m, Message::User(u) if u == "initial prompt")));
-    }
-
-    #[test]
-    fn resume_loads_the_previous_session() {
-        let (_dir, root, provider, tools, ws, cfg) = setup("resume");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let prior = vec![
-            Message::System("sys".into()),
-            Message::User("q1".into()),
-            Message::Assistant {
-                text: Some("a1".into()),
-                tool_calls: vec![],
-            },
-            Message::User("q2".into()),
-            Message::Assistant {
-                text: Some("a2".into()),
-                tool_calls: vec![],
-            },
-        ];
-        session::save_session(&root, agent.workspace_root(), &prior).unwrap();
-
-        let mut session = Session::new(&agent, "trigger prompt", term::cancel_flag());
-        let msg = handle_resume(&agent, &mut session, &root);
-        assert!(msg.contains("resumed previous session (5 messages)"));
-        // The running history is replaced; the trigger prompt is gone.
-        assert_eq!(session.history(), prior.as_slice());
-
-        // The next turn shows the provider the resumed history.
-        session.resume("q3".into());
-        run_turn(&mut session);
-        let histories = provider.histories.lock().unwrap();
-        let seen = &histories[0];
-        assert!(seen
-            .iter()
-            .any(|m| matches!(m, Message::User(u) if u == "q1")));
-        assert!(!seen
-            .iter()
-            .any(|m| matches!(m, Message::User(u) if u == "trigger prompt")));
-    }
-
-    #[test]
-    fn resume_notes_when_the_current_conversation_is_discarded() {
-        let (_dir, root, provider, tools, ws, cfg) = setup("resume-discard");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        session::save_session(
-            &root,
-            agent.workspace_root(),
-            &[
-                Message::System("sys".into()),
-                Message::User("q1".into()),
-                Message::Assistant {
-                    text: Some("a1".into()),
-                    tool_calls: vec![],
-                },
-            ],
-        )
-        .unwrap();
-
-        // The current session already produced a conversation; resuming must
-        // say it is being discarded.
-        let mut session = Session::new(&agent, "initial", term::cancel_flag());
-        run_turn(&mut session);
-        let msg = handle_resume(&agent, &mut session, &root);
-        assert!(msg.contains("resumed previous session (3 messages)"));
-        assert!(msg.contains("current conversation discarded"));
-        assert_eq!(session.history().len(), 3); // the loaded session
-    }
-
-    #[test]
-    fn resume_with_no_previous_session_reports_clearly() {
-        let (_dir, root, provider, tools, ws, cfg) = setup("resume-none");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let mut session = Session::new(&agent, "x", term::cancel_flag());
-        let msg = handle_resume(&agent, &mut session, &root);
-        assert!(msg.contains("no previous session for this workspace"));
-        assert_eq!(session.history().len(), 2); // untouched
-    }
-
-    #[test]
-    fn resume_skips_a_session_with_no_conversation() {
-        let (_dir, root, provider, tools, ws, cfg) = setup("resume-empty");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        // A saved session that is only the system prompt (what /clear followed
-        // by exit leaves behind) is not resumable.
-        session::save_session(
-            &root,
-            agent.workspace_root(),
-            &[Message::System("sys".into())],
-        )
-        .unwrap();
-
-        let mut session = Session::new(&agent, "x", term::cancel_flag());
-        let msg = handle_resume(&agent, &mut session, &root);
-        assert!(msg.contains("no conversation to resume"));
-        assert_eq!(session.history().len(), 2); // untouched
-    }
-
-    #[test]
-    fn unknown_command_is_reported_with_the_command_list() {
-        let (dir, root, provider, tools, ws, cfg) = setup("unknown");
-        let memory_root = dir.join("memory");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let mut session = Session::new(&agent, "x", term::cancel_flag());
-        match dispatch_command(&agent, &mut session, &root, &memory_root, "/nope") {
-            CommandOutcome::Error(e) => {
-                assert!(e.contains("unknown command '/nope'"));
-                assert!(e.contains("/resume"));
-                assert!(e.contains("/help"));
-            }
-            _ => panic!("expected an error outcome"),
-        }
-    }
-
-    #[test]
-    fn help_lists_the_commands_and_exit_returns_exit() {
-        for cmd in ["/resume", "/clear", "/reflect", "/help", "/exit", "/quit"] {
-            assert!(COMMANDS.contains(cmd), "missing {cmd} in help");
-        }
-        let (dir, root, provider, tools, ws, cfg) = setup("help");
-        let memory_root = dir.join("memory");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let mut session = Session::new(&agent, "x", term::cancel_flag());
-        match dispatch_command(&agent, &mut session, &root, &memory_root, "/exit") {
-            CommandOutcome::Exit => {}
-            _ => panic!("expected exit outcome"),
-        }
-        match dispatch_command(&agent, &mut session, &root, &memory_root, "/help") {
-            CommandOutcome::Message(m) => assert_eq!(m, COMMANDS),
-            _ => panic!("expected message outcome"),
-        }
-    }
-
-    /// A provider that plays a scripted `Response` per call (for /reflect).
+    /// A provider that plays a scripted `Response` per call.
     struct ScriptedProvider {
         responses: Mutex<std::collections::VecDeque<crab::provider::Response>>,
         histories: Mutex<Vec<Vec<Message>>>,
@@ -672,26 +509,214 @@ mod tests {
         }
     }
 
+    /// Build a temp workspace + sessions root + a recording provider.
+    fn setup(
+        name: &str,
+        provider: Box<dyn Provider>,
+    ) -> (PathBuf, PathBuf, AgentRuntime, Workspace) {
+        let dir = std::env::temp_dir().join(format!("crab-main-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("sessions");
+        let tools = ToolSet::new(1000);
+        let ws = Workspace::new(dir.clone()).unwrap();
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: dir.clone(),
+            ..Config::defaults(dir.clone())
+        };
+        let (rt, _rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        (dir, root, rt, ws)
+    }
+
+    fn mem_root(dir: &Path) -> PathBuf {
+        dir.join("memory")
+    }
+
+    #[test]
+    fn clear_resets_history_for_the_next_message() {
+        let (dir, _root, rt, _ws) = setup(
+            "clear",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        // Establish a conversation.
+        assert_eq!(rt.run_once("initial prompt").unwrap(), "done");
+        assert!(has_conversation(&rt.history()));
+
+        let msg = handle_clear(&rt);
+        assert!(msg.contains("cleared"));
+        // After /clear the history is just the seed system prompt.
+        assert_eq!(rt.history().len(), 1);
+
+        // The next prompt starts a fresh conversation.
+        assert_eq!(rt.run_once("follow-up after clear").unwrap(), "done");
+        let h = rt.history();
+        assert!(h
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "follow-up after clear")));
+        assert!(!h
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "initial prompt")));
+        let _ = memory_root;
+    }
+
+    #[test]
+    fn resume_loads_the_previous_session() {
+        let (dir, root, rt, ws) = setup(
+            "resume",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        let prior = vec![
+            Message::System("sys".into()),
+            Message::User("q1".into()),
+            Message::Assistant {
+                text: Some("a1".into()),
+                tool_calls: vec![],
+            },
+            Message::User("q2".into()),
+            Message::Assistant {
+                text: Some("a2".into()),
+                tool_calls: vec![],
+            },
+        ];
+        session::save_session(&root, ws.root(), &prior).unwrap();
+
+        // A fresh runtime (no conversation yet).
+        let msg = handle_resume(&rt, &root);
+        assert!(msg.contains("resumed previous session (5 messages)"));
+        assert_eq!(rt.history(), prior);
+        let _ = memory_root;
+    }
+
+    #[test]
+    fn resume_notes_when_the_current_conversation_is_discarded() {
+        let (dir, root, rt, ws) = setup(
+            "resume-discard",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        session::save_session(
+            &root,
+            ws.root(),
+            &[
+                Message::System("sys".into()),
+                Message::User("q1".into()),
+                Message::Assistant {
+                    text: Some("a1".into()),
+                    tool_calls: vec![],
+                },
+            ],
+        )
+        .unwrap();
+
+        // Current session already produced a conversation.
+        assert_eq!(rt.run_once("initial").unwrap(), "done");
+        let msg = handle_resume(&rt, &root);
+        assert!(msg.contains("resumed previous session (3 messages)"));
+        assert!(msg.contains("current conversation discarded"));
+        assert_eq!(rt.history().len(), 3); // the loaded session
+        let _ = memory_root;
+    }
+
+    #[test]
+    fn resume_with_no_previous_session_reports_clearly() {
+        let (dir, root, rt, _ws) = setup(
+            "resume-none",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        let msg = handle_resume(&rt, &root);
+        assert!(msg.contains("no previous session for this workspace"));
+        let _ = memory_root;
+    }
+
+    #[test]
+    fn resume_skips_a_session_with_no_conversation() {
+        let (dir, root, rt, ws) = setup(
+            "resume-empty",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        session::save_session(&root, ws.root(), &[Message::System("sys".into())]).unwrap();
+
+        let msg = handle_resume(&rt, &root);
+        assert!(msg.contains("no conversation to resume"));
+        let _ = memory_root;
+    }
+
+    #[test]
+    fn unknown_command_is_reported_with_the_command_list() {
+        let (dir, root, rt, _ws) = setup(
+            "unknown",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        match dispatch_command(&rt, &root, &memory_root, "/nope") {
+            CommandOutcome::Error(e) => {
+                assert!(e.contains("unknown command '/nope'"));
+                assert!(e.contains("/resume"));
+                assert!(e.contains("/help"));
+            }
+            _ => panic!("expected an error outcome"),
+        }
+    }
+
+    #[test]
+    fn help_lists_the_commands_and_exit_returns_exit() {
+        for cmd in ["/resume", "/clear", "/reflect", "/help", "/exit", "/quit"] {
+            assert!(COMMANDS.contains(cmd), "missing {cmd} in help");
+        }
+        let (dir, root, rt, _ws) = setup(
+            "help",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        match dispatch_command(&rt, &root, &memory_root, "/exit") {
+            CommandOutcome::Exit => {}
+            _ => panic!("expected exit outcome"),
+        }
+        match dispatch_command(&rt, &root, &memory_root, "/help") {
+            CommandOutcome::Message(m) => assert_eq!(m, COMMANDS),
+            _ => panic!("expected message outcome"),
+        }
+    }
+
     #[test]
     fn reflect_dispatching_adds_lessons_with_session_provenance() {
-        let (dir, root, _provider, tools, ws, cfg) = setup("reflect");
-        let memory_root = dir.join("memory");
-        let provider = ScriptedProvider {
-            responses: Mutex::new(std::collections::VecDeque::from([
-                crab::provider::Response::Text("done with the task".into()),
-                crab::provider::Response::Text(
-                    r#"[{"text":"always run make first","kind":"rule"}]"#.into(),
-                ),
-            ])),
-            histories: Mutex::new(Vec::new()),
-        };
-        // First provider call: the turn's final answer; second call: the
-        // reflection LLM's lesson list.
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let mut session = Session::new(&agent, "fix the build", term::cancel_flag());
-        run_turn(&mut session);
+        let (dir, root, rt, ws) = setup(
+            "reflect",
+            Box::new(ScriptedProvider {
+                responses: Mutex::new(std::collections::VecDeque::from([
+                    crab::provider::Response::Text("done with the task".into()),
+                    crab::provider::Response::Text(
+                        r#"[{"text":"always run make first","kind":"rule"}]"#.into(),
+                    ),
+                ])),
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
 
-        let msg = match dispatch_command(&agent, &mut session, &root, &memory_root, "/reflect") {
+        // Run a conversation turn first (consumes response 1).
+        assert_eq!(rt.run_once("fix the build").unwrap(), "done with the task");
+
+        let msg = match dispatch_command(&rt, &root, &memory_root, "/reflect") {
             CommandOutcome::Message(m) => m,
             _ => panic!("expected a message outcome"),
         };
@@ -703,20 +728,35 @@ mod tests {
         assert_eq!(lessons[0].text, "always run make first");
         assert_eq!(lessons[0].cwd, ws.root().to_string_lossy());
         assert!(lessons[0].source_session_id.is_some());
-        // The session was auto-saved so provenance has a real id.
         assert!(session::load_previous(&root, ws.root()).unwrap().is_some());
     }
 
     #[test]
     fn reflect_with_no_conversation_reports_clearly() {
-        let (dir, root, provider, tools, ws, cfg) = setup("reflect-empty");
-        let memory_root = dir.join("memory");
-        let agent = Agent::new(&provider, &tools, &ws, &cfg);
-        let mut session = Session::new(&agent, "x", term::cancel_flag());
-        let msg = match dispatch_command(&agent, &mut session, &root, &memory_root, "/reflect") {
+        let (dir, root, rt, _ws) = setup(
+            "reflect-empty",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        let msg = match dispatch_command(&rt, &root, &memory_root, "/reflect") {
             CommandOutcome::Message(m) => m,
             _ => panic!("expected a message outcome"),
         };
         assert!(msg.contains("no conversation to reflect on"), "{msg}");
+    }
+
+    #[test]
+    fn runtime_emits_events_on_a_run() {
+        let (_dir, _root, rt, _ws) = setup(
+            "events",
+            Box::new(RecordingProvider {
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        // run_once drives synchronously and returns the final text.
+        assert_eq!(rt.run_once("hello").unwrap(), "done");
+        assert!(has_conversation(&rt.history()));
     }
 }
