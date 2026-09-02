@@ -7,12 +7,14 @@
 //! - `agent` (CRAB-104): the bounded orchestration loop.
 //! - `session` (CRAB-109): on-disk conversation persistence for `/resume`.
 //! - `memory` (CRAB-113): append-only JSONL lesson store for agent memory.
+//! - `reflect` (CRAB-112): LLM-backed lesson extraction from session transcripts.
 //! - `main` (CRAB-101): the CLI entrypoint.
 
 pub mod agent;
 pub mod config;
 pub mod memory;
 pub mod provider;
+pub mod reflect;
 pub mod session;
 pub mod term;
 pub mod tools;

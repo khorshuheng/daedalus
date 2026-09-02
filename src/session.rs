@@ -367,6 +367,16 @@ pub fn clear_previous(root: &Path, cwd: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
+/// Read the session `id` recorded in a saved file's header line. Used as
+/// lesson provenance when reflecting over a just-saved session (CRAB-112);
+/// `None` when the file has no parseable header.
+pub fn file_id(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let first = BufReader::new(file).lines().next()?.ok()?;
+    let value: serde_json::Value = serde_json::from_str(first.trim()).ok()?;
+    value.get("id")?.as_str().map(|s| s.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,6 +540,27 @@ mod tests {
         assert!(load_previous(&root, &cwd()).unwrap().is_none());
         // Idempotent: clearing when nothing is saved is fine.
         clear_previous(&root, &cwd()).unwrap();
+    }
+
+    #[test]
+    fn file_id_reads_the_saved_header() {
+        let (_guard, root) = tempdir("fileid");
+        let path = save_session(&root, &cwd(), &sample_history()).unwrap();
+        let id = file_id(&path).expect("saved session has an id");
+        assert!(!id.is_empty());
+        assert_eq!(file_id(&path).unwrap(), id, "id is stable across reads");
+    }
+
+    #[test]
+    fn file_id_is_none_for_unparseable_files() {
+        let (_guard, root) = tempdir("fileid-none");
+        let dir = session_dir(&root, &cwd());
+        std::fs::create_dir_all(&dir).unwrap();
+        let bad = dir.join("garbage.jsonl");
+        std::fs::write(&bad, "this is not json\n").unwrap();
+        assert!(file_id(&bad).is_none());
+        let missing = dir.join("nope.jsonl");
+        assert!(file_id(&missing).is_none());
     }
 
     #[test]

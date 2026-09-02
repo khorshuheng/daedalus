@@ -140,6 +140,12 @@ impl<'a> Agent<'a> {
         self.workspace.root()
     }
 
+    /// The provider backing this agent; reflection (CRAB-112) reuses it for
+    /// its separate summarization call.
+    pub fn provider(&self) -> &dyn Provider {
+        self.provider
+    }
+
     /// The system prompt seeding every session: workspace + tool rules.
     pub fn system_prompt(&self) -> String {
         format!(

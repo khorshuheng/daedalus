@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use crab::agent::{Agent, AgentError, Session, Stream, Turn};
 use crab::config::{Config, Overrides, ProviderKind};
+use crab::memory;
 use crab::provider::{self, Message};
+use crab::reflect;
 use crab::session;
 use crab::term;
 use crab::tools::resolver::ToolSet;
@@ -154,13 +156,38 @@ fn run(cli: Cli) -> Result<i32, String> {
     run_repl(&agent, &cli.prompt)
 }
 
-/// Persist the current session history to disk (auto-save on exit, CRAB-109).
-/// A failure to save is a warning only — quitting must never be blocked by
-/// persistence.
-fn auto_save(agent: &Agent, session: &Session, root: &Path) {
-    match session::save_session(root, agent.workspace_root(), session.history()) {
-        Ok(path) => eprintln!("session saved: {}", path.display()),
-        Err(e) => eprintln!("crab: warning: could not save session: {e}"),
+/// Persist the current session history to disk (auto-save on exit, CRAB-109)
+/// and, when the conversation produced output, reflect it into memory
+/// (auto-reflect at session end, CRAB-112). Failures are warnings only —
+/// quitting must never be blocked by persistence or reflection.
+fn auto_save(agent: &Agent, session: &Session, root: &Path, memory_root: &Path) {
+    let saved = match session::save_session(root, agent.workspace_root(), session.history()) {
+        Ok(path) => {
+            eprintln!("session saved: {}", path.display());
+            Some(path)
+        }
+        Err(e) => {
+            eprintln!("crab: warning: could not save session: {e}");
+            None
+        }
+    };
+    if !has_conversation(session.history()) {
+        return;
+    }
+    // The session was just saved, so lessons can carry its real id.
+    let source = saved.as_deref().and_then(session::file_id);
+    match reflect::reflect_and_store(
+        memory_root,
+        agent.workspace_root(),
+        agent.provider(),
+        term::cancel_flag(),
+        session.history(),
+        source,
+        now_millis(),
+    ) {
+        Ok(0) => {}
+        Ok(n) => eprintln!("memory: reflected {n} new lesson(s) from this session"),
+        Err(e) => eprintln!("crab: warning: could not reflect lessons: {e}"),
     }
 }
 
@@ -177,10 +204,11 @@ enum CommandOutcome {
 /// The built-in command list shown by `/help` and after an unknown command.
 const COMMANDS: &str = "\
 Commands:
-  /resume  Continue the previous session for this workspace
-  /clear   Reset the conversation to a fresh context
-  /help    Show this help
-  /exit    Quit and save the session (also /quit, /q)";
+  /resume   Continue the previous session for this workspace
+  /clear    Reset the conversation to a fresh context
+  /reflect  Extract steering lessons from this session into memory
+  /help     Show this help
+  /exit     Quit and save the session (also /quit, /q)";
 
 /// True when the history contains at least one assistant message — i.e. the
 /// conversation actually produced output. A session holding only the system
@@ -195,6 +223,7 @@ fn dispatch_command<'a, 'inner>(
     agent: &'a Agent<'inner>,
     session: &mut Session<'a, 'inner>,
     root: &Path,
+    memory_root: &Path,
     cmd: &str,
 ) -> CommandOutcome {
     match cmd {
@@ -202,6 +231,7 @@ fn dispatch_command<'a, 'inner>(
         "/help" => CommandOutcome::Message(COMMANDS.to_string()),
         "/resume" => CommandOutcome::Message(handle_resume(agent, session, root)),
         "/clear" => CommandOutcome::Message(handle_clear(agent, session)),
+        "/reflect" => CommandOutcome::Message(handle_reflect(agent, session, root, memory_root)),
         other => CommandOutcome::Error(format!("unknown command '{other}'\n{COMMANDS}")),
     }
 }
@@ -240,6 +270,44 @@ fn handle_clear<'a, 'inner>(agent: &'a Agent<'inner>, session: &mut Session<'a, 
     "conversation cleared".to_string()
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// `/reflect`: reflect on the running conversation (auto-saving it first so
+/// lessons carry a real session id as provenance) and append new lessons to
+/// memory. On-demand trigger (CRAB-112).
+fn handle_reflect<'a, 'inner>(
+    agent: &'a Agent<'inner>,
+    session: &Session<'a, 'inner>,
+    root: &Path,
+    memory_root: &Path,
+) -> String {
+    if !has_conversation(session.history()) {
+        return "no conversation to reflect on".to_string();
+    }
+    let path = match session::save_session(root, agent.workspace_root(), session.history()) {
+        Ok(p) => p,
+        Err(e) => return format!("could not save session: {e}"),
+    };
+    match reflect::reflect_and_store(
+        memory_root,
+        agent.workspace_root(),
+        agent.provider(),
+        term::cancel_flag(),
+        session.history(),
+        session::file_id(&path),
+        now_millis(),
+    ) {
+        Ok(0) => "reflected: no new lessons".to_string(),
+        Ok(n) => format!("reflected: added {n} new lesson(s)"),
+        Err(e) => format!("reflection failed: {e}"),
+    }
+}
+
 /// The interactive REPL. Raw input mode is on for the whole session; a single
 /// input thread line-edits and reports Line/Cancel/Eof. While a turn runs,
 /// Esc/Ctrl-C cancel it; at the prompt, they terminate. A line beginning
@@ -250,6 +318,7 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
     let busy = Arc::new(AtomicBool::new(false));
     let (rx, _input) = term::spawn_input(Arc::clone(&busy));
     let root = session::default_root();
+    let memory_root = memory::default_root();
 
     let mut session = Session::new(agent, initial, term::cancel_flag());
     loop {
@@ -290,9 +359,9 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
                 let trimmed = line.trim();
                 if trimmed.starts_with('/') {
                     // A line beginning with `/` is a command, known or not.
-                    match dispatch_command(agent, &mut session, &root, trimmed) {
+                    match dispatch_command(agent, &mut session, &root, &memory_root, trimmed) {
                         CommandOutcome::Exit => {
-                            auto_save(agent, &session, &root);
+                            auto_save(agent, &session, &root, &memory_root);
                             return Ok(0);
                         }
                         CommandOutcome::Message(m) => println!("{m}"),
@@ -305,7 +374,7 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
                 }
             }
             term::InputEvent::Cancel | term::InputEvent::Eof => {
-                auto_save(agent, &session, &root);
+                auto_save(agent, &session, &root, &memory_root);
                 return Ok(0);
             }
         }
@@ -515,10 +584,11 @@ mod tests {
 
     #[test]
     fn unknown_command_is_reported_with_the_command_list() {
-        let (_dir, root, provider, tools, ws, cfg) = setup("unknown");
+        let (dir, root, provider, tools, ws, cfg) = setup("unknown");
+        let memory_root = dir.join("memory");
         let agent = Agent::new(&provider, &tools, &ws, &cfg);
         let mut session = Session::new(&agent, "x", term::cancel_flag());
-        match dispatch_command(&agent, &mut session, &root, "/nope") {
+        match dispatch_command(&agent, &mut session, &root, &memory_root, "/nope") {
             CommandOutcome::Error(e) => {
                 assert!(e.contains("unknown command '/nope'"));
                 assert!(e.contains("/resume"));
@@ -530,19 +600,97 @@ mod tests {
 
     #[test]
     fn help_lists_the_commands_and_exit_returns_exit() {
-        for cmd in ["/resume", "/clear", "/help", "/exit", "/quit"] {
+        for cmd in ["/resume", "/clear", "/reflect", "/help", "/exit", "/quit"] {
             assert!(COMMANDS.contains(cmd), "missing {cmd} in help");
         }
-        let (_dir, root, provider, tools, ws, cfg) = setup("help");
+        let (dir, root, provider, tools, ws, cfg) = setup("help");
+        let memory_root = dir.join("memory");
         let agent = Agent::new(&provider, &tools, &ws, &cfg);
         let mut session = Session::new(&agent, "x", term::cancel_flag());
-        match dispatch_command(&agent, &mut session, &root, "/exit") {
+        match dispatch_command(&agent, &mut session, &root, &memory_root, "/exit") {
             CommandOutcome::Exit => {}
             _ => panic!("expected exit outcome"),
         }
-        match dispatch_command(&agent, &mut session, &root, "/help") {
+        match dispatch_command(&agent, &mut session, &root, &memory_root, "/help") {
             CommandOutcome::Message(m) => assert_eq!(m, COMMANDS),
             _ => panic!("expected message outcome"),
         }
+    }
+
+    /// A provider that plays a scripted `Response` per call (for /reflect).
+    struct ScriptedProvider {
+        responses: Mutex<std::collections::VecDeque<crab::provider::Response>>,
+        histories: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl Provider for ScriptedProvider {
+        fn complete(
+            &self,
+            history: &[Message],
+            _tools: &[serde_json::Value],
+            _cancel: &AtomicBool,
+            _on_text: &mut dyn FnMut(&str),
+        ) -> Result<crab::provider::Completion, ProviderError> {
+            self.histories.lock().unwrap().push(history.to_vec());
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(crab::provider::Response::Text("done".into()));
+            Ok(crab::provider::Completion {
+                response,
+                prompt_tokens: None,
+                aborted: false,
+            })
+        }
+    }
+
+    #[test]
+    fn reflect_dispatching_adds_lessons_with_session_provenance() {
+        let (dir, root, _provider, tools, ws, cfg) = setup("reflect");
+        let memory_root = dir.join("memory");
+        let provider = ScriptedProvider {
+            responses: Mutex::new(std::collections::VecDeque::from([
+                crab::provider::Response::Text("done with the task".into()),
+                crab::provider::Response::Text(
+                    r#"[{"text":"always run make first","kind":"rule"}]"#.into(),
+                ),
+            ])),
+            histories: Mutex::new(Vec::new()),
+        };
+        // First provider call: the turn's final answer; second call: the
+        // reflection LLM's lesson list.
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "fix the build", term::cancel_flag());
+        run_turn(&mut session);
+
+        let msg = match dispatch_command(&agent, &mut session, &root, &memory_root, "/reflect") {
+            CommandOutcome::Message(m) => m,
+            _ => panic!("expected a message outcome"),
+        };
+        assert!(msg.contains("added 1 new lesson"), "{msg}");
+
+        // The lesson landed in memory with provenance back to the session.
+        let lessons = crab::memory::list_lessons(&memory_root, ws.root()).unwrap();
+        assert_eq!(lessons.len(), 1);
+        assert_eq!(lessons[0].text, "always run make first");
+        assert_eq!(lessons[0].cwd, ws.root().to_string_lossy());
+        assert!(lessons[0].source_session_id.is_some());
+        // The session was auto-saved so provenance has a real id.
+        assert!(session::load_previous(&root, ws.root()).unwrap().is_some());
+    }
+
+    #[test]
+    fn reflect_with_no_conversation_reports_clearly() {
+        let (dir, root, provider, tools, ws, cfg) = setup("reflect-empty");
+        let memory_root = dir.join("memory");
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "x", term::cancel_flag());
+        let msg = match dispatch_command(&agent, &mut session, &root, &memory_root, "/reflect") {
+            CommandOutcome::Message(m) => m,
+            _ => panic!("expected a message outcome"),
+        };
+        assert!(msg.contains("no conversation to reflect on"), "{msg}");
     }
 }
