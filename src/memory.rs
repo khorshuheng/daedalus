@@ -132,7 +132,8 @@ fn write_file_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
 
 /// The memory log path for `cwd` under `root`: the same cwd-encoded
 /// directory scheme as sessions (CRAB-109), holding one `lessons.jsonl`.
-fn lessons_file(root: &Path, cwd: &Path) -> PathBuf {
+/// `pub(crate)` so the SQLite index (CRAB-114) can fingerprint the log.
+pub(crate) fn lessons_file(root: &Path, cwd: &Path) -> PathBuf {
     root.join(encode_cwd(cwd)).join(LOG_FILE)
 }
 

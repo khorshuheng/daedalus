@@ -8,7 +8,7 @@
 //! deterministic.
 
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use crate::config::Config;
@@ -118,6 +118,10 @@ pub struct Agent<'a> {
     tools: &'a ToolSet,
     workspace: &'a Workspace,
     config: &'a Config,
+    /// Where per-project lesson memory lives (CRAB-113/114). `None` disables
+    /// memory injection (kept off for plain `Agent::new`); `main` enables it
+    /// with `memory::default_root()`.
+    memory_root: Option<PathBuf>,
 }
 
 impl<'a> Agent<'a> {
@@ -127,11 +131,25 @@ impl<'a> Agent<'a> {
         workspace: &'a Workspace,
         config: &'a Config,
     ) -> Self {
+        Self::with_memory_root(provider, tools, workspace, config, None)
+    }
+
+    /// Construct an agent with lesson memory enabled at `memory_root`
+    /// (CRAB-114): top lessons for the workspace are injected into the
+    /// system prompt each session.
+    pub fn with_memory_root(
+        provider: &'a dyn Provider,
+        tools: &'a ToolSet,
+        workspace: &'a Workspace,
+        config: &'a Config,
+        memory_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             provider,
             tools,
             workspace,
             config,
+            memory_root,
         }
     }
 
@@ -162,6 +180,25 @@ impl<'a> Agent<'a> {
              - When finished, give a concise final answer.",
             self.workspace.root().display()
         )
+    }
+
+    /// The system prompt for a session that starts with `prompt`: the base
+    /// prompt plus the top memory lessons for this workspace ranked against
+    /// `prompt`, when memory is enabled (CRAB-114). Injection failures or a
+    /// missing index degrade silently to the plain prompt — memory is
+    /// best-effort and must never block a session.
+    pub fn session_system_prompt(&self, prompt: &str) -> String {
+        let base = self.system_prompt();
+        let Some(root) = &self.memory_root else {
+            return base;
+        };
+        // Reserve a small slice of the context window for injected lessons;
+        // the rest stays available for the conversation itself.
+        let budget = (self.config.max_context_tokens / 20).max(64);
+        match crate::index::injection_block(root, self.workspace.root(), prompt, budget) {
+            Ok(block) if !block.is_empty() => format!("{base}\n\n{block}"),
+            _ => base,
+        }
     }
 
     /// Execute a batch of tool calls (or, when `fail_all`, report each as not
@@ -283,10 +320,30 @@ impl<'a, 'inner> Session<'a, 'inner> {
         self.history.push(Message::User(msg));
     }
 
+    /// Replace the seed system prompt (history[0]) with lessons ranked
+    /// against the latest user message, when memory is enabled (CRAB-114).
+    /// Runs at every turn start, so a follow-up task re-ranks its own
+    /// lessons; /resume and /clear histories get fresh injections too.
+    fn refresh_memory_prompt(&mut self) {
+        if self.agent.memory_root.is_none() {
+            return;
+        }
+        let Some(task) = self.history.iter().rev().find_map(|m| match m {
+            Message::User(text) => Some(text.clone()),
+            _ => None,
+        }) else {
+            return;
+        };
+        if let Some(Message::System(first)) = self.history.first_mut() {
+            *first = self.agent.session_system_prompt(&task);
+        }
+    }
+
     /// Run one turn (complete -> tools -> repeat) until a final answer,
     /// cancellation, or error. `emit` receives streamed text and tool markers
     /// for display.
     pub fn run_turn(&mut self, emit: &mut dyn FnMut(Stream)) -> Result<Turn, AgentError> {
+        self.refresh_memory_prompt();
         let seed_len = 2; // [System, first User] are never trimmed.
         let mut iterations = 0usize;
         loop {
@@ -698,5 +755,92 @@ mod tests {
         // The provider saw the full loaded history, unchanged.
         let histories = provider.histories.lock().unwrap();
         assert_eq!(histories[0].len(), 4);
+    }
+
+    #[test]
+    fn memory_lessons_are_injected_into_the_system_prompt() {
+        let (dir, ws) = workspace("mem-inject");
+        let memory_root = dir.join("memory");
+        // Seed a lesson about building with make.
+        let lesson = crate::memory::Lesson {
+            id: "l1".into(),
+            text: "always build with make, never cargo".into(),
+            kind: "rule".into(),
+            tags: vec!["build".into()],
+            cwd: ws.root().to_string_lossy().into_owned(),
+            source_session_id: Some("s1".into()),
+            created_at: 1,
+            retracted: false,
+        };
+        crate::memory::append_lesson(&memory_root, ws.root(), &lesson).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let provider = ScriptedProvider {
+            completions: Mutex::new(std::collections::VecDeque::from([
+                crate::provider::Completion {
+                    response: Response::Text("ok".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                },
+            ])),
+            histories: Mutex::new(Vec::new()),
+        };
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: dir.clone(),
+            ..Config::defaults(dir.clone())
+        };
+        let agent = Agent::with_memory_root(&provider, &tools, &ws, &cfg, Some(memory_root));
+
+        let mut session = Session::new(&agent, "how do i build", &cancel);
+        match session.run_turn(&mut |_| {}).unwrap() {
+            Turn::Final(_) => {}
+            _ => panic!("expected final answer"),
+        }
+
+        // The provider's first history starts with a system prompt that
+        // includes the retrieved lesson for the "build" task.
+        let histories = provider.histories.lock().unwrap();
+        let seen = &histories[0];
+        match &seen[0] {
+            Message::System(s) => {
+                assert!(s.contains("always build with make"), "lesson injected: {s}");
+            }
+            _ => panic!("first message must be the system prompt"),
+        }
+    }
+
+    #[test]
+    fn agent_without_memory_root_keeps_a_plain_system_prompt() {
+        let (_dir, ws) = workspace("no-mem");
+        let cancel = AtomicBool::new(false);
+        let provider = ScriptedProvider {
+            completions: Mutex::new(std::collections::VecDeque::from([
+                crate::provider::Completion {
+                    response: Response::Text("ok".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                },
+            ])),
+            histories: Mutex::new(Vec::new()),
+        };
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: _dir.clone(),
+            ..Config::defaults(_dir.clone())
+        };
+        let agent = Agent::new(&provider, &tools, &ws, &cfg);
+        let mut session = Session::new(&agent, "hello", &cancel);
+        match session.run_turn(&mut |_| {}).unwrap() {
+            Turn::Final(_) => {}
+            _ => panic!("expected final answer"),
+        }
+        let histories = provider.histories.lock().unwrap();
+        match &histories[0][0] {
+            Message::System(s) => assert!(!s.contains("Project lessons")),
+            _ => panic!("first message must be the system prompt"),
+        }
     }
 }

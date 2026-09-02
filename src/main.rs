@@ -135,7 +135,15 @@ fn run(cli: Cli) -> Result<i32, String> {
     let workspace = Workspace::new(config.workspace.clone())?;
     let provider = provider::from_config(&config);
     let tools = ToolSet::new(config.max_output_bytes);
-    let agent = Agent::new(provider.as_ref(), &tools, &workspace, &config);
+    // Memory injection (CRAB-114): real sessions rank lessons for the
+    // workspace into the system prompt; tests use Agent::new (no memory).
+    let agent = Agent::with_memory_root(
+        provider.as_ref(),
+        &tools,
+        &workspace,
+        &config,
+        Some(memory::default_root()),
+    );
 
     // Interactive terminal -> REPL (Ctrl-C/Esc cancel while busy, terminate at
     // the prompt, /exit to quit). Piped stdin -> one-shot.

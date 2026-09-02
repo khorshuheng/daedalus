@@ -25,3 +25,7 @@ libc = "0.2"
 # Pin url to 2.4.x: url >=2.5 pulls idna 1.x -> icu 2.x, which needs rust >=1.88
 # and would exceed the project's 1.85 MSRV.
 url = "=2.4.1"
+# Pin rusqlite to 0.34.x (Mar 2025, MSRV ~1.85 era): newer releases track
+# the then-latest stable rust and would exceed the 1.85 floor. Links the
+# system sqlite3 (pkg-config); no vendored C build.
+rusqlite = "=0.34.0"
