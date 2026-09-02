@@ -155,7 +155,11 @@ fn new_id(created_at: u64) -> String {
 /// Encode a working directory into a filesystem-safe directory name, following
 /// pi's scheme: leading separators are stripped, separators and `:` become
 /// `-`, wrapped in `--…--` (`/home/user/proj` -> `--home-user-proj--`).
-fn encode_cwd(cwd: &Path) -> String {
+///
+/// `pub(crate)` so the memory store (CRAB-113) keys its per-project
+/// `lessons.jsonl` under the same encoding; CRAB-119 will consolidate the
+/// shared storage helpers.
+pub(crate) fn encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
     let inner = s.trim_start_matches(['/', '\\']).replace(['/', '\\', ':'], "-");
     format!("--{inner}--")
