@@ -214,7 +214,9 @@ Commands:
 /// conversation actually produced output. A session holding only the system
 /// prompt (or an unanswered user message) is not worth resuming.
 fn has_conversation(history: &[Message]) -> bool {
-    history.iter().any(|m| matches!(m, Message::Assistant { .. }))
+    history
+        .iter()
+        .any(|m| matches!(m, Message::Assistant { .. }))
 }
 
 /// Dispatch a `/`-prefixed line to its handler (CRAB-110). Adding a command
@@ -327,7 +329,11 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
         // message (the initial prompt or a follow-up). Commands like /resume
         // and /clear change the history without adding one, so the loop just
         // waits for the next input instead of firing a spurious turn.
-        if session.history().last().is_some_and(|m| matches!(m, Message::User(_))) {
+        if session
+            .history()
+            .last()
+            .is_some_and(|m| matches!(m, Message::User(_)))
+        {
             busy.store(true, Ordering::SeqCst);
 
             let mut emit = |ev: Stream| match ev {
@@ -382,7 +388,8 @@ fn run_repl(agent: &Agent, initial: &str) -> Result<i32, String> {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();    let cli = match parse_args(&args) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_args(&args) {
         Ok(ParseOutcome::Help) => {
             print!("{USAGE}");
             std::process::exit(0);
@@ -438,7 +445,16 @@ mod tests {
     }
 
     /// Build a temp workspace + sessions root + a recording provider.
-    fn setup(name: &str) -> (PathBuf, PathBuf, RecordingProvider, ToolSet, Workspace, Config) {
+    fn setup(
+        name: &str,
+    ) -> (
+        PathBuf,
+        PathBuf,
+        RecordingProvider,
+        ToolSet,
+        Workspace,
+        Config,
+    ) {
         let dir = std::env::temp_dir().join(format!("crab-main-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -519,7 +535,9 @@ mod tests {
         run_turn(&mut session);
         let histories = provider.histories.lock().unwrap();
         let seen = &histories[0];
-        assert!(seen.iter().any(|m| matches!(m, Message::User(u) if u == "q1")));
+        assert!(seen
+            .iter()
+            .any(|m| matches!(m, Message::User(u) if u == "q1")));
         assert!(!seen
             .iter()
             .any(|m| matches!(m, Message::User(u) if u == "trigger prompt")));

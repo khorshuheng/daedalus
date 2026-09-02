@@ -161,7 +161,9 @@ fn new_id(created_at: u64) -> String {
 /// shared storage helpers.
 pub(crate) fn encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
-    let inner = s.trim_start_matches(['/', '\\']).replace(['/', '\\', ':'], "-");
+    let inner = s
+        .trim_start_matches(['/', '\\'])
+        .replace(['/', '\\', ':'], "-");
     format!("--{inner}--")
 }
 
@@ -249,9 +251,8 @@ fn load_file(path: &Path) -> Result<Vec<Message>, SessionError> {
     };
 
     let (header_line, header_raw) = &entries[0];
-    let header: Entry = serde_json::from_str(header_raw).map_err(|e| {
-        corrupt(*header_line, format!("invalid header: {e}"))
-    })?;
+    let header: Entry = serde_json::from_str(header_raw)
+        .map_err(|e| corrupt(*header_line, format!("invalid header: {e}")))?;
     let version = match &header {
         Entry::Header { version, .. } => *version,
         _ => {
@@ -313,11 +314,7 @@ pub fn default_root() -> PathBuf {
 /// Persist `history` as a new session for `cwd`, returning the file path.
 /// The file is written atomically; a later `load_previous` for the same `cwd`
 /// returns this session's messages until a newer one is saved.
-pub fn save_session(
-    root: &Path,
-    cwd: &Path,
-    history: &[Message],
-) -> Result<PathBuf, SessionError> {
+pub fn save_session(root: &Path, cwd: &Path, history: &[Message]) -> Result<PathBuf, SessionError> {
     let dir = session_dir(root, cwd);
     std::fs::create_dir_all(&dir).map_err(SessionError::Io)?;
 
@@ -471,13 +468,18 @@ mod tests {
         writeln!(f, "{{\"kind\":\"assistant\",\"text\":\"partial").unwrap();
         drop(f);
 
-        let loaded = load_previous(&root, &cwd()).unwrap().expect("torn tail is recovered");
+        let loaded = load_previous(&root, &cwd())
+            .unwrap()
+            .expect("torn tail is recovered");
         assert_eq!(loaded, sample_history());
 
         // The file was repaired: the torn line is gone and it loads cleanly.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("partial"));
-        assert_eq!(load_previous(&root, &cwd()).unwrap().unwrap(), sample_history());
+        assert_eq!(
+            load_previous(&root, &cwd()).unwrap().unwrap(),
+            sample_history()
+        );
     }
 
     #[test]
@@ -596,7 +598,10 @@ mod tests {
 
     #[test]
     fn cwd_encoding_is_filesystem_safe() {
-        assert_eq!(encode_cwd(Path::new("/home/user/proj")), "--home-user-proj--");
+        assert_eq!(
+            encode_cwd(Path::new("/home/user/proj")),
+            "--home-user-proj--"
+        );
         assert_eq!(encode_cwd(Path::new("/home/user/a b")), "--home-user-a b--");
         assert_eq!(
             encode_cwd(Path::new("C:\\Users\\me\\proj")),
