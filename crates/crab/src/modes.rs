@@ -2,32 +2,33 @@
 //! selected with `--mode`. Each adapter consumes only the runtime's Event
 //! stream and Command surface — no loop internals.
 //!
-//! - `print`: one-shot; runs one prompt and prints the final answer. Exit
-//!   0 on an answer, 2 on iteration cap, 1 on error (the piped behavior).
+//! Headless frontends (CRAB-120): synchronous adapters over AgentRuntime for
+//! scripted/non-interactive use, selected with `--mode`. Interactive use is
+//! the REPL (default) or the TUI (`--mode tui`). Each adapter consumes only
+//! the runtime's Event stream and Command surface — no loop internals.
 //!
-//! One-shot modes do **not** auto-reflect lessons into memory (CRAB-123 #4,
-//! documented non-goal): a piped/scripted run is a single answer with no
-//! session lifecycle, so the session-save + reflection trigger belongs to the
-//! interactive REPL (and TUI) where `/reflect` and auto-reflect-on-exit run.
 //! - `json`: one-shot; runs one prompt and emits **every** runtime Event as
 //!   a JSONL object to stdout (the same serialization the TUI and server
-//!   will use, CRAB-121/122).
+//!   will use, CRAB-121/124) — a headless diagnostic view.
 //! - `rpc`: a JSONL command/event loop over stdin/stdout. Each request is a
 //!   `Command` JSON object on its own line; the runtime's events stream back
 //!   as JSONL. When a request carries an `id`, the adapter emits a terminal
 //!   `{"type":"response","id":...}` line after the command's events so
 //!   clients can correlate replies (pi's RPC mode).
+//!
+//! These headless modes do **not** auto-reflect lessons into memory
+//! (CRAB-123 #4, documented non-goal): the session-save + reflection trigger
+//! belongs to the interactive REPL and TUI.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crab_core::runtime::{AgentRuntime, Command, CommandKind, Event, RuntimeError};
+use crab_core::runtime::{AgentRuntime, Command, CommandKind, Event};
 
 /// The frontend selected by `--mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Print,
     Json,
     Rpc,
     Tui,
@@ -37,29 +38,13 @@ impl Mode {
     /// Parse a `--mode` value.
     pub fn parse(s: &str) -> Result<Mode, String> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "print" => Ok(Mode::Print),
             "json" => Ok(Mode::Json),
             "rpc" => Ok(Mode::Rpc),
             "tui" => Ok(Mode::Tui),
             other => Err(format!(
-                "unknown mode '{other}' (supported: print, json, rpc, tui)"
+                "unknown mode '{other}' (supported: json, rpc, tui)"
             )),
         }
-    }
-}
-
-/// One-shot print: run `prompt` to completion and write the final answer.
-/// Does not save the session or reflect lessons (documented non-goal,
-/// CRAB-123 #4): one-shot invocations are scripted single answers.
-/// Returns the process exit code (0 answer, 2 iteration cap, 1 hard error).
-pub fn run_print(rt: &AgentRuntime, prompt: &str, out: &mut dyn Write) -> Result<i32, String> {
-    match rt.run_once(prompt) {
-        Ok(answer) => {
-            writeln!(out, "{answer}").map_err(|e| e.to_string())?;
-            Ok(0)
-        }
-        Err(RuntimeError::IterationCap(_)) => Ok(2),
-        Err(RuntimeError::Provider(e)) => Err(e),
     }
 }
 
@@ -287,7 +272,7 @@ mod tests {
     use super::*;
     use crab_core::config::Config;
     use crab_core::provider::fake::FakeProvider;
-    use crab_core::provider::{Message, Response, ToolCall};
+    use crab_core::provider::{Message, Response};
     use crab_core::runtime::Effort;
     use crab_core::session;
     use crab_core::tools::resolver::ToolSet;
@@ -335,42 +320,6 @@ mod tests {
     fn shutdown(rt: &AgentRuntime, handle: std::thread::JoinHandle<()>) {
         rt.shutdown();
         handle.join().unwrap_or(());
-    }
-
-    fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall {
-            id: id.into(),
-            name: name.into(),
-            args,
-        }
-    }
-
-    #[test]
-    fn print_mode_prints_the_final_answer() {
-        let (tmp, _root, rt, _rx, handle, _ws) = setup(
-            "print",
-            vec![
-                Response::ToolCalls(vec![call(
-                    "c1",
-                    "bash",
-                    serde_json::json!({"command": "echo hi"}),
-                )]),
-                Response::Text("all done".into()),
-            ],
-        );
-        let mut out = Vec::new();
-        // print mode runs on this thread (run_once) — no worker needed.
-        let code = run_print(&rt, "do it", &mut out).unwrap();
-        assert_eq!(code, 0);
-        assert_eq!(String::from_utf8(out).unwrap(), "all done\n");
-        // The tool ran in the temp workspace.
-        let h = rt.history();
-        assert!(h.iter().any(|m| matches!(
-            m,
-            Message::ToolResult { result, .. } if result.contains("hi")
-        )));
-        shutdown(&rt, handle);
-        let _ = tmp;
     }
 
     #[test]
@@ -490,7 +439,6 @@ mod tests {
 
     #[test]
     fn mode_parsing() {
-        assert_eq!(Mode::parse("print").unwrap(), Mode::Print);
         assert_eq!(Mode::parse("json").unwrap(), Mode::Json);
         assert_eq!(Mode::parse("rpc").unwrap(), Mode::Rpc);
         assert_eq!(Mode::parse("RPC").unwrap(), Mode::Rpc);

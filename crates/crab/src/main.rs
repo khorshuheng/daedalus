@@ -3,14 +3,14 @@
 //! Takes a positional `<prompt>` and a workspace directory (`--dir`, defaulting
 //! to cwd) plus `--model`, `--provider`, `--max-iterations`, and `--config`.
 //! Builds the app from the `crab_core` library (config CRAB-105, runtime
-//! CRAB-116, providers CRAB-103, tools CRAB-102) and drives it through one of
-//! the stdio frontends (`modes`, CRAB-120): `--mode print` (default when
-//! piped, one prompt -> final answer), `--mode json` (one prompt -> every
-//! Event as JSONL), `--mode rpc` (JSONL command/event loop, no prompt
-//! needed), or the interactive REPL on a terminal (`term`, CRAB-110).
+//! CRAB-116, providers CRAB-103, tools CRAB-102). Interactive use is the REPL
+//! (default on a terminal, `term` CRAB-110) or the TUI (`--mode tui`,
+//! CRAB-121). Headless/scripted use requires an explicit mode: `--mode json`
+//! (one prompt -> every Event as JSONL) or `--mode rpc` (JSONL command/event
+//! loop, no prompt needed).
 //!
 //! Exit codes:
-//!   0 — clean final answer
+//!   0 — clean exit
 //!   1 — hard error (bad config/flags, provider unreachable)
 //!   2 — iteration cap exceeded
 
@@ -70,8 +70,9 @@ struct Cli {
     #[arg(long, value_name = "KEY", hide = true)]
     api_key: Option<String>,
 
-    /// print | json | rpc (default: print when piped, REPL on a terminal;
-    /// rpc reads JSON commands from stdin and needs no <prompt>).
+    /// json | rpc | tui. Interactive (REPL) is the default on a terminal;
+    /// json and rpc are headless modes (rpc reads JSON commands from stdin
+    /// and needs no <prompt>); tui is the full-screen interface.
     #[arg(long, value_name = "MODE", value_parser = parse_mode)]
     mode: Option<Mode>,
 }
@@ -141,43 +142,30 @@ fn run(cli: Cli) -> Result<i32, String> {
     // workspace into the system prompt.
     let memory_root = Some(memory::default_root());
 
+    // No --mode: an interactive terminal gets the REPL (or the TUI with
+    // --mode tui). Piped/non-tty stdin without an explicit mode is an error:
+    // crab is interactive, so a scripted session must say --mode json or rpc.
     let stdin_is_terminal = std::io::stdin().is_terminal();
-    // No --mode: an interactive terminal gets the REPL; piped stdin gets
-    // print (one prompt -> final answer). An explicit --mode always wins.
-    let mode = cli.mode.unwrap_or(Mode::Print);
-    if cli.mode.is_none() && stdin_is_terminal {
-        return run_repl(
+    match cli.mode {
+        None if stdin_is_terminal => run_repl(
             config,
             provider,
             tools,
             workspace,
             memory_root,
             &cli.prompt(),
-        );
-    }
-
-    match mode {
-        // One-shot print does not auto-reflect (documented non-goal,
-        // CRAB-123 #4): scripted single answers have no session lifecycle.
-        Mode::Print => {
-            let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
-            let mut stdout = std::io::stdout();
-            match modes::run_print(&rt, &cli.prompt(), &mut stdout) {
-                Ok(2) => {
-                    eprintln!("crab: iteration cap exceeded: no final answer");
-                    Ok(2)
-                }
-                other => other,
-            }
-        }
-        Mode::Json => {
+        ),
+        None => Err("stdin is not a terminal: crab is interactive (REPL/TUI). \
+                 For a scripted session pass --mode json or --mode rpc."
+            .into()),
+        Some(Mode::Json) => {
             let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let mut stdout = std::io::stdout();
             modes::run_json(&rt, &rx, &cli.prompt(), &mut stdout)
         }
-        Mode::Rpc => {
+        Some(Mode::Rpc) => {
             let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
@@ -187,7 +175,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             let mut stdout = std::io::stdout();
             modes::run_rpc(&rt, &rx, &root, reader, &mut stdout)
         }
-        Mode::Tui => {
+        Some(Mode::Tui) => {
             let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());

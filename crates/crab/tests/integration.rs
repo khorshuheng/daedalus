@@ -125,11 +125,12 @@ fn integration_iteration_cap() {
     assert!(matches!(err, RuntimeError::IterationCap(3)));
 }
 
-/// CLI smoke test: `crab "hello" --provider fake --dir <tmp>` exits 0 and
-/// prints a final answer.
+/// CLI smoke: non-interactive stdin without an explicit --mode is rejected
+/// with a pointer to the headless modes (print mode was removed; crab is
+/// interactive by default).
 #[test]
-fn cli_smoke_fake_provider() {
-    let tmp = tempdir("cli");
+fn cli_smoke_piped_without_mode_is_rejected() {
+    let tmp = tempdir("cli-no-mode");
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hello", "--provider", "fake", "--dir"])
         .arg(tmp.path())
@@ -137,12 +138,13 @@ fn cli_smoke_fake_provider() {
         .output()
         .expect("run crab binary");
     assert!(
-        out.status.success(),
-        "crab exited {}; stderr: {}",
-        out.status,
-        String::from_utf8_lossy(&out.stderr)
+        !out.status.success(),
+        "piped stdin without --mode must fail"
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("done"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a terminal"), "{stderr}");
+    assert!(stderr.contains("--mode json"), "{stderr}");
+    assert!(stderr.contains("--mode rpc"), "{stderr}");
 }
 
 /// CLI smoke: an unknown provider must fail fast with a non-zero exit.
@@ -251,7 +253,7 @@ fn cli_json_mode_emits_events_as_jsonl() {
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
     assert!(lines.iter().any(|l| l["type"] == "agent_start"));
-    // JSON output must not contain a bare final-answer line (unlike print).
+    // JSON output is the event stream, not a bare answer line.
     assert!(lines.iter().any(|l| l["type"] == "agent_settled"));
 }
 
@@ -268,7 +270,7 @@ fn cli_unknown_mode_fails() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown mode"));
-    assert!(stderr.contains("print, json, rpc, tui"));
+    assert!(stderr.contains("json, rpc, tui"));
 }
 
 /// End-to-end memory pipeline (CRAB-111 epic acceptance): a session is
