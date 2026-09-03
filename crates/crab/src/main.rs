@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
-use crab_core::config::{Config, Overrides, ProviderKind};
+use crab_core::config::{Config, PartialConfig, ProviderKind};
 use crab_core::memory;
 use crab_core::provider::{self, Message};
 use crab_core::reflect;
@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Provider API key (default: provider-native env var, then the keyring).
+    #[arg(long, value_name = "KEY", hide = true)]
+    api_key: Option<String>,
+
     /// print | json | rpc (default: print when piped, REPL on a terminal;
     /// rpc reads JSON commands from stdin and needs no <prompt>).
     #[arg(long, value_name = "MODE", value_parser = parse_mode)]
@@ -92,8 +96,8 @@ impl Cli {
         self.prompt_parts.join(" ")
     }
 
-    fn flags(&self) -> Overrides {
-        Overrides {
+    fn flags(&self) -> PartialConfig {
+        PartialConfig {
             provider: self.provider,
             model: self.model.clone(),
             max_iterations: self.max_iterations,
@@ -125,8 +129,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     let config = Config::load(
         default_workspace,
         config_path.as_deref(),
-        Overrides::from_env(),
         cli.flags(),
+        cli.api_key.clone(),
     )?;
 
     let workspace = Workspace::new(config.workspace.clone())?;

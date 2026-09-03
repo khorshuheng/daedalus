@@ -1,8 +1,11 @@
-//! Configuration (CRAB-105).
+//! Configuration (CRAB-105, revised CRAB-118).
 //!
-//! Keys: provider, base URL, API key, model, temperature, max_iterations,
-//! output size caps. Sources merge with documented precedence:
-//! `flags > env > config file`, all applied over built-in defaults.
+//! Keys: provider, base URL, model, temperature, max_iterations, output size
+//! caps, workspace. Sources merge with documented precedence:
+//! `flags > config file > defaults` (the `CRAB_*` env layer was removed in
+//! CRAB-118). API keys are **not** a config key: they are resolved separately
+//! via `credential` (`--api-key` > provider-native env > OS keyring), so a
+//! secret can never be stored in the config file.
 //!
 //! Supported providers: `openai`, `anthropic`, `deepseek`. DeepSeek reuses the
 //! OpenAI-compatible client via its own base URL + model (see CRAB-103). The
@@ -77,6 +80,17 @@ impl ProviderKind {
             Self::Fake => 128_000,
         }
     }
+
+    /// The provider-native environment variable that carries this provider's
+    /// API key (CRAB-118: secrets never live in the config file).
+    pub fn api_key_env(self) -> Option<&'static str> {
+        match self {
+            Self::Openai => Some("OPENAI_API_KEY"),
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::Deepseek => Some("DEEPSEEK_API_KEY"),
+            Self::Fake => None,
+        }
+    }
 }
 
 /// Fully-resolved configuration passed to the provider and the agent loop.
@@ -125,16 +139,15 @@ impl Config {
     }
 }
 
-/// Optional overrides collected from the config file, environment, and CLI
-/// flags. Fields left `None` are not overridden.
-#[derive(Debug, Default, Clone)]
-pub struct Overrides {
+/// Partial configuration from one source (config file or CLI flags). All
+/// fields are optional; unresolved fields fall back to defaults or to the
+/// next-higher-precedence source. Doubles as the schema of the TOML config
+/// file and as the flag overrides — `api_key` is deliberately absent so a
+/// secret can never be stored in the config file (CRAB-118).
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct PartialConfig {
     pub provider: Option<ProviderKind>,
-    /// Raw provider string (from env) kept so an invalid value can fail fast
-    /// with an accurate error instead of silently falling back to defaults.
-    pub provider_raw: Option<String>,
     pub base_url: Option<String>,
-    pub api_key: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
     pub max_iterations: Option<usize>,
@@ -146,138 +159,38 @@ pub struct Overrides {
     pub workspace: Option<PathBuf>,
 }
 
-/// Schema of the TOML config file (`--config`, defaulting to
-/// `~/.config/crab/config.toml`). All keys are optional.
-#[derive(Debug, Default, Deserialize)]
-struct FileConfig {
-    provider: Option<String>,
-    base_url: Option<String>,
-    api_key: Option<String>,
-    model: Option<String>,
-    temperature: Option<f32>,
-    max_iterations: Option<usize>,
-    max_output_bytes: Option<usize>,
-    max_tokens: Option<usize>,
-    timeout_secs: Option<u64>,
-    max_retries: Option<usize>,
-    max_context_tokens: Option<usize>,
-    workspace: Option<PathBuf>,
-}
+impl PartialConfig {
+    /// Overlay `higher` on top of `self`: every field set in `higher` wins.
+    /// Used to merge the config file under CLI flags (`flags > file`).
+    pub fn overlay(&mut self, higher: &PartialConfig) {
+        macro_rules! take {
+            ($f:ident) => {
+                if higher.$f.is_some() {
+                    self.$f = higher.$f.clone();
+                }
+            };
+        }
+        take!(provider);
+        take!(base_url);
+        take!(model);
+        take!(temperature);
+        take!(max_iterations);
+        take!(max_output_bytes);
+        take!(max_tokens);
+        take!(timeout_secs);
+        take!(max_retries);
+        take!(max_context_tokens);
+        take!(workspace);
+    }
 
-impl Config {
-    /// Build a `Config` by merging `file`, then `env`, then `flags` over
-    /// defaults. `default_workspace` is used unless an override supplies one.
-    pub fn load(
+    /// Resolve to a complete `Config`: fill defaults (provider presets) and
+    /// validate, attaching the resolved `api_key`.
+    pub fn resolve(
+        self,
         default_workspace: PathBuf,
-        file: Option<&Path>,
-        env: Overrides,
-        flags: Overrides,
+        api_key: Option<String>,
     ) -> Result<Config, String> {
-        let mut merged = Overrides::default();
-
-        if let Some(path) = file {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| format!("cannot read config '{}': {e}", path.display()))?;
-            let fc: FileConfig = toml::from_str(&text)
-                .map_err(|e| format!("invalid config '{}': {e}", path.display()))?;
-            merged.apply_file(fc)?;
-        }
-
-        merged.merge(env);
-        merged.merge(flags);
-
-        merged.build(default_workspace)
-    }
-}
-
-impl Overrides {
-    fn apply_file(&mut self, fc: FileConfig) -> Result<(), String> {
-        if let Some(p) = fc.provider {
-            self.provider = Some(ProviderKind::parse(&p)?);
-        }
-        if let Some(v) = fc.base_url {
-            self.base_url = Some(v);
-        }
-        if let Some(v) = fc.api_key {
-            self.api_key = Some(v);
-        }
-        if let Some(v) = fc.model {
-            self.model = Some(v);
-        }
-        if let Some(v) = fc.temperature {
-            self.temperature = Some(v);
-        }
-        if let Some(v) = fc.max_iterations {
-            self.max_iterations = Some(v);
-        }
-        if let Some(v) = fc.max_output_bytes {
-            self.max_output_bytes = Some(v);
-        }
-        if let Some(v) = fc.max_tokens {
-            self.max_tokens = Some(v);
-        }
-        if let Some(v) = fc.timeout_secs {
-            self.timeout_secs = Some(v);
-        }
-        if let Some(v) = fc.max_retries {
-            self.max_retries = Some(v);
-        }
-        if let Some(v) = fc.max_context_tokens {
-            self.max_context_tokens = Some(v);
-        }
-        if let Some(v) = fc.workspace {
-            self.workspace = Some(v);
-        }
-        Ok(())
-    }
-
-    fn merge(&mut self, other: Overrides) {
-        if other.provider.is_some() {
-            self.provider = other.provider;
-        }
-        if other.base_url.is_some() {
-            self.base_url = other.base_url;
-        }
-        if other.api_key.is_some() {
-            self.api_key = other.api_key;
-        }
-        if other.model.is_some() {
-            self.model = other.model;
-        }
-        if other.temperature.is_some() {
-            self.temperature = other.temperature;
-        }
-        if other.max_iterations.is_some() {
-            self.max_iterations = other.max_iterations;
-        }
-        if other.max_output_bytes.is_some() {
-            self.max_output_bytes = other.max_output_bytes;
-        }
-        if other.max_tokens.is_some() {
-            self.max_tokens = other.max_tokens;
-        }
-        if other.timeout_secs.is_some() {
-            self.timeout_secs = other.timeout_secs;
-        }
-        if other.max_retries.is_some() {
-            self.max_retries = other.max_retries;
-        }
-        if other.max_context_tokens.is_some() {
-            self.max_context_tokens = other.max_context_tokens;
-        }
-        if other.workspace.is_some() {
-            self.workspace = other.workspace;
-        }
-    }
-
-    fn build(self, default_workspace: PathBuf) -> Result<Config, String> {
-        let provider = match self.provider {
-            Some(p) => p,
-            None => match self.provider_raw {
-                Some(raw) => ProviderKind::parse(&raw)?,
-                None => ProviderKind::Openai,
-            },
-        };
+        let provider = self.provider.unwrap_or(ProviderKind::Openai);
         // base_url defaults to the provider preset unless explicitly set.
         let base_url = self
             .base_url
@@ -313,7 +226,7 @@ impl Overrides {
         Ok(Config {
             provider,
             base_url,
-            api_key: self.api_key,
+            api_key,
             model,
             temperature: self.temperature.unwrap_or(0.7),
             max_iterations: self.max_iterations.unwrap_or(30),
@@ -327,51 +240,59 @@ impl Overrides {
     }
 }
 
-impl Overrides {
-    /// Read `CRAB_*` environment variables into an `Overrides`.
-    pub fn from_env() -> Self {
-        let mut o = Overrides::default();
-        if let Ok(v) = std::env::var("CRAB_PROVIDER") {
-            // A bad env value fails fast via parse in `build`; here we just
-            // keep the raw string so the error message is accurate.
-            match ProviderKind::parse(&v) {
-                Ok(p) => o.provider = Some(p),
-                Err(_) => {
-                    o.provider_raw = Some(v);
-                }
+impl Config {
+    /// Build a `Config` by merging the config `file`, then CLI `flags` over
+    /// defaults — `flags > config file > defaults` (CRAB-118 removes the env
+    /// layer). `api_key` is resolved separately by the caller via
+    /// `crate::credential::resolve_api_key` and passed in; the config file
+    /// cannot carry a secret. `default_workspace` is used unless an override
+    /// supplies one.
+    /// Build a `Config` by merging the config `file`, then CLI `flags` over
+    /// defaults — `flags > config file > defaults` (CRAB-118 removes the env
+    /// layer). `api_key_flag` feeds the resolution chain
+    /// (`--api-key` > provider-native env > keyring); the config file cannot
+    /// carry a secret, so an `api_key` key in it is rejected. `default_workspace`
+    /// is used unless an override supplies one.
+    pub fn load(
+        default_workspace: PathBuf,
+        file: Option<&Path>,
+        flags: PartialConfig,
+        api_key_flag: Option<String>,
+    ) -> Result<Config, String> {
+        let mut merged = PartialConfig::default();
+        if let Some(path) = file {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| format!("cannot read config '{}': {e}", path.display()))?;
+            // Reject a secret in the config file explicitly: parse the raw
+            // TOML too, because typed deserialization would silently drop an
+            // unknown `api_key` key.
+            let raw: toml::Value = toml::from_str(&text)
+                .map_err(|e| format!("invalid config '{}': {e}", path.display()))?;
+            if raw.get("api_key").is_some() {
+                return Err(format!(
+                    "invalid config '{}': api_key in the config file is not supported; set it via --api-key, a provider-native environment variable, or /login (keyring)",
+                    path.display()
+                ));
             }
+            let fc: PartialConfig = toml::from_str(&text)
+                .map_err(|e| format!("invalid config '{}': {e}", path.display()))?;
+            merged.overlay(&fc);
         }
-        if let Ok(v) = std::env::var("CRAB_BASE_URL") {
-            o.base_url = Some(v);
-        }
-        if let Ok(v) = std::env::var("CRAB_API_KEY") {
-            o.api_key = Some(v);
-        }
-        if let Ok(v) = std::env::var("CRAB_MODEL") {
-            o.model = Some(v);
-        }
-        if let Ok(v) = std::env::var("CRAB_TEMPERATURE") {
-            o.temperature = v.parse().ok();
-        }
-        if let Ok(v) = std::env::var("CRAB_MAX_ITERATIONS") {
-            o.max_iterations = v.parse().ok();
-        }
-        if let Ok(v) = std::env::var("CRAB_MAX_OUTPUT_BYTES") {
-            o.max_output_bytes = v.parse().ok();
-        }
-        if let Ok(v) = std::env::var("CRAB_MAX_TOKENS") {
-            o.max_tokens = v.parse().ok();
-        }
-        if let Ok(v) = std::env::var("CRAB_TIMEOUT_SECS") {
-            o.timeout_secs = v.parse().ok();
-        }
-        if let Ok(v) = std::env::var("CRAB_MAX_RETRIES") {
-            o.max_retries = v.parse().ok();
-        }
-        if let Ok(v) = std::env::var("CRAB_MAX_CONTEXT_TOKENS") {
-            o.max_context_tokens = v.parse().ok();
-        }
-        o
+        merged.overlay(&flags);
+        // Resolve the API key against the final provider (flag > env > keyring).
+        let api_key = crate::credential::resolve_api_key(
+            merged.provider.unwrap_or(ProviderKind::Openai),
+            api_key_flag,
+        );
+        merged.resolve(default_workspace, api_key)
+    }
+}
+
+/// Deserialize `ProviderKind` from a lowercase string (config file / TOML).
+impl<'de> serde::Deserialize<'de> for ProviderKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        ProviderKind::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -384,22 +305,27 @@ mod tests {
         PathBuf::from("/tmp/crab-config-test")
     }
 
+    fn load(ws: PathBuf, file: Option<&Path>, flags: PartialConfig) -> Result<Config, String> {
+        Config::load(ws, file, flags, None)
+    }
+
     #[test]
     fn defaults() {
-        let c = Config::load(ws(), None, Overrides::default(), Overrides::default()).unwrap();
+        let c = load(ws(), None, PartialConfig::default()).unwrap();
         assert_eq!(c.provider, ProviderKind::Openai);
         assert_eq!(c.base_url, "https://api.openai.com");
+        assert_eq!(c.api_key, None);
         assert_eq!(c.max_iterations, 30);
         assert_eq!(c.max_context_tokens, 128_000 - 4_096);
     }
 
     #[test]
     fn deepseek_preset_applies_base_url_and_model() {
-        let flags = Overrides {
+        let flags = PartialConfig {
             provider: Some(ProviderKind::Deepseek),
             ..Default::default()
         };
-        let c = Config::load(ws(), None, Overrides::default(), flags).unwrap();
+        let c = load(ws(), None, flags).unwrap();
         assert_eq!(c.provider, ProviderKind::Deepseek);
         assert_eq!(c.base_url, "https://api.deepseek.com");
         assert_eq!(c.model, "deepseek-chat");
@@ -408,12 +334,12 @@ mod tests {
 
     #[test]
     fn explicit_base_url_wins_over_preset() {
-        let flags = Overrides {
+        let flags = PartialConfig {
             provider: Some(ProviderKind::Deepseek),
             base_url: Some("http://localhost:9000".into()),
             ..Default::default()
         };
-        let c = Config::load(ws(), None, Overrides::default(), flags).unwrap();
+        let c = load(ws(), None, flags).unwrap();
         assert_eq!(c.base_url, "http://localhost:9000");
     }
 
@@ -429,29 +355,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "provider = \"nope\"\n").unwrap();
-        let err = Config::load(
-            ws(),
-            Some(&path),
-            Overrides::default(),
-            Overrides::default(),
-        )
-        .unwrap_err();
+        let err = load(ws(), Some(&path), PartialConfig::default()).unwrap_err();
         assert!(err.contains("unknown provider"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn flags_override_env_override_file() {
-        let env = Overrides {
-            model: Some("env-model".into()),
-            ..Default::default()
-        };
-        let flags = Overrides {
+    fn flags_override_file() {
+        let dir = std::env::temp_dir().join("crab-config-flag-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"file-model\"\n").unwrap();
+        let flags = PartialConfig {
             model: Some("flag-model".into()),
             ..Default::default()
         };
-        let c = Config::load(ws(), None, env, flags).unwrap();
+        let c = load(ws(), Some(&path), flags).unwrap();
         assert_eq!(c.model, "flag-model");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -464,17 +385,39 @@ mod tests {
             "provider = \"anthropic\"\nmodel = \"claude-x\"\nmax_iterations = 7\n",
         )
         .unwrap();
-        let c = Config::load(
-            ws(),
-            Some(&path),
-            Overrides::default(),
-            Overrides::default(),
-        )
-        .unwrap();
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
         assert_eq!(c.provider, ProviderKind::Anthropic);
         assert_eq!(c.base_url, "https://api.anthropic.com");
         assert_eq!(c.model, "claude-x");
         assert_eq!(c.max_iterations, 7);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn api_key_in_config_file_is_rejected() {
+        let dir = std::env::temp_dir().join("crab-config-secret");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "api_key = \"sk-secret\"\n").unwrap();
+        let err = load(ws(), Some(&path), PartialConfig::default()).unwrap_err();
+        assert!(err.contains("api_key in the config file is not supported"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn overlay_flags_win_over_file() {
+        let file = PartialConfig {
+            model: Some("file-model".into()),
+            max_iterations: Some(5),
+            ..Default::default()
+        };
+        let mut merged = file.clone();
+        let flags = PartialConfig {
+            model: Some("flag-model".into()),
+            ..Default::default()
+        };
+        merged.overlay(&flags);
+        assert_eq!(merged.model.as_deref(), Some("flag-model"));
+        assert_eq!(merged.max_iterations, Some(5));
     }
 }

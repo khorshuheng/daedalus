@@ -1,7 +1,8 @@
 //! Crab core library (CRAB-117 workspace split): the synchronous engine.
 //!
 //! The crate is split into layers that mirror the CRAB tickets:
-//! - `config`/`workspace` (CRAB-105): configuration and workspace scoping.
+//! - `config`/`workspace` (CRAB-105/118): configuration and workspace scoping.
+//! - `credential` (CRAB-118): API-key resolution (flag > provider env > keyring).
 //! - `tools` (CRAB-102): the four built-in tools (read, bash, edit, write).
 //! - `provider` (CRAB-103): LLM providers behind an extensible `Provider` trait.
 //! - `session` (CRAB-109): on-disk conversation persistence for `/resume`.
@@ -16,6 +17,7 @@
 //! async dependencies.
 
 pub mod config;
+pub mod credential;
 pub mod index;
 pub mod memory;
 pub mod paths;
