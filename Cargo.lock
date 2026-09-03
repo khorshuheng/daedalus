@@ -40,7 +40,15 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 name = "crab"
 version = "0.1.0"
 dependencies = [
+ "crab-core",
  "libc",
+ "serde_json",
+]
+
+[[package]]
+name = "crab-core"
+version = "0.1.0"
+dependencies = [
  "rusqlite",
  "serde",
  "serde_json",

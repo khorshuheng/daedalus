@@ -23,10 +23,6 @@ pub fn request_cancel() {
     CANCEL.store(true, Ordering::SeqCst);
 }
 
-pub fn clear_cancel() {
-    CANCEL.store(false, Ordering::SeqCst);
-}
-
 /// An event produced by the interactive input thread.
 pub enum InputEvent {
     /// A completed line of input (Enter pressed).

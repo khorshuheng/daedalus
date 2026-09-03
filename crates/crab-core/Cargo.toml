@@ -1,0 +1,25 @@
+[package]
+name = "crab-core"
+description = "Crab core library: synchronous agent engine, tools, providers, persistence and memory (CRAB-117 workspace split)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "crab_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+# Pin url to 2.4.x: url >=2.5 pulls idna 1.x -> icu 2.x, which needs rust >=1.88
+# and would exceed the project's 1.85 MSRV.
+url = "=2.4.1"
+# Pin rusqlite to 0.34.x (Mar 2025, MSRV ~1.85 era): newer releases track
+# the then-latest stable rust and would exceed the 1.85 floor. Links the
+# system sqlite3 (pkg-config); no vendored C build.
+rusqlite = "=0.34.0"
+
+# crab-core must stay synchronous: no tokio/async dependencies here.

@@ -1,13 +1,13 @@
-//! Crab CLI entrypoint (CRAB-101).
+//! Crab CLI binary (CRAB-101, in the `crab` crate of the CRAB-117 workspace).
 //!
 //! Takes a positional `<prompt>` and a workspace directory (`--dir`, defaulting
 //! to cwd) plus `--model`, `--provider`, `--max-iterations`, and `--config`.
-//! Builds the app from config (CRAB-105), constructs the AgentRuntime
-//! (CRAB-116) with the selected provider (CRAB-103) and tools (CRAB-102), and
-//! drives it through one of the stdio frontends (CRAB-120): `--mode print`
-//! (default when piped, one prompt -> final answer), `--mode json` (one
-//! prompt -> every Event as JSONL), `--mode rpc` (JSONL command/event loop,
-//! no prompt needed), or the interactive REPL on a terminal.
+//! Builds the app from the `crab_core` library (config CRAB-105, runtime
+//! CRAB-116, providers CRAB-103, tools CRAB-102) and drives it through one of
+//! the stdio frontends (`modes`, CRAB-120): `--mode print` (default when
+//! piped, one prompt -> final answer), `--mode json` (one prompt -> every
+//! Event as JSONL), `--mode rpc` (JSONL command/event loop, no prompt
+//! needed), or the interactive REPL on a terminal (`term`, CRAB-110).
 //!
 //! Exit codes:
 //!   0 — clean final answer
@@ -20,16 +20,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
-use crab::config::{Config, Overrides, ProviderKind};
-use crab::memory;
-use crab::modes::Mode;
-use crab::provider::{self, Message};
-use crab::reflect;
-use crab::runtime::{AgentRuntime, Event};
-use crab::session;
-use crab::term;
-use crab::tools::resolver::ToolSet;
-use crab::workspace::Workspace;
+use crab_core::config::{Config, Overrides, ProviderKind};
+use crab_core::memory;
+use crab_core::provider::{self, Message};
+use crab_core::reflect;
+use crab_core::runtime::{AgentRuntime, Event};
+use crab_core::session;
+use crab_core::tools::resolver::ToolSet;
+use crab_core::workspace::Workspace;
+
+mod modes;
+mod term;
+
+use modes::Mode;
 
 const USAGE: &str = "\
 crab — a minimal coding agent
@@ -166,7 +169,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         Mode::Print => {
             let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let mut stdout = std::io::stdout();
-            match crab::modes::run_print(&rt, &cli.prompt, &mut stdout) {
+            match modes::run_print(&rt, &cli.prompt, &mut stdout) {
                 Ok(2) => {
                     eprintln!("crab: iteration cap exceeded: no final answer");
                     Ok(2)
@@ -179,7 +182,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let mut stdout = std::io::stdout();
-            crab::modes::run_json(&rt, &rx, &cli.prompt, &mut stdout)
+            modes::run_json(&rt, &rx, &cli.prompt, &mut stdout)
         }
         Mode::Rpc => {
             let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
@@ -189,7 +192,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             let reader: Box<dyn std::io::BufRead + Send> =
                 Box::new(std::io::BufReader::new(std::io::stdin()));
             let mut stdout = std::io::stdout();
-            crab::modes::run_rpc(&rt, &rx, &root, reader, &mut stdout)
+            modes::run_rpc(&rt, &rx, &root, reader, &mut stdout)
         }
     }
 }
@@ -389,7 +392,7 @@ fn consume_until_settled(rx: &Receiver<Event>, busy: &AtomicBool) -> String {
 /// anything else is a follow-up. The session is auto-saved on exit.
 fn run_repl(
     config: Config,
-    provider: Box<dyn crab::provider::Provider>,
+    provider: Box<dyn crab_core::provider::Provider>,
     tools: ToolSet,
     workspace: Workspace,
     memory_root: Option<PathBuf>,
@@ -482,11 +485,11 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crab::config::Config;
-    use crab::provider::{Provider, ProviderError, Response};
-    use crab::runtime::AgentRuntime;
-    use crab::tools::resolver::ToolSet;
-    use crab::workspace::Workspace;
+    use crab_core::config::Config;
+    use crab_core::provider::{Provider, ProviderError, Response};
+    use crab_core::runtime::AgentRuntime;
+    use crab_core::tools::resolver::ToolSet;
+    use crab_core::workspace::Workspace;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
@@ -503,9 +506,9 @@ mod tests {
             _tools: &[serde_json::Value],
             _cancel: &AtomicBool,
             _on_text: &mut dyn FnMut(&str),
-        ) -> Result<crab::provider::Completion, ProviderError> {
+        ) -> Result<crab_core::provider::Completion, ProviderError> {
             self.histories.lock().unwrap().push(history.to_vec());
-            Ok(crab::provider::Completion {
+            Ok(crab_core::provider::Completion {
                 response: Response::Text("done".into()),
                 prompt_tokens: None,
                 aborted: false,
@@ -515,7 +518,7 @@ mod tests {
 
     /// A provider that plays a scripted `Response` per call.
     struct ScriptedProvider {
-        responses: Mutex<std::collections::VecDeque<crab::provider::Response>>,
+        responses: Mutex<std::collections::VecDeque<crab_core::provider::Response>>,
         histories: Mutex<Vec<Vec<Message>>>,
     }
 
@@ -526,15 +529,15 @@ mod tests {
             _tools: &[serde_json::Value],
             _cancel: &AtomicBool,
             _on_text: &mut dyn FnMut(&str),
-        ) -> Result<crab::provider::Completion, ProviderError> {
+        ) -> Result<crab_core::provider::Completion, ProviderError> {
             self.histories.lock().unwrap().push(history.to_vec());
             let response = self
                 .responses
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or(crab::provider::Response::Text("done".into()));
-            Ok(crab::provider::Completion {
+                .unwrap_or(crab_core::provider::Response::Text("done".into()));
+            Ok(crab_core::provider::Completion {
                 response,
                 prompt_tokens: None,
                 aborted: false,
@@ -736,8 +739,8 @@ mod tests {
             "reflect",
             Box::new(ScriptedProvider {
                 responses: Mutex::new(std::collections::VecDeque::from([
-                    crab::provider::Response::Text("done with the task".into()),
-                    crab::provider::Response::Text(
+                    crab_core::provider::Response::Text("done with the task".into()),
+                    crab_core::provider::Response::Text(
                         r#"[{"text":"always run make first","kind":"rule"}]"#.into(),
                     ),
                 ])),
@@ -756,7 +759,7 @@ mod tests {
         assert!(msg.contains("added 1 new lesson"), "{msg}");
 
         // The lesson landed in memory with provenance back to the session.
-        let lessons = crab::memory::list_lessons(&memory_root, ws.root()).unwrap();
+        let lessons = crab_core::memory::list_lessons(&memory_root, ws.root()).unwrap();
         assert_eq!(lessons.len(), 1);
         assert_eq!(lessons[0].text, "always run make first");
         assert_eq!(lessons[0].cwd, ws.root().to_string_lossy());

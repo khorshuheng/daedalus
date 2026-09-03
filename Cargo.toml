@@ -1,31 +1,22 @@
-[package]
-name = "crab"
+# Cargo workspace (CRAB-117).
+#
+# The split keeps the synchronous core (crab-core) free of any async or
+# frontend dependency, and gives each frontend its own dependency tree.
+# Members:
+#   crates/crab-core — the sync library (config, tools, provider, session,
+#                      memory, reflect, index, runtime, workspace).
+#   crates/crab     — the CLI binary (main + stdio modes + terminal input).
+#
+# CRAB-122 adds crates/crab-server (axum/tokio/tungstenite) later.
+
+[workspace]
+resolver = "2"
+members = ["crates/crab-core", "crates/crab"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "A minimal coding agent in Rust, modeled on the pi coding agent."
 # Minimum supported Rust version (first 2025 release). Cargo's MSRV-aware
 # resolver keeps dependencies compatible with this floor, so the project stays
 # buildable on older rust even as Arch keeps updating the installed toolchain.
 rust-version = "1.85"
-
-[[bin]]
-name = "crab"
-path = "src/main.rs"
-
-[lib]
-name = "crab"
-path = "src/lib.rs"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-ureq = { version = "2", features = ["json"] }
-libc = "0.2"
-# Pin url to 2.4.x: url >=2.5 pulls idna 1.x -> icu 2.x, which needs rust >=1.88
-# and would exceed the project's 1.85 MSRV.
-url = "=2.4.1"
-# Pin rusqlite to 0.34.x (Mar 2025, MSRV ~1.85 era): newer releases track
-# the then-latest stable rust and would exceed the 1.85 floor. Links the
-# system sqlite3 (pkg-config); no vendored C build.
-rusqlite = "=0.34.0"

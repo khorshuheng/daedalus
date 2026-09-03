@@ -17,7 +17,7 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::mpsc::Receiver;
 
-use crate::runtime::{AgentRuntime, Command, CommandKind, Event, RuntimeError};
+use crab_core::runtime::{AgentRuntime, Command, CommandKind, Event, RuntimeError};
 
 /// The frontend selected by `--mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,14 +37,6 @@ impl Mode {
             other => Err(format!(
                 "unknown mode '{other}' (supported: print, json, rpc)"
             )),
-        }
-    }
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Mode::Print => "print",
-            Mode::Json => "json",
-            Mode::Rpc => "rpc",
         }
     }
 }
@@ -187,12 +179,13 @@ pub fn run_rpc(
                 drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::Resume => {
-                let history = crate::session::load_previous(root, &rt.workspace_root())
+                let history = crab_core::session::load_previous(root, &rt.workspace_root())
                     .map_err(|e| format!("could not load previous session: {e}"))?;
                 match history {
                     Some(h)
-                        if h.iter()
-                            .any(|m| matches!(m, crate::provider::Message::Assistant { .. })) =>
+                        if h.iter().any(|m| {
+                            matches!(m, crab_core::provider::Message::Assistant { .. })
+                        }) =>
                     {
                         rt.replace_history(h);
                         write_response(out, id.as_deref(), true)?;
@@ -283,13 +276,13 @@ fn write_response(out: &mut dyn Write, id: Option<&str>, ok: bool) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use crate::provider::fake::FakeProvider;
-    use crate::provider::{Message, Response, ToolCall};
-    use crate::runtime::Effort;
-    use crate::session;
-    use crate::tools::resolver::ToolSet;
-    use crate::workspace::Workspace;
+    use crab_core::config::Config;
+    use crab_core::provider::fake::FakeProvider;
+    use crab_core::provider::{Message, Response, ToolCall};
+    use crab_core::runtime::Effort;
+    use crab_core::session;
+    use crab_core::tools::resolver::ToolSet;
+    use crab_core::workspace::Workspace;
     use std::io::Cursor;
     use std::path::PathBuf;
 

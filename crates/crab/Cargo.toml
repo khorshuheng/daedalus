@@ -1,0 +1,20 @@
+[package]
+name = "crab"
+description = "Crab CLI: a minimal coding agent, modeled on the pi coding agent (CRAB-117 workspace split)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "crab"
+path = "src/main.rs"
+
+[dependencies]
+crab-core = { path = "../crab-core" }
+serde_json = "1"
+# term.rs uses libc for raw terminal input mode.
+libc = "0.2"
+
+# The crab binary owns its frontend dependencies (term, stdio modes). Async
+# server deps (axum/tokio) arrive with crates/crab-server in CRAB-122, so this
+# crate never compiles them.

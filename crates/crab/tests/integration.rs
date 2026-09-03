@@ -6,12 +6,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crab::config::{Config, ProviderKind};
-use crab::provider::fake::FakeProvider;
-use crab::provider::{Message, Response, ToolCall};
-use crab::runtime::{AgentRuntime, RuntimeError};
-use crab::tools::resolver::ToolSet;
-use crab::workspace::Workspace;
+use crab_core::config::{Config, ProviderKind};
+use crab_core::provider::fake::FakeProvider;
+use crab_core::provider::{Message, Response, ToolCall};
+use crab_core::runtime::{AgentRuntime, RuntimeError};
+use crab_core::tools::resolver::ToolSet;
+use crab_core::workspace::Workspace;
 
 /// RAII guard removing the temp dir on drop.
 struct TempDir(PathBuf);

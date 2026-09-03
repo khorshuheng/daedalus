@@ -1,4 +1,4 @@
-//! Crab — a minimal coding agent.
+//! Crab core library (CRAB-117 workspace split): the synchronous engine.
 //!
 //! The crate is split into layers that mirror the CRAB tickets:
 //! - `config`/`workspace` (CRAB-105): configuration and workspace scoping.
@@ -7,19 +7,19 @@
 //! - `session` (CRAB-109): on-disk conversation persistence for `/resume`.
 //! - `index` (CRAB-114): SQLite FTS5 search over lessons + system-prompt injection.
 //! - `memory` (CRAB-113): append-only JSONL lesson store for agent memory.
-//! - `modes` (CRAB-120): print/json/rpc stdio frontends over the runtime.
 //! - `reflect` (CRAB-112): LLM-backed lesson extraction from session transcripts.
 //! - `runtime` (CRAB-116): stateful AgentRuntime engine + Event/Command surface.
-//! - `main` (CRAB-101): the CLI entrypoint.
+//!
+//! The frontends (`crab` binary: main/modes/term) live in the sibling crate so
+//! this core never depends on terminal or stdio concerns, and stays free of
+//! async dependencies.
 
 pub mod config;
 pub mod index;
 pub mod memory;
-pub mod modes;
 pub mod provider;
 pub mod reflect;
 pub mod runtime;
 pub mod session;
-pub mod term;
 pub mod tools;
 pub mod workspace;
