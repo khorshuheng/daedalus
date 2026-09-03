@@ -70,7 +70,9 @@ impl ToolSet {
             .map(|(_, _, t)| t.as_ref())
     }
 
-    /// Route `name`+`args` to the matching executor, or a clear error.
+    /// Route `name`+`args` to the matching executor, or a clear error. Args
+    /// are validated against the tool's declared JSON Schema first (CRAB-107
+    /// #9), so malformed model calls never reach an executor.
     pub fn execute(
         &self,
         workspace: &Workspace,
@@ -79,7 +81,10 @@ impl ToolSet {
         cancel: &AtomicBool,
     ) -> Result<ToolOutput, ToolError> {
         match self.tool(name) {
-            Some(tool) => tool.run(workspace, args, cancel),
+            Some(tool) => {
+                super::validate_args(&tool.schema(), args)?;
+                tool.run(workspace, args, cancel)
+            }
             None => Err(ToolError::Argument(format!(
                 "unknown tool '{name}' (expected read, bash, edit, write)"
             ))),
@@ -135,5 +140,20 @@ mod tests {
             assert!(s.get("description").is_some());
             assert!(s.get("parameters").is_some());
         }
+    }
+
+    #[test]
+    fn rejects_bad_args_before_running() {
+        let (_dir, ws) = workspace("badargs");
+        let ts = ToolSet::new(1000);
+        let err = ts
+            .execute(&ws, "read", &json!({}), &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(err.to_string().contains("missing required 'path'"));
+        // A non-string path is rejected too.
+        let err = ts
+            .execute(&ws, "read", &json!({"path": 7}), &AtomicBool::new(false))
+            .unwrap_err();
+        assert!(err.to_string().contains("'path' must be a string"));
     }
 }

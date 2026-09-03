@@ -371,7 +371,7 @@ fn trim_history(
 struct Inner {
     config: Config,
     provider: Arc<dyn Provider>,
-    tools: ToolSet,
+    tools: Arc<ToolSet>,
     /// Canonical workspace; `switch_workspace` replaces it (re-seeding the
     /// system prompt). Read by adapters (session/memory keying).
     workspace: Mutex<Workspace>,
@@ -415,6 +415,7 @@ impl AgentRuntime {
     ) -> (AgentRuntime, Receiver<Event>) {
         let (events, rx) = mpsc::channel();
         let schemas = tools.tool_schemas();
+        let tools = Arc::new(tools);
         let model = config.model.clone();
         let effort = Effort::Medium;
         let ws_path = workspace.root().to_string_lossy().into_owned();
@@ -805,6 +806,118 @@ impl AgentRuntime {
     /// results are fed back verbatim; text deltas and tool lifecycle emit
     /// events. Runs entirely on the worker thread.
     ///
+    /// Keep `history` within `budget` tokens. Prefers **compaction**
+    /// (CRAB-107 #13): the oldest removable turn blocks are summarized via a
+    /// provider call and replaced with a compact System summary, so the agent
+    /// keeps a compressed memory instead of silently losing old turns. When
+    /// compaction is unavailable (e.g. the provider is fake) or fails, falls
+    /// back to dropping the oldest blocks (trim), which always keeps the
+    /// session under budget.
+    fn manage_context(
+        &self,
+        history: &mut Vec<Message>,
+        seed_len: usize,
+        budget: usize,
+        anchor_tokens: &mut usize,
+        anchor_len: &mut usize,
+    ) {
+        // Try compaction first when over budget.
+        if anchored_total(history, *anchor_tokens, *anchor_len) > budget {
+            self.compact_history(history, seed_len, budget);
+        }
+        // Whatever remains over budget is trimmed (compaction is best-effort:
+        // a summary may itself be long, or the provider may be unavailable).
+        trim_history(history, seed_len, budget, anchor_tokens, anchor_len);
+    }
+
+    /// Compact the oldest removable turns (past the seed) into a single
+    /// summary System message, repeated until the history fits `budget` or
+    /// nothing more can be removed. Best-effort: returns without changing
+    /// anything when there is nothing summarizable or the provider call
+    /// fails (the caller then trims).
+    fn compact_history(&self, history: &mut Vec<Message>, seed_len: usize, budget: usize) {
+        // Find the oldest removable turn block (an Assistant message and its
+        // following ToolResults). Compaction summarizes from the seed onward.
+        loop {
+            // Everything from the seed up to (and including) the oldest
+            // assistant block + its tool results is compacted into a summary.
+            let Some(first_removable) = history
+                .iter()
+                .enumerate()
+                .skip(seed_len)
+                .find(|(_, m)| matches!(m, Message::Assistant { .. }))
+                .map(|(i, _)| i)
+            else {
+                return; // no assistant turns yet (nothing worth compacting)
+            };
+            let mut block_end = first_removable + 1;
+            while block_end < history.len()
+                && matches!(history[block_end], Message::ToolResult { .. })
+            {
+                block_end += 1;
+            }
+            // Compact from the first non-system message (index 1, past the
+            // system prompt) through the oldest assistant block, so the User
+            // that prompted the assistant is summarized too.
+            let compact_from = 1usize.max(seed_len.saturating_sub(1));
+            let compact_range = compact_from..block_end;
+            let to_compact: Vec<Message> = history[compact_range.clone()].to_vec();
+            if to_compact.len() <= 1 {
+                return; // nothing meaningful to compress
+            }
+            let summary = match self.request_summary(&to_compact) {
+                Some(s) if !s.is_empty() => s,
+                _ => return, // compaction unavailable/failed; caller trims
+            };
+            // Replace the compacted range with a summary System message.
+            history.drain(compact_range);
+            history.insert(
+                compact_from,
+                Message::System(format!("Summary of earlier conversation: {summary}")),
+            );
+            if anchored_total(history, 0, 0) <= budget {
+                return;
+            }
+        }
+    }
+
+    /// Ask the provider to compress `messages` into a short summary. Returns
+    /// `None` when the provider cannot (fake provider has no scripted
+    /// response) or the call fails. The request is fire-and-forget: no events
+    /// are emitted for it.
+    fn request_summary(&self, messages: &[Message]) -> Option<String> {
+        let prompt = format!(
+            "Compress the following conversation into a concise summary that preserves \
+             the key instructions, decisions, and constraints, so a follow-up turn \
+             can continue without the full transcript. Keep it under 200 words.\n\n{}",
+            messages
+                .iter()
+                .map(|m| match m {
+                    Message::User(u) => format!("user: {u}"),
+                    Message::Assistant { text, .. } => {
+                        format!("assistant: {}", text.as_deref().unwrap_or("(tool call)"))
+                    }
+                    Message::ToolResult { result, .. } => format!("result: {result}"),
+                    Message::System(s) => format!("system: {s}"),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let history = vec![Message::User(prompt)];
+        match self.inner.provider.complete(
+            &history,
+            &[],
+            &self.inner.cancel,
+            &mut |_| {}, // do not stream a compaction into the UI
+        ) {
+            Ok(completion) => match completion.response {
+                Response::Text(t) => Some(t),
+                _ => None,
+            },
+            Err(_) => None,
+        }
+    }
+
     /// Returns the terminal text, whether the turn was interrupted, and an
     /// error description when the turn ended on an error (iteration cap or
     /// provider failure — also emitted as `Event::Error`).
@@ -855,7 +968,7 @@ impl AgentRuntime {
             {
                 let mut h = self.inner.history.lock().unwrap();
                 let (mut a0, mut a1) = *self.inner.anchor.lock().unwrap();
-                trim_history(
+                self.manage_context(
                     &mut h,
                     seed_len,
                     self.inner.config.max_context_tokens,
@@ -924,26 +1037,58 @@ impl AgentRuntime {
                                 tool_calls: calls.clone(),
                             });
                             drop(h);
-                            let mut tool_cancelled = false;
-                            for call in &calls {
-                                self.emit(Event::ToolStart {
-                                    name: call.name.clone(),
-                                    id: Some(call.id.clone()),
+                            // Run tool calls in parallel (CRAB-107 #11), like
+                            // pi. Each thread locks the workspace and checks
+                            // the shared cancel flag; results are collected in
+                            // call order so history stays deterministic.
+                            let mut cancelled = false;
+                            let results: Vec<(String, Result<String, crate::tools::ToolError>)> =
+                                std::thread::scope(|scope| {
+                                    let handles: Vec<_> = calls
+                                        .iter()
+                                        .map(|call| {
+                                            self.emit(Event::ToolStart {
+                                                name: call.name.clone(),
+                                                id: Some(call.id.clone()),
+                                            });
+                                            scope.spawn(move || {
+                                                // Clone the (immutable) workspace so the
+                                                // lock is not held across the whole tool
+                                                // run — otherwise parallel calls would
+                                                // serialize on the workspace mutex.
+                                                let ws =
+                                                    self.inner.workspace.lock().unwrap().clone();
+                                                let cancel = &self.inner.cancel;
+                                                let result = self
+                                                    .inner
+                                                    .tools
+                                                    .execute(&ws, &call.name, &call.args, cancel)
+                                                    .map(|out| out.content);
+                                                (call.id.clone(), result)
+                                            })
+                                        })
+                                        .collect();
+                                    handles
+                                        .into_iter()
+                                        .map(|h| {
+                                            h.join().unwrap_or_else(|_| {
+                                                (
+                                                    String::new(),
+                                                    Err(crate::tools::ToolError::Io(
+                                                        "tool thread panicked".into(),
+                                                    )),
+                                                )
+                                            })
+                                        })
+                                        .collect()
                                 });
-                                let result_str = {
-                                    let ws = self.inner.workspace.lock().unwrap();
-                                    let cancel = &self.inner.cancel;
-                                    match self
-                                        .inner
-                                        .tools
-                                        .execute(&ws, &call.name, &call.args, cancel)
-                                    {
-                                        Ok(out) => out.content,
-                                        Err(e) => {
-                                            tool_cancelled =
-                                                matches!(e, crate::tools::ToolError::Cancelled);
-                                            format!("tool error: {e}")
-                                        }
+                            for (call, (_id, result)) in calls.iter().zip(&results) {
+                                let result_str = match result {
+                                    Ok(content) => content.clone(),
+                                    Err(e) => {
+                                        cancelled |=
+                                            matches!(e, crate::tools::ToolError::Cancelled);
+                                        format!("tool error: {e}")
                                     }
                                 };
                                 self.emit(Event::ToolEnd {
@@ -960,7 +1105,7 @@ impl AgentRuntime {
                                     result: result_str,
                                 });
                             }
-                            if tool_cancelled {
+                            if cancelled {
                                 interrupted = true;
                                 break 'steps;
                             }
@@ -1557,6 +1702,147 @@ mod tests {
                 aborted: true,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+    use crate::provider::ToolCall;
+
+    #[test]
+    fn tool_calls_execute_in_parallel() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) =
+            AgentRuntime::new(cfg, Box::new(ParallelCallProvider), tools, ws.clone(), None);
+        // Two bash calls each sleep 400ms; parallel wall time is ~400ms, not
+        // ~800ms.
+        let start = std::time::Instant::now();
+        let answer = rt.run_once("run both").unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(answer, "done");
+        assert!(
+            elapsed < std::time::Duration::from_millis(750),
+            "parallel tools should finish well under the sequential sum: {elapsed:?}"
+        );
+    }
+
+    /// A provider that first emits two parallel bash `sleep 0.4` calls, then
+    /// a final answer.
+    struct ParallelCallProvider;
+    impl crate::provider::Provider for ParallelCallProvider {
+        fn complete(
+            &self,
+            _history: &[Message],
+            _tools: &[serde_json::Value],
+            _cancel: &AtomicBool,
+            _on_text: &mut dyn FnMut(&str),
+        ) -> Result<crate::provider::Completion, crate::provider::ProviderError> {
+            use std::sync::atomic::Ordering as O;
+            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = CALLS.fetch_add(1, O::SeqCst);
+            let response = if n == 0 {
+                Response::ToolCalls(vec![
+                    ToolCall {
+                        id: "p1".into(),
+                        name: "bash".into(),
+                        args: serde_json::json!({"command": "sleep 0.4"}),
+                    },
+                    ToolCall {
+                        id: "p2".into(),
+                        name: "bash".into(),
+                        args: serde_json::json!({"command": "sleep 0.4"}),
+                    },
+                ])
+            } else {
+                Response::Text("done".into())
+            };
+            Ok(crate::provider::Completion {
+                response,
+                prompt_tokens: None,
+                aborted: false,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::*;
+    use crate::provider::fake::FakeProvider;
+
+    fn runtime_with_summarizer(summary: Option<String>) -> AgentRuntime {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let tools = ToolSet::new(1000);
+        let responses = summary.map(|s| vec![Response::Text(s)]).unwrap_or_default();
+        let cfg = Config {
+            max_iterations: 5,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) =
+            AgentRuntime::new(cfg, Box::new(FakeProvider::new(responses)), tools, ws, None);
+        rt
+    }
+
+    #[test]
+    fn compaction_replaces_old_turns_with_a_summary() {
+        let rt = runtime_with_summarizer(Some("compact summary here".into()));
+        // Build a history that is over budget: seed + a long old turn.
+        let mut history = vec![
+            Message::System("seed prompt that is reasonably long".into()),
+            Message::User("first long question that fills space".into()),
+            Message::Assistant {
+                text: Some("a".repeat(5000)),
+                tool_calls: vec![],
+            },
+            Message::User("second question".into()),
+        ];
+        let mut a0 = 0usize;
+        let mut a1 = 0usize;
+        rt.manage_context(&mut history, 2, 120, &mut a0, &mut a1);
+        // The old assistant text was replaced by the summary.
+        assert!(
+            history
+                .iter()
+                .any(|m| matches!(m, Message::System(s) if s.contains("compact summary here"))),
+            "expected a summary message: {history:?}"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { text: Some(t), .. } if t.len() > 100)),
+            "long old turn should be gone"
+        );
+    }
+
+    #[test]
+    fn compaction_falls_back_to_trimming_without_summarizer() {
+        // A provider with no scripted summary: FakeProvider returns "done" for
+        // the compaction call (not a useful summary is still a text). We rely
+        // on the fallback path keeping the session bounded.
+        let rt = runtime_with_summarizer(None);
+        let mut history = vec![
+            Message::System("seed".into()),
+            Message::User("q".into()),
+            Message::Assistant {
+                text: Some("x".repeat(300)),
+                tool_calls: vec![],
+            },
+        ];
+        let mut a0 = 0usize;
+        let mut a1 = 0usize;
+        rt.manage_context(&mut history, 2, 50, &mut a0, &mut a1);
+        // History is now within budget (trimming happened).
+        assert!(crate::runtime::anchored_total(&history, a0, a1) <= 50);
     }
 }
 

@@ -38,9 +38,8 @@ fn restore_line_endings(s: &str, ending: &str) -> String {
     }
 }
 
-/// Map a single character to its ASCII equivalent for fuzzy matching. This is
-/// length-preserving (one char in, one char out), which lets fuzzy-space char
-/// offsets be mapped back onto the original content.
+/// Map a single character to its ASCII equivalent for fuzzy matching, after
+/// NFKC normalization. Length-preserving (one char in, one char out).
 fn fuzzy_char(c: char) -> char {
     match c {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
@@ -51,16 +50,53 @@ fn fuzzy_char(c: char) -> char {
     }
 }
 
-fn fuzzy_normalize(s: &str) -> String {
-    s.chars().map(fuzzy_char).collect()
-}
-
-/// Byte offset of the `char_idx`-th character in `s`.
-fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
+/// A normalized string plus, for each normalized char, the byte range it
+/// came from in the original. NFKC can expand one original char into several
+/// (e.g. ligatures, compat forms), so a match in normalized space maps back
+/// to the original through this table. Trailing whitespace on each line is
+/// trimmed and excluded from the map (pi's `normalizeForFuzzyMatch`).
+fn normalize_for_fuzzy(s: &str) -> (String, Vec<(usize, usize)>) {
+    use unicode_normalization::UnicodeNormalization;
+    // NFKC-normalize char-by-char so each output char knows its source byte
+    // range (one original char may expand to several normalized chars).
+    let mut norm_chars: Vec<(char, (usize, usize))> = Vec::new();
+    for (byte_start, c) in s.char_indices() {
+        let byte_end = byte_start + c.len_utf8();
+        for n in c.nfkc() {
+            norm_chars.push((fuzzy_char(n), (byte_start, byte_end)));
+        }
+    }
+    // Trim trailing whitespace on each line (pi's normalizeForFuzzyMatch), so
+    // a model's oldText without trailing spaces matches file lines that have
+    // them. Trimming drops entries from the map, keeping indices aligned.
+    let mut result = String::new();
+    let mut result_map: Vec<(usize, usize)> = Vec::new();
+    let mut line: Vec<(char, (usize, usize))> = Vec::new();
+    for item in norm_chars {
+        if item.0 == '\n' {
+            let mut keep = line.len();
+            while keep > 0 && line[keep - 1].0 == ' ' {
+                keep -= 1;
+            }
+            for (ch, range) in line.drain(..keep) {
+                result.push(ch);
+                result_map.push(range);
+            }
+            result.push('\n');
+            result_map.push(item.1);
+        } else {
+            line.push(item);
+        }
+    }
+    let mut keep = line.len();
+    while keep > 0 && line[keep - 1].0 == ' ' {
+        keep -= 1;
+    }
+    for (ch, range) in line.drain(..keep) {
+        result.push(ch);
+        result_map.push(range);
+    }
+    (result, result_map)
 }
 
 fn describe_edit(idx: usize, total: usize) -> String {
@@ -103,8 +139,11 @@ fn locate_match(
         }
     }
 
-    let fuzzy_content = fuzzy_normalize(content);
-    let fuzzy_old = fuzzy_normalize(old);
+    let (fuzzy_content, map) = normalize_for_fuzzy(content);
+    let (fuzzy_old, _old_map) = normalize_for_fuzzy(old);
+    // Byte index of a normalized char = its position in the String; but the
+    // match range in the *String* is byte-based while `map` is per-char. Walk
+    // char indices to locate the normalized match, then translate both ends.
     let fuzzy: Vec<usize> = fuzzy_content
         .match_indices(&fuzzy_old)
         .map(|(i, _)| i)
@@ -115,9 +154,17 @@ fn locate_match(
             describe_edit(idx, total)
         ))),
         1 => {
-            let char_idx = fuzzy_content[..fuzzy[0]].chars().count();
-            let start = char_index_to_byte(content, char_idx);
-            let end = char_index_to_byte(content, char_idx + fuzzy_old.chars().count());
+            let char_start = fuzzy_content[..fuzzy[0]].chars().count();
+            let char_end = char_start + fuzzy_old.chars().count();
+            // map[i] = original byte range of the i-th normalized char. The
+            // matched region spans chars [char_start, char_end): its start is
+            // the start of the first matched char and its end the end of the
+            // last matched char.
+            let start = map.get(char_start).map(|r| r.0).unwrap_or(content.len());
+            let end = map
+                .get(char_end.saturating_sub(1))
+                .map(|r| r.1)
+                .unwrap_or(content.len());
             Ok((start, end))
         }
         n => Err(ToolError::Invalid(format!(
@@ -364,6 +411,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read(&dir), "do not panic");
+    }
+
+    #[test]
+    fn fuzzy_matches_nfkc_fullwidth_and_ligatures() {
+        // Fullwidth Latin (NFKC -> ASCII) in the model's oldText.
+        let (ws, dir) = setup("nfkc", "use HelloWorld here");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "ＨｅｌｌｏＷｏｒｌｄ", "newText": "hi"}),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(read(&dir), "use hi here");
+    }
+
+    #[test]
+    fn fuzzy_tolerates_trailing_whitespace_on_the_line() {
+        // The model's oldText has no trailing spaces, but the file line does;
+        // the match must still succeed (pi's normalizeForFuzzyMatch trims each
+        // line). The trailing spaces themselves are not part of oldText, so
+        // they remain after the replacement.
+        let (ws, dir) = setup("trailing", "alpha   \nbeta   \n");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "beta", "newText": "gamma"}),
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(read(&dir), "alpha   \ngamma   \n");
     }
 
     #[test]

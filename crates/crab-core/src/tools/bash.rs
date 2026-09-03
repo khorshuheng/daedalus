@@ -1,5 +1,9 @@
 //! The `bash` tool: run a shell command in the workspace directory.
 //!
+//! The shell runs in its own process group (Unix) so a timeout or cancel can
+//! kill the whole tree — including grandchildren — not just the direct child
+//! (CRAB-107 #14).
+//!
 //! Known limitation: a command that backgrounds a process while keeping
 //! stdout/stderr open (e.g. `sh -c "sleep 100 &"`) will block until that
 //! process exits, because the readers wait for the pipes to reach EOF.
@@ -7,6 +11,9 @@
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use serde_json::{json, Value};
 
@@ -29,14 +36,25 @@ fn run_command(
     use std::io::Read;
     use std::time::{Duration, Instant};
 
-    let mut child = Command::new("sh")
-        .arg("-c")
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| ToolError::Io(e.to_string()))?;
+        .stderr(Stdio::piped());
+    // Run the shell in its own session/process group so we can kill the
+    // whole tree on timeout/cancel (pi semantics).
+    #[cfg(unix)]
+    unsafe {
+        cmd.pre_exec(|| {
+            // setsid: detach into a new session whose process group id == pid.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().map_err(|e| ToolError::Io(e.to_string()))?;
 
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
@@ -58,14 +76,12 @@ fn run_command(
             Some(status) => break status,
             None => {
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     return Err(ToolError::Cancelled);
                 }
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_tree(&mut child);
                         // Do NOT join the reader threads here: a grandchild of
                         // `sh` (e.g. `sh -c "a && b"`) may still hold the pipe
                         // write end open, so joining would block past the
@@ -95,6 +111,23 @@ fn run_command(
         stdout,
         stderr,
     })
+}
+
+/// Kill the whole process tree rooted at `child`. On Unix the child was
+/// started in its own session (setsid), so its process-group id equals its
+/// pid and `kill(-pid, SIGKILL)` reaches every descendant; the direct child
+/// is then reaped. On other platforms only the direct child is killed.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        // Negative pid => the whole process group.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Write the full command output to a temp file and return its path, so a
@@ -304,5 +337,43 @@ mod tests {
         cancel.store(true, Ordering::SeqCst);
         let result = handle.join().unwrap();
         assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_grandchild_processes() {
+        let (ws, dir) = setup("grandchild");
+        let tool = BashTool { max_output: 1000 };
+        // Start a backgrounded grandchild that writes its PID and sleeps; the
+        // direct `sh` exits immediately but the grandchild must not survive
+        // the group kill.
+        let marker = dir.path().join("gc.pid");
+        // The direct `sh` backgrounds a grandchild, then waits on it, so the
+        // timeout fires while both the direct child and the grandchild are
+        // alive. The group kill must reap both.
+        let cmd = format!("sleep 30 & echo $! > '{}'; wait", marker.display());
+        let err = tool
+            .run(
+                &ws,
+                &json!({"command": cmd, "timeout": 1}),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Timeout(_)));
+        // Give the kill a moment to land, then confirm the grandchild is gone.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .map(|s| s.trim().parse().unwrap_or(0))
+            .unwrap_or(0);
+        assert!(
+            pid > 0,
+            "grandchild should have started and recorded its pid"
+        );
+        // kill(pid, 0) returns 0 while the process exists; -1 (ESRCH) means gone.
+        let alive = unsafe { libc::kill(pid, 0) == 0 };
+        assert!(
+            !alive,
+            "grandchild {pid} should have been killed with the group"
+        );
     }
 }

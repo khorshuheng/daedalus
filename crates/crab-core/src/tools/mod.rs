@@ -65,6 +65,114 @@ pub trait Tool: Send + Sync {
     ) -> Result<ToolOutput, ToolError>;
 }
 
+/// Validate `args` against the small JSON-Schema subset this crate's tools
+/// declare (CRAB-107 #9): an object with `properties` (string/integer/array
+/// of objects, optional `minimum`), `required`, and `oneOf`. The tools are a
+/// closed set we author, so validating against exactly the subset we emit
+/// (rather than pulling a full JSON-Schema engine) is sufficient and keeps
+/// bad model args from reaching executors. Returns a clear `ToolError`
+/// describing the first violation.
+pub(crate) fn validate_args(schema: &Value, args: &Value) -> Result<(), ToolError> {
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return Err(ToolError::Argument("schema must describe an object".into()));
+    }
+    let obj = args
+        .as_object()
+        .ok_or_else(|| ToolError::Argument("arguments must be a JSON object".into()))?;
+
+    // oneOf: at least one branch must validate (used by edit: edits XOR oldText/newText).
+    if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
+        let mut any = false;
+        for branch in one_of {
+            if let Some(required) = branch.get("required").and_then(Value::as_array) {
+                if required
+                    .iter()
+                    .all(|k| k.as_str().map(|k| obj.contains_key(k)).unwrap_or(false))
+                {
+                    any = true;
+                    break;
+                }
+            }
+        }
+        if !any {
+            let branch = one_of.first().cloned().unwrap_or(Value::Null);
+            let required = branch
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|r| {
+                    r.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            return Err(ToolError::Argument(format!(
+                "one of these argument sets is required: {required}"
+            )));
+        }
+    }
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required {
+            if let Some(key) = key.as_str() {
+                if !obj.contains_key(key) {
+                    return Err(ToolError::Argument(format!("missing required '{key}'")));
+                }
+            }
+        }
+    }
+
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (key, prop) in properties {
+            if let Some(value) = obj.get(key) {
+                check_property(key, prop, value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a single property value against its subschema.
+fn check_property(key: &str, prop: &Value, value: &Value) -> Result<(), ToolError> {
+    let type_name = prop.get("type").and_then(Value::as_str).unwrap_or("");
+    let ok = match type_name {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "array" => {
+            if !value.is_array() {
+                false
+            } else if let Some(items) = prop.get("items") {
+                let items_type = items.get("type").and_then(Value::as_str).unwrap_or("");
+                value.as_array().is_some_and(|arr| {
+                    arr.iter().all(|it| match items_type {
+                        "object" => it.is_object(),
+                        "string" => it.is_string(),
+                        "integer" => it.is_i64() || it.is_u64(),
+                        _ => true,
+                    })
+                })
+            } else {
+                true
+            }
+        }
+        "object" => value.is_object(),
+        _ => true,
+    };
+    if !ok {
+        return Err(ToolError::Argument(format!(
+            "'{key}' must be a {type_name}"
+        )));
+    }
+    if let Some(min) = prop.get("minimum").and_then(Value::as_i64) {
+        if let Some(n) = value.as_i64() {
+            if n < min {
+                return Err(ToolError::Argument(format!("'{key}' must be >= {min}")));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Truncate `s` to at most `max` bytes keeping the *tail* (last bytes),
 /// prepending an ellipsis note when truncated. Suitable for command output,
 /// where errors and final results appear at the end.
@@ -114,4 +222,94 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, ToolEr
 /// a `ToolError::Escape`.
 pub(crate) fn resolve(workspace: &Workspace, rel: &Path) -> Result<std::path::PathBuf, ToolError> {
     workspace.resolve(rel).map_err(ToolError::Escape)
+}
+
+#[cfg(test)]
+mod validate_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rejects_non_object_args() {
+        let schema = json!({"type": "object", "properties": {}});
+        let err = validate_args(&schema, &json!([1, 2])).unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn rejects_missing_required() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let err = validate_args(&schema, &json!({})).unwrap_err();
+        assert!(err.to_string().contains("missing required 'path'"));
+    }
+
+    #[test]
+    fn rejects_wrong_type() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let err = validate_args(&schema, &json!({"path": 42})).unwrap_err();
+        assert!(err.to_string().contains("'path' must be a string"));
+    }
+
+    #[test]
+    fn enforces_minimum_on_integers() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"timeout": {"type": "integer", "minimum": 1}},
+            "required": []
+        });
+        let err = validate_args(&schema, &json!({"timeout": 0})).unwrap_err();
+        assert!(err.to_string().contains("'timeout' must be >= 1"));
+        assert!(validate_args(&schema, &json!({"timeout": 5})).is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_args() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "integer", "minimum": 1}
+            },
+            "required": ["command"]
+        });
+        assert!(validate_args(&schema, &json!({"command": "ls", "timeout": 2})).is_ok());
+    }
+
+    #[test]
+    fn one_of_requires_at_least_one_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "edits": {"type": "array"},
+                "oldText": {"type": "string"},
+                "newText": {"type": "string"}
+            },
+            "required": ["path"],
+            "oneOf": [
+                {"required": ["edits"]},
+                {"required": ["oldText", "newText"]}
+            ]
+        });
+        // Neither branch satisfied.
+        let err = validate_args(&schema, &json!({"path": "f"})).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("one of these argument sets is required"));
+        // edits branch ok.
+        assert!(validate_args(&schema, &json!({"path": "f", "edits": []})).is_ok());
+        // oldText+newText branch ok.
+        assert!(validate_args(
+            &schema,
+            &json!({"path": "f", "oldText": "a", "newText": "b"})
+        )
+        .is_ok());
+    }
 }
