@@ -260,7 +260,7 @@ fn cli_json_mode_emits_events_as_jsonl() {
 fn cli_unknown_mode_fails() {
     let tmp = tempdir("mode-bad");
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
-        .args(["hi", "--mode", "tui", "--dir"])
+        .args(["hi", "--mode", "nope", "--dir"])
         .arg(tmp.path())
         .stdin(std::process::Stdio::null())
         .output()
@@ -268,5 +268,5 @@ fn cli_unknown_mode_fails() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown mode"));
-    assert!(stderr.contains("print, json, rpc"));
+    assert!(stderr.contains("print, json, rpc, tui"));
 }

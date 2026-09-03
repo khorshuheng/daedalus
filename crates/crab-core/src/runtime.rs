@@ -288,7 +288,7 @@ impl RuntimeError {
 
 /// A snapshot of the runtime's mutable state, reported via `get_state` and
 /// carried in `state_changed` events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RuntimeState {
     pub model: String,
@@ -549,6 +549,12 @@ impl AgentRuntime {
     /// The provider backing this runtime (reflection reuses it, CRAB-112).
     pub fn provider(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.inner.provider)
+    }
+
+    /// The provider kind this runtime was built with (for /login and the
+    /// model picker, CRAB-121).
+    pub fn provider_kind(&self) -> ProviderKind {
+        self.inner.config.provider
     }
 
     /// Current runtime state snapshot.
@@ -1551,5 +1557,31 @@ mod tests {
                 aborted: true,
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod accessor_tests {
+    use super::*;
+
+    #[test]
+    fn provider_kind_is_exposed_for_frontends() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            provider: ProviderKind::Anthropic,
+            max_iterations: 5,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::new(
+            cfg,
+            Box::new(crate::provider::fake::FakeProvider::new(vec![])),
+            tools,
+            ws,
+            None,
+        );
+        assert_eq!(rt.provider_kind(), ProviderKind::Anthropic);
     }
 }

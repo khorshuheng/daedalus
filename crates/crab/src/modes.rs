@@ -25,6 +25,7 @@ pub enum Mode {
     Print,
     Json,
     Rpc,
+    Tui,
 }
 
 impl Mode {
@@ -34,8 +35,9 @@ impl Mode {
             "print" => Ok(Mode::Print),
             "json" => Ok(Mode::Json),
             "rpc" => Ok(Mode::Rpc),
+            "tui" => Ok(Mode::Tui),
             other => Err(format!(
-                "unknown mode '{other}' (supported: print, json, rpc)"
+                "unknown mode '{other}' (supported: print, json, rpc, tui)"
             )),
         }
     }
@@ -485,7 +487,7 @@ mod tests {
         assert_eq!(Mode::parse("json").unwrap(), Mode::Json);
         assert_eq!(Mode::parse("rpc").unwrap(), Mode::Rpc);
         assert_eq!(Mode::parse("RPC").unwrap(), Mode::Rpc);
-        assert!(Mode::parse("tui").is_err());
+        assert_eq!(Mode::parse("tui").unwrap(), Mode::Tui);
     }
 
     #[test]

@@ -17,6 +17,9 @@ libc = "0.2"
 # Maintainability crates (CRAB-119), era-appropriate for the 1.85 MSRV floor.
 clap = { version = "=4.5.23", features = ["derive"] }
 anyhow = "=1.0.95"
+# TUI (CRAB-121): ratatui 0.29 (MSRV 1.74) + crossterm 0.28 (MSRV 1.63).
+ratatui = "=0.29.0"
+crossterm = "=0.28.1"
 directories = "=5.0.1"
 
 # The crab binary owns its frontend dependencies (term, stdio modes). Async

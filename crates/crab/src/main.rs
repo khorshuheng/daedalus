@@ -31,6 +31,7 @@ use crab_core::workspace::Workspace;
 
 mod modes;
 mod term;
+mod tui;
 
 use modes::Mode;
 
@@ -183,6 +184,13 @@ fn run(cli: Cli) -> Result<i32, String> {
                 Box::new(std::io::BufReader::new(std::io::stdin()));
             let mut stdout = std::io::stdout();
             modes::run_rpc(&rt, &rx, &root, reader, &mut stdout)
+        }
+        Mode::Tui => {
+            let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let worker = rt.clone();
+            let _worker_handle = std::thread::spawn(move || worker.run_forever());
+            let root = session::default_root();
+            tui::run_tui(&rt, &rx, &cli.prompt(), root.as_path())
         }
     }
 }
