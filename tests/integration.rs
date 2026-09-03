@@ -202,3 +202,81 @@ fn integration_path_escape_is_rejected() {
     assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
     std::fs::remove_dir_all(&outside).ok();
 }
+
+/// CLI smoke: `--mode rpc` drives a full session over stdin/stdout with no
+/// terminal (CRAB-120): send a prompt request with an id, expect events plus
+/// a correlated response line.
+#[test]
+fn cli_rpc_mode_drives_a_session_over_stdio() {
+    let tmp = TempDir::new("rpc");
+    let script = r#"{"id":"1","type":"prompt","text":"say hi"}
+"#;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_crab"))
+        .args(["--mode", "rpc", "--provider", "fake", "--dir"])
+        .arg(&tmp.0)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn crab rpc");
+    use std::io::Write as _;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().expect("wait");
+    assert!(out.status.success(), "rpc exited {}", out.status);
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(!lines.is_empty());
+    // Events stream, ending with the correlated response carrying our id.
+    let last = lines.last().unwrap();
+    assert_eq!(last["type"], "response");
+    assert_eq!(last["id"], "1");
+    assert!(lines.iter().any(|l| l["type"] == "agent_start"));
+    assert!(lines.iter().any(|l| l["type"] == "agent_settled"));
+}
+
+/// CLI smoke: `--mode json` emits every Event as a JSONL line (CRAB-120).
+#[test]
+fn cli_json_mode_emits_events_as_jsonl() {
+    let tmp = TempDir::new("json");
+    let out = Command::new(env!("CARGO_BIN_EXE_crab"))
+        .args(["hello", "--mode", "json", "--provider", "fake", "--dir"])
+        .arg(&tmp.0)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run crab json");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert!(lines.iter().any(|l| l["type"] == "agent_start"));
+    // JSON output must not contain a bare final-answer line (unlike print).
+    assert!(lines.iter().any(|l| l["type"] == "agent_settled"));
+}
+
+/// CLI smoke: unknown --mode fails fast.
+#[test]
+fn cli_unknown_mode_fails() {
+    let tmp = TempDir::new("mode-bad");
+    let out = Command::new(env!("CARGO_BIN_EXE_crab"))
+        .args(["hi", "--mode", "tui", "--dir"])
+        .arg(&tmp.0)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run crab");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unknown mode"));
+    assert!(stderr.contains("print, json, rpc"));
+}

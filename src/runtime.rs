@@ -249,6 +249,9 @@ pub enum CommandKind {
     Clear {},
     /// Ask the runtime to report its current state.
     GetState {},
+    /// Reload the previous saved session for the workspace. Handled by the
+    /// adapter (the runtime does not own the session store).
+    Resume,
 }
 
 /// Internal queue item: a wire command or a worker shutdown request.
@@ -597,7 +600,11 @@ impl AgentRuntime {
                 }
                 CommandKind::Abort {} => self.cancel_clear(),
                 CommandKind::GetState {} => self.emit_state_changed(),
-                CommandKind::Clear {} => self.reset_to_seed(),
+                CommandKind::Clear {} => {
+                    self.reset_to_seed();
+                    self.emit_state_changed();
+                }
+                CommandKind::Resume => {}
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
                 | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind),
@@ -773,7 +780,11 @@ impl AgentRuntime {
                     self.inner.cancel.store(true, Ordering::SeqCst);
                 }
                 CommandKind::GetState {} => self.emit_state_changed(),
-                CommandKind::Clear {} => self.reset_to_seed(),
+                CommandKind::Clear {} => {
+                    self.reset_to_seed();
+                    self.emit_state_changed();
+                }
+                CommandKind::Resume => {}
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
                 | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind),
@@ -1203,6 +1214,30 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::StateChanged { .. })));
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn queued_clear_acknowledges_with_state_changed() {
+        let (rt, rx, handle, _ws) = runtime_with(
+            "clear-ack",
+            Box::new(GateProvider::new(vec![Response::Text(text("a"))])),
+        );
+        rt.prompt("first");
+        collect_until_settled(&rx);
+        // A queued /clear must emit state_changed so an rpc adapter has a
+        // deterministic ack boundary (CRAB-120).
+        rt.clear();
+        let mut seen_state = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !seen_state && std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(e) => seen_state = matches!(e, Event::StateChanged { .. }),
+                Err(_) => continue,
+            }
+        }
+        assert!(seen_state, "clear must ack with state_changed");
         rt.shutdown();
         handle.join().unwrap_or(());
     }

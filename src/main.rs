@@ -4,8 +4,10 @@
 //! to cwd) plus `--model`, `--provider`, `--max-iterations`, and `--config`.
 //! Builds the app from config (CRAB-105), constructs the AgentRuntime
 //! (CRAB-116) with the selected provider (CRAB-103) and tools (CRAB-102), and
-//! drives it: piped stdin runs one prompt to completion; an interactive
-//! terminal runs a REPL that consumes runtime events and sends commands.
+//! drives it through one of the stdio frontends (CRAB-120): `--mode print`
+//! (default when piped, one prompt -> final answer), `--mode json` (one
+//! prompt -> every Event as JSONL), `--mode rpc` (JSONL command/event loop,
+//! no prompt needed), or the interactive REPL on a terminal.
 //!
 //! Exit codes:
 //!   0 — clean final answer
@@ -20,9 +22,10 @@ use std::sync::Arc;
 
 use crab::config::{Config, Overrides, ProviderKind};
 use crab::memory;
+use crab::modes::Mode;
 use crab::provider::{self, Message};
 use crab::reflect;
-use crab::runtime::{AgentRuntime, Event, RuntimeError};
+use crab::runtime::{AgentRuntime, Event};
 use crab::session;
 use crab::term;
 use crab::tools::resolver::ToolSet;
@@ -43,6 +46,9 @@ OPTIONS:
     --model <name>          Model identifier (provider-specific default)
     --max-iterations <n>    Iteration cap for the agent loop (default: 30)
     --config <path>         Config file (default: ~/.config/crab/config.toml)
+    --mode <mode>           print | json | rpc (default: print when piped,
+                            interactive REPL on a terminal; rpc reads JSON
+                            commands from stdin and needs no <prompt>)
     -h, --help              Print this help.
 
 Precedence for config values: flags > env (CRAB_*) > config file > defaults.
@@ -57,6 +63,7 @@ struct Cli {
     prompt: String,
     dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
+    mode: Option<Mode>,
     flags: Overrides,
 }
 
@@ -70,6 +77,7 @@ fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
     let mut prompt_parts: Vec<String> = Vec::new();
     let mut dir: Option<PathBuf> = None;
     let mut config_path: Option<PathBuf> = None;
+    let mut mode: Option<Mode> = None;
     let mut flags = Overrides::default();
 
     let mut it = args.iter();
@@ -89,6 +97,10 @@ fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
                 );
             }
             "--config" => config_path = Some(PathBuf::from(next_value(&mut it, "--config")?)),
+            "--mode" => {
+                let v = next_value(&mut it, "--mode")?;
+                mode = Some(Mode::parse(&v)?);
+            }
             "-h" | "--help" => return Ok(ParseOutcome::Help),
             s if s.starts_with("--dir=") => dir = Some(PathBuf::from(&s["--dir=".len()..])),
             s if s.starts_with('-') => return Err(format!("unknown flag '{s}'")),
@@ -96,7 +108,7 @@ fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         }
     }
 
-    if prompt_parts.is_empty() {
+    if prompt_parts.is_empty() && mode != Some(Mode::Rpc) {
         return Err("no prompt given".into());
     }
 
@@ -104,6 +116,7 @@ fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
         prompt: prompt_parts.join(" "),
         dir,
         config_path,
+        mode,
         flags,
     })))
 }
@@ -141,24 +154,44 @@ fn run(cli: Cli) -> Result<i32, String> {
     // workspace into the system prompt.
     let memory_root = Some(memory::default_root());
 
-    // Interactive terminal -> REPL (Ctrl-C/Esc cancel while busy, terminate at
-    // the prompt, /exit to quit). Piped stdin -> one-shot.
-    if !std::io::stdin().is_terminal() {
-        let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
-        return match rt.run_once(&cli.prompt) {
-            Ok(answer) => {
-                println!("{answer}");
-                Ok(0)
-            }
-            Err(RuntimeError::IterationCap(n)) => {
-                eprintln!("crab: iteration cap exceeded: no final answer after {n} iterations");
-                Ok(2)
-            }
-            Err(e) => Err(e.to_string()),
-        };
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    // No --mode: an interactive terminal gets the REPL; piped stdin gets
+    // print (one prompt -> final answer). An explicit --mode always wins.
+    let mode = cli.mode.unwrap_or(Mode::Print);
+    if cli.mode.is_none() && stdin_is_terminal {
+        return run_repl(config, provider, tools, workspace, memory_root, &cli.prompt);
     }
 
-    run_repl(config, provider, tools, workspace, memory_root, &cli.prompt)
+    match mode {
+        Mode::Print => {
+            let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let mut stdout = std::io::stdout();
+            match crab::modes::run_print(&rt, &cli.prompt, &mut stdout) {
+                Ok(2) => {
+                    eprintln!("crab: iteration cap exceeded: no final answer");
+                    Ok(2)
+                }
+                other => other,
+            }
+        }
+        Mode::Json => {
+            let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let worker = rt.clone();
+            let _worker_handle = std::thread::spawn(move || worker.run_forever());
+            let mut stdout = std::io::stdout();
+            crab::modes::run_json(&rt, &rx, &cli.prompt, &mut stdout)
+        }
+        Mode::Rpc => {
+            let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let worker = rt.clone();
+            let _worker_handle = std::thread::spawn(move || worker.run_forever());
+            let root = session::default_root();
+            let reader: Box<dyn std::io::BufRead + Send> =
+                Box::new(std::io::BufReader::new(std::io::stdin()));
+            let mut stdout = std::io::stdout();
+            crab::modes::run_rpc(&rt, &rx, &root, reader, &mut stdout)
+        }
+    }
 }
 
 fn now_millis() -> u64 {
