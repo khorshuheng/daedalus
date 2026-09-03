@@ -3,7 +3,7 @@
 //! No network required: drives the real agent loop with an in-memory scripted
 //! provider against a temp workspace, plus a CLI smoke test.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crab_core::config::{Config, ProviderKind};
@@ -13,20 +13,10 @@ use crab_core::runtime::{AgentRuntime, RuntimeError};
 use crab_core::tools::resolver::ToolSet;
 use crab_core::workspace::Workspace;
 
-/// RAII guard removing the temp dir on drop.
-struct TempDir(PathBuf);
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let base = std::env::temp_dir().join(format!("crab-it-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        TempDir(base)
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+type TempDir = tempfile::TempDir;
+fn tempdir(_name: &str) -> TempDir {
+    tempfile::tempdir().expect("create temp dir")
 }
 
 fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
@@ -50,9 +40,9 @@ fn config_for(dir: &Path, max_iterations: usize) -> Config {
 /// the tools ran against the temp workspace and the loop fed results back.
 #[test]
 fn integration_multi_step_session() {
-    let tmp = TempDir::new("multi");
-    let ws = Workspace::new(tmp.0.clone()).unwrap();
-    let cfg = config_for(&tmp.0, 10);
+    let tmp = tempdir("multi");
+    let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = config_for(tmp.path(), 10);
 
     let fake = FakeProvider::new(vec![
         Response::ToolCalls(vec![call(
@@ -86,7 +76,7 @@ fn integration_multi_step_session() {
 
     // The tools actually mutated the workspace.
     assert_eq!(
-        std::fs::read_to_string(tmp.0.join("a.txt")).unwrap(),
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
         "hello there"
     );
 
@@ -102,9 +92,9 @@ fn integration_multi_step_session() {
 /// terminate with an iteration-cap error, not run forever.
 #[test]
 fn integration_iteration_cap() {
-    let tmp = TempDir::new("cap");
-    let ws = Workspace::new(tmp.0.clone()).unwrap();
-    let cfg = config_for(&tmp.0, 3);
+    let tmp = tempdir("cap");
+    let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = config_for(tmp.path(), 3);
 
     let fake = FakeProvider::new(vec![
         Response::ToolCalls(vec![call(
@@ -139,10 +129,10 @@ fn integration_iteration_cap() {
 /// prints a final answer.
 #[test]
 fn cli_smoke_fake_provider() {
-    let tmp = TempDir::new("cli");
+    let tmp = tempdir("cli");
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hello", "--provider", "fake", "--dir"])
-        .arg(&tmp.0)
+        .arg(tmp.path())
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run crab binary");
@@ -158,10 +148,10 @@ fn cli_smoke_fake_provider() {
 /// CLI smoke: an unknown provider must fail fast with a non-zero exit.
 #[test]
 fn cli_smoke_unknown_provider_fails() {
-    let tmp = TempDir::new("cli-bad");
+    let tmp = tempdir("cli-bad");
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hi", "--provider", "nope", "--dir"])
-        .arg(&tmp.0)
+        .arg(tmp.path())
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run crab binary");
@@ -174,14 +164,14 @@ fn cli_smoke_unknown_provider_fails() {
 /// Path-escape through a tool call is rejected and handed back as an error.
 #[test]
 fn integration_path_escape_is_rejected() {
-    let tmp = TempDir::new("escape");
+    let tmp = tempdir("escape");
     // Create an outside file to prove the tool never touches it.
     let outside = std::env::temp_dir().join(format!("crab-outside-it-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&outside);
     std::fs::write(&outside, "secret").unwrap();
 
-    let ws = Workspace::new(tmp.0.clone()).unwrap();
-    let cfg = config_for(&tmp.0, 5);
+    let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = config_for(tmp.path(), 5);
     let fake = FakeProvider::new(vec![
         Response::ToolCalls(vec![call(
             "e1",
@@ -208,12 +198,12 @@ fn integration_path_escape_is_rejected() {
 /// a correlated response line.
 #[test]
 fn cli_rpc_mode_drives_a_session_over_stdio() {
-    let tmp = TempDir::new("rpc");
+    let tmp = tempdir("rpc");
     let script = r#"{"id":"1","type":"prompt","text":"say hi"}
 "#;
     let mut child = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["--mode", "rpc", "--provider", "fake", "--dir"])
-        .arg(&tmp.0)
+        .arg(tmp.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -246,10 +236,10 @@ fn cli_rpc_mode_drives_a_session_over_stdio() {
 /// CLI smoke: `--mode json` emits every Event as a JSONL line (CRAB-120).
 #[test]
 fn cli_json_mode_emits_events_as_jsonl() {
-    let tmp = TempDir::new("json");
+    let tmp = tempdir("json");
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hello", "--mode", "json", "--provider", "fake", "--dir"])
-        .arg(&tmp.0)
+        .arg(tmp.path())
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run crab json");
@@ -268,10 +258,10 @@ fn cli_json_mode_emits_events_as_jsonl() {
 /// CLI smoke: unknown --mode fails fast.
 #[test]
 fn cli_unknown_mode_fails() {
-    let tmp = TempDir::new("mode-bad");
+    let tmp = tempdir("mode-bad");
     let out = Command::new(env!("CARGO_BIN_EXE_crab"))
         .args(["hi", "--mode", "tui", "--dir"])
-        .arg(&tmp.0)
+        .arg(tmp.path())
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run crab");

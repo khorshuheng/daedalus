@@ -31,30 +31,21 @@ pub struct DraftLesson {
 }
 
 /// Errors while reflecting on a session.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ReflectError {
     /// Nothing to reflect on (no assistant/user conversation in the history).
+    #[error("no conversation to reflect on")]
     EmptyHistory,
     /// The provider failed (auth, timeout, malformed response, ...).
+    #[error("reflection LLM error: {0}")]
     Provider(crate::provider::ProviderError),
     /// The model's answer was not parseable as a lesson list.
+    #[error("malformed lesson response: {0}")]
     Malformed(String),
     /// Reading or writing the memory store failed.
+    #[error("memory error: {0}")]
     Memory(crate::memory::MemoryError),
 }
-
-impl std::fmt::Display for ReflectError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReflectError::EmptyHistory => write!(f, "no conversation to reflect on"),
-            ReflectError::Provider(e) => write!(f, "reflection LLM error: {e}"),
-            ReflectError::Malformed(m) => write!(f, "malformed lesson response: {m}"),
-            ReflectError::Memory(e) => write!(f, "memory error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for ReflectError {}
 
 impl From<crate::provider::ProviderError> for ReflectError {
     fn from(e: crate::provider::ProviderError) -> Self {
@@ -605,18 +596,11 @@ mod tests {
         assert_eq!(l.kind, "rule");
     }
 
-    struct TempDir(std::path::PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_mem(name: &str) -> (TempDir, std::path::PathBuf) {
-        let base = std::env::temp_dir().join(format!("crab-reflect-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        (TempDir(base.clone()), base)
+    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    fn temp_mem(_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = dir.path().to_path_buf();
+        (dir, base)
     }
 
     fn conversation() -> Vec<Message> {

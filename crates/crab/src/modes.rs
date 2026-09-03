@@ -286,15 +286,11 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
 
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    type TempDir = tempfile::TempDir;
 
     fn setup(
-        name: &str,
+        _name: &str,
         responses: Vec<Response>,
     ) -> (
         TempDir,
@@ -304,15 +300,13 @@ mod tests {
         std::thread::JoinHandle<()>,
         Workspace,
     ) {
-        let dir = std::env::temp_dir().join(format!("crab-modes-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("sessions");
-        let ws = Workspace::new(dir.clone()).unwrap();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().join("sessions");
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
         let cfg = Config {
             max_iterations: 10,
-            workspace: dir.clone(),
-            ..Config::defaults(dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let tools = ToolSet::new(1000);
         let (rt, rx) = AgentRuntime::new(
@@ -326,7 +320,7 @@ mod tests {
         let handle = std::thread::spawn(move || worker.run_forever());
         // Drain the initial agent_start so tests see events from their command.
         let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
-        (TempDir(dir), root, rt, rx, handle, ws)
+        (dir, root, rt, rx, handle, ws)
     }
 
     fn shutdown(rt: &AgentRuntime, handle: std::thread::JoinHandle<()>) {
@@ -405,7 +399,7 @@ mod tests {
             "{\"id\":\"1\",\"type\":\"prompt\",\"text\":\"what is 2+2\"}\n".to_string(),
         ));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, &tmp.0, input, &mut out).unwrap();
+        let code = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -433,7 +427,7 @@ mod tests {
         );
         let input = Box::new(Cursor::new(input.to_string()));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, &tmp.0, input, &mut out).unwrap();
+        let code = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -512,7 +506,7 @@ mod tests {
         );
         let input = Box::new(Cursor::new(input.to_string()));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, &tmp.0, input, &mut out).unwrap();
+        let code = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -537,7 +531,7 @@ mod tests {
         let (tmp, _root, rt, rx, handle, _ws) = setup("rpc-bad", vec![]);
         let input = Box::new(Cursor::new("not json\n".to_string()));
         let mut out = Vec::new();
-        let err = run_rpc(&rt, &rx, &tmp.0, input, &mut out).unwrap_err();
+        let err = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap_err();
         assert!(err.contains("bad request"));
         shutdown(&rt, handle);
         let _ = tmp;

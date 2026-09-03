@@ -34,94 +34,72 @@ mod term;
 
 use modes::Mode;
 
-const USAGE: &str = "\
-crab — a minimal coding agent
+use clap::Parser;
 
-USAGE:
-    crab <prompt> [OPTIONS]
-
-ARGS:
-    <prompt>    The instruction to give the model.
-
-OPTIONS:
-    --dir <path>            Workspace directory (default: current directory)
-    --provider <name>       openai | anthropic | deepseek | fake (default: openai)
-    --model <name>          Model identifier (provider-specific default)
-    --max-iterations <n>    Iteration cap for the agent loop (default: 30)
-    --config <path>         Config file (default: ~/.config/crab/config.toml)
-    --mode <mode>           print | json | rpc (default: print when piped,
-                            interactive REPL on a terminal; rpc reads JSON
-                            commands from stdin and needs no <prompt>)
-    -h, --help              Print this help.
-
-Precedence for config values: flags > env (CRAB_*) > config file > defaults.
-";
-
-enum ParseOutcome {
-    Run(Box<Cli>),
-    Help,
-}
-
+/// Crab — a minimal coding agent.
+#[derive(Parser, Debug)]
+#[command(name = "crab", version, about, disable_help_flag = false)]
 struct Cli {
-    prompt: String,
+    /// The instruction to give the model (not needed in --mode rpc, which
+    /// reads commands from stdin).
+    #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = false)]
+    prompt_parts: Vec<String>,
+
+    /// Workspace directory (default: current directory).
+    #[arg(long, value_name = "PATH")]
     dir: Option<PathBuf>,
-    config_path: Option<PathBuf>,
+
+    /// openai | anthropic | deepseek | fake (default: openai).
+    #[arg(long, value_name = "NAME", value_parser = parse_provider)]
+    provider: Option<ProviderKind>,
+
+    /// Model identifier (provider-specific default).
+    #[arg(long, value_name = "NAME")]
+    model: Option<String>,
+
+    /// Iteration cap for the agent loop (default: 30).
+    #[arg(long, value_name = "N", value_parser = parse_max_iterations)]
+    max_iterations: Option<usize>,
+
+    /// Config file (default: ~/.config/crab/config.toml).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// print | json | rpc (default: print when piped, REPL on a terminal;
+    /// rpc reads JSON commands from stdin and needs no <prompt>).
+    #[arg(long, value_name = "MODE", value_parser = parse_mode)]
     mode: Option<Mode>,
-    flags: Overrides,
 }
 
-fn next_value<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<String, String> {
-    it.next()
-        .cloned()
-        .ok_or_else(|| format!("flag '{flag}' requires a value"))
+fn parse_provider(s: &str) -> Result<ProviderKind, String> {
+    ProviderKind::parse(s)
 }
 
-fn parse_args(args: &[String]) -> Result<ParseOutcome, String> {
-    let mut prompt_parts: Vec<String> = Vec::new();
-    let mut dir: Option<PathBuf> = None;
-    let mut config_path: Option<PathBuf> = None;
-    let mut mode: Option<Mode> = None;
-    let mut flags = Overrides::default();
+fn parse_mode(s: &str) -> Result<Mode, String> {
+    Mode::parse(s)
+}
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--dir" => dir = Some(PathBuf::from(next_value(&mut it, "--dir")?)),
-            "--model" => flags.model = Some(next_value(&mut it, "--model")?),
-            "--provider" => {
-                let v = next_value(&mut it, "--provider")?;
-                flags.provider = Some(ProviderKind::parse(&v)?);
-            }
-            "--max-iterations" => {
-                let v = next_value(&mut it, "--max-iterations")?;
-                flags.max_iterations = Some(
-                    v.parse()
-                        .map_err(|_| format!("invalid --max-iterations '{v}'"))?,
-                );
-            }
-            "--config" => config_path = Some(PathBuf::from(next_value(&mut it, "--config")?)),
-            "--mode" => {
-                let v = next_value(&mut it, "--mode")?;
-                mode = Some(Mode::parse(&v)?);
-            }
-            "-h" | "--help" => return Ok(ParseOutcome::Help),
-            s if s.starts_with("--dir=") => dir = Some(PathBuf::from(&s["--dir=".len()..])),
-            s if s.starts_with('-') => return Err(format!("unknown flag '{s}'")),
-            s => prompt_parts.push(s.to_string()),
+fn parse_max_iterations(s: &str) -> Result<usize, String> {
+    s.parse()
+        .map_err(|_| format!("invalid --max-iterations '{s}'"))
+}
+
+impl Cli {
+    /// Reassemble positional prompt words and the config-file precedence the
+    /// way the hand-rolled parser did (flags here are merged over env and
+    /// file in `Config::load`).
+    fn prompt(&self) -> String {
+        self.prompt_parts.join(" ")
+    }
+
+    fn flags(&self) -> Overrides {
+        Overrides {
+            provider: self.provider,
+            model: self.model.clone(),
+            max_iterations: self.max_iterations,
+            ..Default::default()
         }
     }
-
-    if prompt_parts.is_empty() && mode != Some(Mode::Rpc) {
-        return Err("no prompt given".into());
-    }
-
-    Ok(ParseOutcome::Run(Box::new(Cli {
-        prompt: prompt_parts.join(" "),
-        dir,
-        config_path,
-        mode,
-        flags,
-    })))
 }
 
 /// If `--config` was not given, use `~/.config/crab/config.toml` when present.
@@ -129,25 +107,26 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(p);
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let candidate = PathBuf::from(home).join(".config/crab/config.toml");
-        if candidate.exists() {
-            return Some(candidate);
-        }
+    let candidate = crab_core::paths::config_dir().join("config.toml");
+    if candidate.exists() {
+        return Some(candidate);
     }
     None
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
+    if cli.prompt_parts.is_empty() && cli.mode != Some(Mode::Rpc) {
+        return Err("no prompt given".into());
+    }
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let default_workspace = cli.dir.clone().unwrap_or(cwd);
-    let config_path = resolve_config_path(cli.config_path);
+    let config_path = resolve_config_path(cli.config.clone());
 
     let config = Config::load(
         default_workspace,
         config_path.as_deref(),
         Overrides::from_env(),
-        cli.flags,
+        cli.flags(),
     )?;
 
     let workspace = Workspace::new(config.workspace.clone())?;
@@ -162,14 +141,21 @@ fn run(cli: Cli) -> Result<i32, String> {
     // print (one prompt -> final answer). An explicit --mode always wins.
     let mode = cli.mode.unwrap_or(Mode::Print);
     if cli.mode.is_none() && stdin_is_terminal {
-        return run_repl(config, provider, tools, workspace, memory_root, &cli.prompt);
+        return run_repl(
+            config,
+            provider,
+            tools,
+            workspace,
+            memory_root,
+            &cli.prompt(),
+        );
     }
 
     match mode {
         Mode::Print => {
             let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let mut stdout = std::io::stdout();
-            match modes::run_print(&rt, &cli.prompt, &mut stdout) {
+            match modes::run_print(&rt, &cli.prompt(), &mut stdout) {
                 Ok(2) => {
                     eprintln!("crab: iteration cap exceeded: no final answer");
                     Ok(2)
@@ -182,7 +168,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let mut stdout = std::io::stdout();
-            modes::run_json(&rt, &rx, &cli.prompt, &mut stdout)
+            modes::run_json(&rt, &rx, &cli.prompt(), &mut stdout)
         }
         Mode::Rpc => {
             let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
@@ -459,18 +445,7 @@ fn run_repl(
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = match parse_args(&args) {
-        Ok(ParseOutcome::Help) => {
-            print!("{USAGE}");
-            std::process::exit(0);
-        }
-        Ok(ParseOutcome::Run(cli)) => *cli,
-        Err(e) => {
-            eprintln!("crab: {e}\n\n{USAGE}");
-            std::process::exit(1);
-        }
-    };
+    let cli = Cli::parse();
 
     let code = match run(cli) {
         Ok(code) => code,
@@ -547,26 +522,24 @@ mod tests {
 
     /// Build a temp workspace + sessions root + a recording provider.
     fn setup(
-        name: &str,
+        _name: &str,
         provider: Box<dyn Provider>,
-    ) -> (PathBuf, PathBuf, AgentRuntime, Workspace) {
-        let dir = std::env::temp_dir().join(format!("crab-main-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let root = dir.join("sessions");
+    ) -> (tempfile::TempDir, PathBuf, AgentRuntime, Workspace) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().join("sessions");
         let tools = ToolSet::new(1000);
-        let ws = Workspace::new(dir.clone()).unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
         let cfg = Config {
             max_iterations: 10,
-            workspace: dir.clone(),
-            ..Config::defaults(dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let (rt, _rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         (dir, root, rt, ws)
     }
 
-    fn mem_root(dir: &Path) -> PathBuf {
-        dir.join("memory")
+    fn mem_root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().join("memory")
     }
 
     #[test]

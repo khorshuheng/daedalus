@@ -9,6 +9,7 @@
 //! - `memory` (CRAB-113): append-only JSONL lesson store for agent memory.
 //! - `reflect` (CRAB-112): LLM-backed lesson extraction from session transcripts.
 //! - `runtime` (CRAB-116): stateful AgentRuntime engine + Event/Command surface.
+//! - `paths` (CRAB-119): XDG config/data base directories.
 //!
 //! The frontends (`crab` binary: main/modes/term) live in the sibling crate so
 //! this core never depends on terminal or stdio concerns, and stays free of
@@ -17,6 +18,7 @@
 pub mod config;
 pub mod index;
 pub mod memory;
+pub mod paths;
 pub mod provider;
 pub mod reflect;
 pub mod runtime;

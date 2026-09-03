@@ -149,12 +149,11 @@ mod tests {
     use super::*;
     use crate::workspace::Workspace;
 
-    fn setup(name: &str, contents: &str) -> (Workspace, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("crab-read-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), contents).unwrap();
-        (Workspace::new(dir.clone()).unwrap(), dir)
+    fn setup(_name: &str, contents: &str) -> (Workspace, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), contents).unwrap();
+        (Workspace::new(root).unwrap(), dir)
     }
 
     #[test]

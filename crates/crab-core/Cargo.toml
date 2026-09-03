@@ -21,5 +21,11 @@ url = "=2.4.1"
 # the then-latest stable rust and would exceed the 1.85 floor. Links the
 # system sqlite3 (pkg-config); no vendored C build.
 rusqlite = "=0.34.0"
+# Maintainability crates (CRAB-119): era-appropriate versions for the 1.85
+# MSRV floor (2024-2025 releases).
+thiserror = "=1.0.69"
+directories = "=5.0.1"
+tempfile = "=3.15.0"
+similar = "=2.6.0"
 
 # crab-core must stay synchronous: no tokio/async dependencies here.

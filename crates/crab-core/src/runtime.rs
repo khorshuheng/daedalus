@@ -263,11 +263,13 @@ enum Control {
 
 /// Terminal errors surfaced by the synchronous `run_once` path. The worker
 /// path reports these as `Event::Error` instead.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum RuntimeError {
     /// The model never produced a final answer within the iteration budget.
+    #[error("iteration cap exceeded: no final answer after {0} iterations")]
     IterationCap(usize),
     /// A provider failure.
+    #[error("provider error: {0}")]
     Provider(String),
 }
 
@@ -283,20 +285,6 @@ impl RuntimeError {
         RuntimeError::Provider(msg)
     }
 }
-
-impl fmt::Display for RuntimeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RuntimeError::IterationCap(n) => write!(
-                f,
-                "iteration cap exceeded: no final answer after {n} iterations"
-            ),
-            RuntimeError::Provider(e) => write!(f, "provider error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for RuntimeError {}
 
 /// A snapshot of the runtime's mutable state, reported via `get_state` and
 /// carried in `state_changed` events.
@@ -1082,11 +1070,10 @@ mod tests {
         }
     }
 
-    fn workspace(name: &str) -> (std::path::PathBuf, Workspace) {
-        let dir = std::env::temp_dir().join(format!("crab-runtime-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = Workspace::new(dir.clone()).unwrap();
+    fn workspace(_name: &str) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        let ws = Workspace::new(root).unwrap();
         (dir, ws)
     }
 
@@ -1099,12 +1086,13 @@ mod tests {
         std::thread::JoinHandle<()>,
         Workspace,
     ) {
-        let (_dir, ws) = workspace(name);
+        let (dir, ws) = workspace(name);
+        let root = dir.path().to_path_buf();
         let tools = ToolSet::new(1000);
         let cfg = Config {
             max_iterations: 10,
-            workspace: _dir.clone(),
-            ..Config::defaults(_dir.clone())
+            workspace: root.clone(),
+            ..Config::defaults(root)
         };
         let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         let worker = rt.clone();
@@ -1139,7 +1127,7 @@ mod tests {
     #[test]
     fn iteration_cap_emits_error_and_settles() {
         // Two tool-call completions then no final text; max_iterations = 2.
-        let (_dir, ws) = workspace("cap");
+        let (dir, ws) = workspace("cap");
         let provider = Box::new(GateProvider::new(vec![
             Response::ToolCalls(vec![ToolCall {
                 id: "c1".into(),
@@ -1160,8 +1148,8 @@ mod tests {
         let tools = ToolSet::new(1000);
         let cfg = Config {
             max_iterations: 2,
-            workspace: _dir.clone(),
-            ..Config::defaults(_dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         let worker = rt.clone();
@@ -1290,7 +1278,7 @@ mod tests {
 
     #[test]
     fn tool_calls_execute_and_emit_lifecycle_events() {
-        let (_dir, ws) = workspace("tools");
+        let (dir, ws) = workspace("tools");
         let builder = GateProvider::new(vec![
             Response::ToolCalls(vec![ToolCall {
                 id: "c1".into(),
@@ -1302,8 +1290,8 @@ mod tests {
         let tools = ToolSet::new(1000);
         let cfg = Config {
             max_iterations: 10,
-            workspace: _dir.clone(),
-            ..Config::defaults(_dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let (rt, rx) = AgentRuntime::new(cfg, Box::new(builder), tools, ws.clone(), None);
         let worker = rt.clone();
@@ -1383,7 +1371,7 @@ mod tests {
 
     #[test]
     fn steer_delivered_after_assistant_finishes_tool_calls() {
-        let (_dir, ws) = workspace("steer");
+        let (dir, ws) = workspace("steer");
         let mut completions = VecDeque::new();
         completions.push_back(Completion {
             response: Response::ToolCalls(vec![ToolCall {
@@ -1409,8 +1397,8 @@ mod tests {
         let tools = ToolSet::new(1000);
         let cfg = Config {
             max_iterations: 10,
-            workspace: _dir.clone(),
-            ..Config::defaults(_dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let (rt, rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone(), None);
         let worker = rt.clone();
@@ -1443,7 +1431,7 @@ mod tests {
 
     #[test]
     fn follow_up_runs_after_agent_settles() {
-        let (_dir, ws) = workspace("followup");
+        let (dir, ws) = workspace("followup");
         let provider = Box::new(GateProvider::new(vec![
             Response::Text(text("first answer")),
             Response::Text(text("second answer")),
@@ -1451,8 +1439,8 @@ mod tests {
         let tools = ToolSet::new(1000);
         let cfg = Config {
             max_iterations: 10,
-            workspace: _dir.clone(),
-            ..Config::defaults(_dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         let worker = rt.clone();
@@ -1484,7 +1472,7 @@ mod tests {
     #[test]
     fn memory_lessons_are_injected_into_the_system_prompt() {
         let (dir, ws) = workspace("mem-inject");
-        let memory_root = dir.join("memory");
+        let memory_root = dir.path().join("memory");
         // Seed a lesson about building with make.
         let lesson = crate::memory::Lesson {
             id: "l1".into(),
@@ -1501,8 +1489,8 @@ mod tests {
         let tools = ToolSet::new(1000);
         let cfg = Config {
             max_iterations: 10,
-            workspace: dir.clone(),
-            ..Config::defaults(dir.clone())
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
         };
         let (rt, _rx) = AgentRuntime::new(
             cfg,

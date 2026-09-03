@@ -55,11 +55,10 @@ mod tests {
     use super::*;
     use crate::workspace::Workspace;
 
-    fn setup(name: &str) -> (Workspace, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("crab-write-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (Workspace::new(dir.clone()).unwrap(), dir)
+    fn setup(_name: &str) -> (Workspace, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        (Workspace::new(root).unwrap(), dir)
     }
 
     #[test]
@@ -72,13 +71,16 @@ mod tests {
             &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "data");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "data"
+        );
     }
 
     #[test]
     fn overwrites_file() {
         let (ws, dir) = setup("overwrite");
-        std::fs::write(dir.join("b.txt"), "old").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "old").unwrap();
         let tool = WriteTool;
         tool.run(
             &ws,
@@ -86,7 +88,10 @@ mod tests {
             &std::sync::atomic::AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("b.txt")).unwrap(), "new");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "new"
+        );
     }
 
     #[test]
@@ -100,7 +105,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            std::fs::read_to_string(dir.join("a/b/c.txt")).unwrap(),
+            std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
             "deep"
         );
     }

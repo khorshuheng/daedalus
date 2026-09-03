@@ -98,14 +98,18 @@ fn run_command(
 }
 
 /// Write the full command output to a temp file and return its path, so a
-/// truncated result still lets the model retrieve the complete output.
+/// truncated result still lets the model retrieve the complete output. The
+/// file is kept after the write (the caller embeds its path in the tool
+/// result), so the temp file is created with `keep` semantics.
 fn write_full_output(full: &str) -> Result<std::path::PathBuf, ToolError> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("crab-bash-{}-{nanos}.log", std::process::id()));
-    std::fs::write(&path, full).map_err(|e| ToolError::Io(e.to_string()))?;
+    let mut file = tempfile::Builder::new()
+        .prefix("crab-bash-")
+        .suffix(".log")
+        .tempfile()
+        .map_err(|e| ToolError::Io(format!("cannot create temp file: {e}")))?;
+    std::io::Write::write_all(&mut file, full.as_bytes())
+        .map_err(|e| ToolError::Io(e.to_string()))?;
+    let (_, path) = file.keep().map_err(|e| ToolError::Io(e.to_string()))?;
     Ok(path)
 }
 
@@ -186,11 +190,10 @@ mod tests {
     use super::*;
     use crate::workspace::Workspace;
 
-    fn setup(name: &str) -> (Workspace, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("crab-bash-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        (Workspace::new(dir.clone()).unwrap(), dir)
+    fn setup(_name: &str) -> (Workspace, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        (Workspace::new(root).unwrap(), dir)
     }
 
     #[test]
@@ -228,7 +231,7 @@ mod tests {
     #[test]
     fn runs_in_workspace_dir() {
         let (ws, dir) = setup("pwd");
-        std::fs::write(dir.join("marker.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
         let tool = BashTool { max_output: 1000 };
         let out = tool
             .run(

@@ -16,7 +16,6 @@
 //! SQLite / full-text search is a non-goal (CRAB-111 defers it); the JSONL log
 //! is the source of truth.
 
-use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -32,14 +31,16 @@ use crate::provider::{Message, ToolCall};
 pub const FORMAT_VERSION: u32 = 1;
 
 /// An error while persisting or loading a session.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     /// Filesystem failure (create dir, open, read, write, rename).
+    #[error("session I/O error: {0}")]
     Io(std::io::Error),
     /// A session file could not be parsed and cannot be recovered. A torn
     /// final line is recovered automatically; reaching this means real
     /// corruption (bad line in the middle, missing header, unsupported
     /// version, ...).
+    #[error("corrupt session file '{}' at line {line}: {reason}", path.display())]
     Corrupt {
         path: PathBuf,
         /// 1-based line number; 0 when the file has no usable header.
@@ -48,26 +49,9 @@ pub enum SessionError {
     },
     /// Serialization failure while writing (should be impossible for the
     /// fixed entry schema).
+    #[error("session serialization error: {0}")]
     Serde(String),
 }
-
-impl fmt::Display for SessionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SessionError::Io(e) => write!(f, "session I/O error: {e}"),
-            SessionError::Corrupt { path, line, reason } => {
-                write!(
-                    f,
-                    "corrupt session file '{}' at line {line}: {reason}",
-                    path.display()
-                )
-            }
-            SessionError::Serde(e) => write!(f, "session serialization error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for SessionError {}
 
 /// One JSON object per line: the header or a single conversation message.
 /// The `kind` tag mirrors pi's JSONL session shape
@@ -175,13 +159,16 @@ fn session_dir(root: &Path, cwd: &Path) -> PathBuf {
 /// fsync it, then rename it over the destination. A crash mid-write leaves
 /// only the ignored `.tmp` file; the destination is untouched.
 fn write_file_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut f = File::create(&tmp).map_err(SessionError::Io)?;
-        f.write_all(contents.as_bytes()).map_err(SessionError::Io)?;
-        f.sync_all().map_err(SessionError::Io)?;
-    }
-    std::fs::rename(&tmp, path).map_err(SessionError::Io)
+    // A temp file in the destination directory, fsynced, then renamed over
+    // the target (tempfile, CRAB-119). A crash mid-write leaves only the
+    // temp file; the destination is untouched.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(SessionError::Io)?;
+    tmp.write_all(contents.as_bytes())
+        .map_err(SessionError::Io)?;
+    tmp.as_file().sync_all().map_err(SessionError::Io)?;
+    tmp.persist(path).map_err(|e| SessionError::Io(e.error))?;
+    Ok(())
 }
 
 /// The most recent `.jsonl` session file for `cwd` under `root`, or `None`
@@ -305,10 +292,7 @@ fn load_file(path: &Path) -> Result<Vec<Message>, SessionError> {
 
 /// The default sessions root: `~/.local/share/crab/sessions`.
 pub fn default_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/share/crab/sessions")
+    crate::paths::data_dir().join("sessions")
 }
 
 /// Persist `history` as a new session for `cwd`, returning the file path.
@@ -379,19 +363,11 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
 
-    /// RAII guard that removes its dir on drop.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn tempdir(name: &str) -> (TempDir, PathBuf) {
-        let base = std::env::temp_dir().join(format!("crab-session-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        (TempDir(base.clone()), base)
+    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    fn tempdir(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = dir.path().to_path_buf();
+        (dir, base)
     }
 
     fn cwd() -> PathBuf {

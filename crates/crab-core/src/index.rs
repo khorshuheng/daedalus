@@ -23,13 +23,17 @@ use std::time::UNIX_EPOCH;
 use crate::memory::Lesson;
 
 /// Errors while indexing or searching lessons.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum IndexError {
+    #[error("index I/O error: {0}")]
     Io(std::io::Error),
+    #[error("index sqlite error: {0}")]
     Sqlite(rusqlite::Error),
+    #[error("index memory error: {0}")]
     Memory(crate::memory::MemoryError),
     /// A lesson row stored in the index could not be deserialized (internal
     /// corruption; rebuild from the JSONL log fixes it).
+    #[error("corrupt index row: {0}")]
     Corrupt(String),
 }
 
@@ -129,19 +133,6 @@ pub fn injection_block(
     }
     Ok(block)
 }
-
-impl std::fmt::Display for IndexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IndexError::Io(e) => write!(f, "index I/O error: {e}"),
-            IndexError::Sqlite(e) => write!(f, "index sqlite error: {e}"),
-            IndexError::Memory(e) => write!(f, "index memory error: {e}"),
-            IndexError::Corrupt(m) => write!(f, "corrupt index row: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for IndexError {}
 
 impl From<std::io::Error> for IndexError {
     fn from(e: std::io::Error) -> Self {
@@ -337,18 +328,11 @@ mod tests {
         );
     }
 
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn temp_mem(name: &str) -> (TempDir, PathBuf) {
-        let base = std::env::temp_dir().join(format!("crab-index-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        (TempDir(base.clone()), base)
+    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    fn temp_mem(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = dir.path().to_path_buf();
+        (dir, base)
     }
 
     fn cwd() -> PathBuf {

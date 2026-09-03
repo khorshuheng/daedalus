@@ -128,53 +128,13 @@ fn locate_match(
 }
 
 /// Minimal unified diff (no context) between two texts, sufficient to show the
-/// model what changed without a heavy diff dependency.
+/// model what changed. Delegates the line diff to `similar` (CRAB-119),
+/// rendered with no surrounding context.
 fn unified_diff(old: &str, new: &str) -> String {
-    let old_lines: Vec<&str> = old.split('\n').collect();
-    let new_lines: Vec<&str> = new.split('\n').collect();
-
-    let mut prefix = 0;
-    while prefix < old_lines.len()
-        && prefix < new_lines.len()
-        && old_lines[prefix] == new_lines[prefix]
-    {
-        prefix += 1;
-    }
-    let mut suffix = 0;
-    while suffix < old_lines.len() - prefix
-        && suffix < new_lines.len() - prefix
-        && old_lines[old_lines.len() - 1 - suffix] == new_lines[new_lines.len() - 1 - suffix]
-    {
-        suffix += 1;
-    }
-
-    let old_start = prefix;
-    let old_count = old_lines.len() - prefix - suffix;
-    let new_start = prefix;
-    let new_count = new_lines.len() - prefix - suffix;
-
-    let mut out = format!(
-        "@@ -{},{} +{},{} @@\n",
-        if old_count > 0 {
-            old_start + 1
-        } else {
-            old_start
-        },
-        old_count,
-        if new_count > 0 {
-            new_start + 1
-        } else {
-            new_start
-        },
-        new_count
-    );
-    for line in &old_lines[old_start..old_start + old_count] {
-        out.push_str(&format!("-{line}\n"));
-    }
-    for line in &new_lines[new_start..new_start + new_count] {
-        out.push_str(&format!("+{line}\n"));
-    }
-    out
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(0)
+        .to_string()
 }
 
 impl Tool for EditTool {
@@ -311,16 +271,15 @@ mod tests {
     use super::*;
     use crate::workspace::Workspace;
 
-    fn setup(name: &str, contents: &str) -> (Workspace, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("crab-edit-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), contents).unwrap();
-        (Workspace::new(dir.clone()).unwrap(), dir)
+    fn setup(_name: &str, contents: &str) -> (Workspace, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), contents).unwrap();
+        (Workspace::new(root).unwrap(), dir)
     }
 
-    fn read(dir: &std::path::Path) -> String {
-        std::fs::read_to_string(dir.join("a.txt")).unwrap()
+    fn read(dir: &tempfile::TempDir) -> String {
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap()
     }
 
     #[test]

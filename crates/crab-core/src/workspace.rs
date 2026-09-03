@@ -106,19 +106,11 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    /// RAII guard that removes its dir on drop.
-    struct Dir(std::path::PathBuf);
-    impl Drop for Dir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn tempdir(name: &str) -> (Dir, PathBuf) {
-        let base = std::env::temp_dir().join(format!("crab-ws-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        (Dir(base.clone()), base)
+    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    fn tempdir(_name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = dir.path().to_path_buf();
+        (dir, base)
     }
 
     #[test]

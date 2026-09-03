@@ -27,7 +27,6 @@
 //! API (per spec): `append_lesson(lesson)`, `list_lessons(cwd)`.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -70,13 +69,15 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// An error while persisting or reading lesson memory.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum MemoryError {
     /// Filesystem failure (create dir, open, read, write, rename).
+    #[error("memory I/O error: {0}")]
     Io(std::io::Error),
     /// A memory file could not be parsed and cannot be recovered. A torn
     /// final line is recovered automatically; reaching this means real
     /// corruption (garbage/schema error anywhere in the file).
+    #[error("corrupt memory file '{}' at line {line}: {reason}", path.display())]
     Corrupt {
         path: PathBuf,
         /// 1-based line number.
@@ -85,33 +86,13 @@ pub enum MemoryError {
     },
     /// Serialization failure while writing (should be impossible for the
     /// fixed lesson schema).
+    #[error("memory serialization error: {0}")]
     Serde(String),
 }
 
-impl fmt::Display for MemoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MemoryError::Io(e) => write!(f, "memory I/O error: {e}"),
-            MemoryError::Corrupt { path, line, reason } => {
-                write!(
-                    f,
-                    "corrupt memory file '{}' at line {line}: {reason}",
-                    path.display()
-                )
-            }
-            MemoryError::Serde(e) => write!(f, "memory serialization error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for MemoryError {}
-
 /// The default memory root: `~/.local/share/crab/memory`.
 pub fn default_root() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/share/crab/memory")
+    crate::paths::data_dir().join("memory")
 }
 
 /// The log file name inside each cwd-encoded directory.
@@ -121,13 +102,16 @@ const LOG_FILE: &str = "lessons.jsonl";
 /// fsync it, then rename it over the destination. A crash mid-write leaves
 /// only the ignored `.tmp` file; the destination is untouched.
 fn write_file_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
-    let tmp = path.with_extension("jsonl.tmp");
-    {
-        let mut f = File::create(&tmp).map_err(MemoryError::Io)?;
-        f.write_all(contents.as_bytes()).map_err(MemoryError::Io)?;
-        f.sync_all().map_err(MemoryError::Io)?;
-    }
-    std::fs::rename(&tmp, path).map_err(MemoryError::Io)
+    // A temp file in the destination directory, fsynced, then renamed over
+    // the target (tempfile, CRAB-119). A crash mid-write leaves only the
+    // temp file; the destination is untouched.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(MemoryError::Io)?;
+    tmp.write_all(contents.as_bytes())
+        .map_err(MemoryError::Io)?;
+    tmp.as_file().sync_all().map_err(MemoryError::Io)?;
+    tmp.persist(path).map_err(|e| MemoryError::Io(e.error))?;
+    Ok(())
 }
 
 /// The memory log path for `cwd` under `root`: the same cwd-encoded
@@ -245,19 +229,11 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
 
-    /// RAII guard that removes its dir on drop.
-    struct TempDir(PathBuf);
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn tempdir(name: &str) -> (TempDir, PathBuf) {
-        let base = std::env::temp_dir().join(format!("crab-memory-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        (TempDir(base.clone()), base)
+    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    fn tempdir(_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = dir.path().to_path_buf();
+        (dir, base)
     }
 
     fn cwd() -> PathBuf {

@@ -91,16 +91,16 @@ impl ToolSet {
 mod tests {
     use super::*;
 
-    fn workspace(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("crab-resolver-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Workspace::new(dir).unwrap()
+    fn workspace(_name: &str) -> (tempfile::TempDir, Workspace) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        let ws = Workspace::new(root).unwrap();
+        (dir, ws)
     }
 
     #[test]
     fn routes_to_correct_executor() {
-        let ws = workspace("bash");
+        let (_dir, ws) = workspace("bash");
         let ts = ToolSet::new(1000);
 
         let out = ts
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_clear_error() {
-        let ws = workspace("unknown");
+        let (_dir, ws) = workspace("unknown");
         let ts = ToolSet::new(1000);
         let err = ts
             .execute(&ws, "frobnicate", &json!({}), &AtomicBool::new(false))

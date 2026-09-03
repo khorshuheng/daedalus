@@ -11,7 +11,6 @@ pub mod anthropic;
 pub mod fake;
 pub mod openai;
 
-use std::fmt;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -67,26 +66,17 @@ pub struct Completion {
 }
 
 /// Typed provider errors, surfaced clearly at the loop boundary.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
+    #[error("authentication error: {0}")]
     Auth(String),
+    #[error("request timed out: {0}")]
     Timeout(String),
+    #[error("malformed response: {0}")]
     Malformed(String),
+    #[error("http error: {0}")]
     Http(String),
 }
-
-impl fmt::Display for ProviderError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ProviderError::Auth(m) => write!(f, "authentication error: {m}"),
-            ProviderError::Timeout(m) => write!(f, "request timed out: {m}"),
-            ProviderError::Malformed(m) => write!(f, "malformed response: {m}"),
-            ProviderError::Http(m) => write!(f, "http error: {m}"),
-        }
-    }
-}
-
-impl std::error::Error for ProviderError {}
 
 /// A chat + tool-calling backend. Implementations must be `Send + Sync` so the
 /// loop can hold them behind `Box<dyn Provider>`.

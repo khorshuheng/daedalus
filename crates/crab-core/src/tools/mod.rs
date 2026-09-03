@@ -10,7 +10,6 @@ pub mod read;
 pub mod resolver;
 pub mod write;
 
-use std::fmt;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
@@ -25,43 +24,33 @@ pub struct ToolOutput {
 }
 
 /// A typed error raised by a tool or the resolver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ToolError {
     /// Missing / malformed argument.
+    #[error("bad arguments: {0}")]
     Argument(String),
     /// The referenced file does not exist.
+    #[error("not found: {0}")]
     NotFound(String),
     /// The operation is invalid (e.g. edit matched zero or many times).
+    #[error("invalid: {0}")]
     Invalid(String),
     /// I/O failure.
+    #[error("io error: {0}")]
     Io(String),
     /// A path escapes the workspace.
+    #[error("path escaped: {0}")]
     Escape(String),
     /// A command failed (non-zero exit or killed by signal).
+    #[error("{0}")]
     Command(String),
     /// A command exceeded its timeout.
+    #[error("command timed out: {0}")]
     Timeout(String),
     /// The tool was interrupted by a cancellation request.
+    #[error("cancelled")]
     Cancelled,
 }
-
-impl fmt::Display for ToolError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ToolError::Argument(m) => write!(f, "bad arguments: {m}"),
-            ToolError::NotFound(m) => write!(f, "not found: {m}"),
-            ToolError::Invalid(m) => write!(f, "invalid: {m}"),
-            ToolError::Io(m) => write!(f, "io error: {m}"),
-            ToolError::Escape(m) => write!(f, "path escaped: {m}"),
-            ToolError::Command(m) => write!(f, "{m}"),
-            ToolError::Timeout(m) => write!(f, "command timed out: {m}"),
-            ToolError::Cancelled => write!(f, "cancelled"),
-        }
-    }
-}
-
-impl std::error::Error for ToolError {}
-
 /// A built-in tool. Implementations must be cheap to construct and stateless
 /// apart from their output cap.
 pub trait Tool: Send + Sync {
