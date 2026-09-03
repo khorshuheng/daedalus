@@ -4,6 +4,11 @@
 //!
 //! - `print`: one-shot; runs one prompt and prints the final answer. Exit
 //!   0 on an answer, 2 on iteration cap, 1 on error (the piped behavior).
+//!
+//! One-shot modes do **not** auto-reflect lessons into memory (CRAB-123 #4,
+//! documented non-goal): a piped/scripted run is a single answer with no
+//! session lifecycle, so the session-save + reflection trigger belongs to the
+//! interactive REPL (and TUI) where `/reflect` and auto-reflect-on-exit run.
 //! - `json`: one-shot; runs one prompt and emits **every** runtime Event as
 //!   a JSONL object to stdout (the same serialization the TUI and server
 //!   will use, CRAB-121/122).
@@ -44,6 +49,8 @@ impl Mode {
 }
 
 /// One-shot print: run `prompt` to completion and write the final answer.
+/// Does not save the session or reflect lessons (documented non-goal,
+/// CRAB-123 #4): one-shot invocations are scripted single answers.
 /// Returns the process exit code (0 answer, 2 iteration cap, 1 hard error).
 pub fn run_print(rt: &AgentRuntime, prompt: &str, out: &mut dyn Write) -> Result<i32, String> {
     match rt.run_once(prompt) {

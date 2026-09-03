@@ -212,6 +212,39 @@ pub fn append_lesson(root: &Path, cwd: &Path, lesson: &Lesson) -> Result<(), Mem
     Ok(())
 }
 
+/// Append a whole batch of lessons atomically (CRAB-123 #3): every line is
+/// written in one syscall before fsync, so a crash mid-batch leaves either
+/// the previous tail or a torn final line (recovered on read) — never a
+/// partial batch of valid records between the new lessons. Used by
+/// reflection so a failed run does not half-commit lessons.
+pub fn append_lessons_batch(
+    root: &Path,
+    cwd: &Path,
+    lessons: &[Lesson],
+) -> Result<usize, MemoryError> {
+    if lessons.is_empty() {
+        return Ok(0);
+    }
+    let path = lessons_file(root, cwd);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(MemoryError::Io)?;
+    }
+    let mut out = String::new();
+    for lesson in lessons {
+        let line = serde_json::to_string(lesson).map_err(|e| MemoryError::Serde(e.to_string()))?;
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(MemoryError::Io)?;
+    f.write_all(out.as_bytes()).map_err(MemoryError::Io)?;
+    f.sync_all().map_err(MemoryError::Io)?;
+    Ok(lessons.len())
+}
+
 /// Load the current lessons for `cwd` from the log, folded to the latest
 /// record per id with retracted lessons removed. Returns an empty list when
 /// no memory exists yet. A torn final line is dropped and repaired.
@@ -435,5 +468,46 @@ mod tests {
             std::fs::read_to_string(root.join(encode_cwd(&cwd())).join("lessons.jsonl")).unwrap();
         assert!(raw.contains("build with make"));
         assert!(raw.contains("project:crab"));
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    fn lesson(i: u64) -> Lesson {
+        Lesson {
+            id: format!("b{i}"),
+            text: format!("lesson {i}"),
+            kind: "rule".into(),
+            tags: vec![],
+            cwd: "/tmp/proj".into(),
+            source_session_id: None,
+            created_at: i,
+            retracted: false,
+        }
+    }
+
+    #[test]
+    fn batch_appends_all_lessons_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/tmp/proj");
+        let n = append_lessons_batch(dir.path(), cwd, &[lesson(1), lesson(2), lesson(3)]).unwrap();
+        assert_eq!(n, 3);
+        let stored = list_lessons(dir.path(), cwd).unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].text, "lesson 1");
+        assert_eq!(stored[2].text, "lesson 3");
+        // Appending again extends, not overwrites.
+        append_lessons_batch(dir.path(), cwd, &[lesson(4)]).unwrap();
+        assert_eq!(list_lessons(dir.path(), cwd).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn empty_batch_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/tmp/proj");
+        assert_eq!(append_lessons_batch(dir.path(), cwd, &[]).unwrap(), 0);
+        assert!(list_lessons(dir.path(), cwd).unwrap().is_empty());
     }
 }

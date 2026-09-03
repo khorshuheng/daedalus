@@ -157,6 +157,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     }
 
     match mode {
+        // One-shot print does not auto-reflect (documented non-goal,
+        // CRAB-123 #4): scripted single answers have no session lifecycle.
         Mode::Print => {
             let (rt, _rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let mut stdout = std::io::stdout();
@@ -220,9 +222,19 @@ fn auto_save(rt: &AgentRuntime, root: &Path, memory_root: &Path) {
     if !has_conversation(&rt.history()) {
         return;
     }
+    let history = rt.history();
+    // Skip a redundant auto-reflect when this exact conversation was already
+    // reflected (e.g. the user ran /reflect, then quit) — CRAB-123 #1. The
+    // marker stores a content fingerprint, so re-saving the same conversation
+    // (a new session id each time) is recognized as already reflected.
+    let fingerprint = crab_core::reflect::history_fingerprint(&history);
+    if crab_core::reflect::last_reflected(memory_root, &rt.workspace_root()).as_deref()
+        == Some(fingerprint.as_str())
+    {
+        return;
+    }
     // The session was just saved, so lessons can carry its real id.
     let source = saved.as_deref().and_then(session::file_id);
-    let history = rt.history();
     let ws = rt.workspace_root();
     match reflect::reflect_and_store(
         memory_root,
@@ -234,7 +246,10 @@ fn auto_save(rt: &AgentRuntime, root: &Path, memory_root: &Path) {
         now_millis(),
     ) {
         Ok(0) => {}
-        Ok(n) => eprintln!("memory: reflected {n} new lesson(s) from this session"),
+        Ok(n) => {
+            crab_core::reflect::mark_reflected(memory_root, &ws, &fingerprint);
+            eprintln!("memory: reflected {n} new lesson(s) from this session");
+        }
         Err(e) => eprintln!("crab: warning: could not reflect lessons: {e}"),
     }
 }
@@ -328,6 +343,7 @@ fn handle_reflect(rt: &AgentRuntime, root: &Path, memory_root: &Path) -> String 
     };
     let history = rt.history();
     let ws = rt.workspace_root();
+    let fingerprint = crab_core::reflect::history_fingerprint(&history);
     match reflect::reflect_and_store(
         memory_root,
         &ws,
@@ -338,7 +354,10 @@ fn handle_reflect(rt: &AgentRuntime, root: &Path, memory_root: &Path) -> String 
         now_millis(),
     ) {
         Ok(0) => "reflected: no new lessons".to_string(),
-        Ok(n) => format!("reflected: added {n} new lesson(s)"),
+        Ok(n) => {
+            crab_core::reflect::mark_reflected(memory_root, &ws, &fingerprint);
+            format!("reflected: added {n} new lesson(s)")
+        }
         Err(e) => format!("reflection failed: {e}"),
     }
 }
@@ -750,6 +769,38 @@ mod tests {
         assert_eq!(lessons[0].cwd, ws.root().to_string_lossy());
         assert!(lessons[0].source_session_id.is_some());
         assert!(session::load_previous(&root, ws.root()).unwrap().is_some());
+    }
+
+    #[test]
+    fn auto_reflect_is_skipped_when_conversation_was_already_reflected() {
+        // Provider: turn answer, then one reflect response. After /reflect
+        // marks the conversation, a later auto_save with the *same* history
+        // must not fire a second reflect LLM call.
+        let (dir, root, rt, ws) = setup(
+            "reflect-skip",
+            Box::new(ScriptedProvider {
+                responses: Mutex::new(std::collections::VecDeque::from([
+                    crab_core::provider::Response::Text("done".into()),
+                    crab_core::provider::Response::Text(
+                        r#"[{"text":"a rule","kind":"rule"}]"#.into(),
+                    ),
+                ])),
+                histories: Mutex::new(Vec::new()),
+            }),
+        );
+        let memory_root = mem_root(&dir);
+        assert_eq!(rt.run_once("task").unwrap(), "done"); // call 1
+        let msg = match dispatch_command(&rt, &root, &memory_root, "/reflect") {
+            CommandOutcome::Message(m) => m,
+            _ => panic!("expected message"),
+        };
+        assert!(msg.contains("added 1 new lesson"), "{msg}"); // call 2 (reflect)
+
+        // auto_save with the unchanged conversation: the fingerprint matches
+        // the marker, so no third provider call and no new lesson.
+        auto_save(&rt, &root, &memory_root);
+        let lessons = crab_core::memory::list_lessons(&memory_root, ws.root()).unwrap();
+        assert_eq!(lessons.len(), 1);
     }
 
     #[test]

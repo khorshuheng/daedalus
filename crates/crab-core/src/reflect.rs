@@ -16,7 +16,7 @@
 //! and can never corrupt existing memory.
 
 use crate::provider::Message;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +163,43 @@ pub fn render_transcript(history: &[Message]) -> String {
     out
 }
 
+/// Default cap for the whole reflection transcript (chars, ~1/4 token each):
+/// reflections must stay well under the model context even for very long
+/// sessions (CRAB-123 #2). `render_transcript` keeps the *recent* tail when
+/// over budget — the latest turns are the most relevant for lessons.
+pub const TRANSCRIPT_BUDGET_CHARS: usize = 24_000;
+
+/// Render a history, bounded to at most `max_chars` characters. When the full
+/// transcript would exceed the cap, the oldest messages are dropped (with a
+/// notice line) so the recent tail is preserved.
+pub fn render_transcript_bounded(history: &[Message], max_chars: usize) -> String {
+    // Render in full first, then trim from the front (line-wise) if needed.
+    let full = render_transcript(history);
+    if full.chars().count() <= max_chars {
+        return full;
+    }
+    // Split into lines and keep as many trailing lines as fit, but never drop
+    // below a floor so the newest assistant/user turns are included.
+    let lines: Vec<&str> = full.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut size = 0usize;
+    for line in lines.iter().rev() {
+        let add = line.chars().count() + 1; // + newline
+        if !kept.is_empty() && size + add > max_chars {
+            break;
+        }
+        kept.push(line);
+        size += add;
+    }
+    kept.reverse();
+    let mut out = String::from("…[earlier turns truncated]\n");
+    for line in kept {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
 /// Filter `candidates` to only lessons not already in `existing` memory and
 /// not duplicated within the batch itself. Comparison uses `normalize_text`,
 /// so re-learned lessons with different spacing/case are recognized as the
@@ -197,7 +234,7 @@ pub fn reflection_messages(history: &[Message], cwd: &Path) -> Vec<Message> {
     );
     vec![
         Message::System(system),
-        Message::User(render_transcript(history)),
+        Message::User(render_transcript_bounded(history, TRANSCRIPT_BUDGET_CHARS)),
     ]
 }
 
@@ -258,12 +295,9 @@ pub fn reflect_and_store(
     let existing = crate::memory::list_lessons(root, cwd).map_err(ReflectError::Memory)?;
     let fresh = dedupe(&drafts, &existing);
     let lessons = lessons_from_drafts(&fresh, cwd, source_session_id, created_at);
-    let mut added = 0;
-    for lesson in &lessons {
-        crate::memory::append_lesson(root, cwd, lesson).map_err(ReflectError::Memory)?;
-        added += 1;
-    }
-    Ok(added)
+    // Append the whole batch in one atomic write (CRAB-123 #3): a mid-batch
+    // failure cannot leave a partial set of valid lessons behind.
+    crate::memory::append_lessons_batch(root, cwd, &lessons).map_err(ReflectError::Memory)
 }
 
 /// Attach provenance to fresh drafts: a content-addressed `id`, the `cwd`,
@@ -726,5 +760,157 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, ReflectError::EmptyHistory));
         assert_eq!(fake2.calls(), 0);
+    }
+}
+
+/// A stable content fingerprint of a history: used to skip redundant
+/// auto-reflect on exit (CRAB-123 #1). Two saves of the same conversation get
+/// different session ids but the same fingerprint, so we can tell "this
+/// conversation was already reflected" apart from a genuinely new one.
+pub fn history_fingerprint(history: &[Message]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    // Hash only the conversation-bearing messages (skip the system seed), and
+    // only their user/assistant text so a tool result retry doesn't count as
+    // new content.
+    for m in history.iter().filter(|m| !matches!(m, Message::System(_))) {
+        match m {
+            Message::System(_) => {}
+            Message::User(u) => {
+                "U".hash(&mut h);
+                u.hash(&mut h);
+            }
+            Message::Assistant { text, .. } => {
+                "A".hash(&mut h);
+                text.hash(&mut h);
+            }
+            Message::ToolResult { .. } => {} // tool noise is not new content
+        }
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// Where the last-reflected marker for `cwd` lives, next to the lessons log.
+fn last_reflected_file(root: &Path, cwd: &Path) -> PathBuf {
+    let log = crate::memory::lessons_file(root, cwd);
+    log.with_file_name("last_reflected")
+}
+
+/// Record that the conversation with `fingerprint` was reflected into memory
+/// for `cwd`. Best-effort: a failure to write the marker is not fatal.
+pub fn mark_reflected(root: &Path, cwd: &Path, fingerprint: &str) {
+    let path = last_reflected_file(root, cwd);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, fingerprint);
+}
+
+/// The fingerprint of the last conversation reflected for `cwd`, if any.
+pub fn last_reflected(root: &Path, cwd: &Path) -> Option<String> {
+    std::fs::read_to_string(last_reflected_file(root, cwd))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+
+    fn messages(texts: &[&str]) -> Vec<Message> {
+        texts.iter().map(|t| Message::User(t.to_string())).collect()
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_content_sensitive() {
+        let a = messages(&["hello", "world"]);
+        let b = messages(&["hello", "world"]);
+        assert_eq!(history_fingerprint(&a), history_fingerprint(&b));
+        let c = messages(&["hello", "world!"]);
+        assert_ne!(history_fingerprint(&a), history_fingerprint(&c));
+    }
+
+    #[test]
+    fn fingerprint_ignores_system_seed_and_tool_noise() {
+        let base = vec![
+            Message::System("you are crab".into()),
+            Message::User("build it".into()),
+            Message::Assistant {
+                text: Some("ok".into()),
+                tool_calls: vec![],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                result: "huge output that changed".into(),
+            },
+        ];
+        // Same conversation, different tool result text -> same fingerprint.
+        let mut other = base.clone();
+        other[3] = Message::ToolResult {
+            tool_call_id: "c1".into(),
+            result: "different output".into(),
+        };
+        assert_eq!(history_fingerprint(&base), history_fingerprint(&other));
+    }
+
+    #[test]
+    fn mark_and_last_reflected_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = std::path::Path::new("/tmp/proj");
+        assert!(last_reflected(dir.path(), cwd).is_none());
+        mark_reflected(dir.path(), cwd, "abc123");
+        assert_eq!(last_reflected(dir.path(), cwd).as_deref(), Some("abc123"));
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn short_transcripts_are_unchanged() {
+        let h = vec![Message::User("hello".into())];
+        assert_eq!(
+            render_transcript_bounded(&h, TRANSCRIPT_BUDGET_CHARS),
+            render_transcript(&h)
+        );
+    }
+
+    #[test]
+    fn long_transcripts_keep_the_recent_tail() {
+        // 30 user turns each 2000 chars = 60k chars, over a 10k cap.
+        let h: Vec<Message> = (0..30)
+            .map(|i| Message::User(format!("turn {i}: {}", "x".repeat(1990))))
+            .collect();
+        let out = render_transcript_bounded(&h, 10_000);
+        assert!(
+            out.chars().count() <= 10_000,
+            "bounded: {}",
+            out.chars().count()
+        );
+        assert!(out.contains("truncated"), "should note truncation");
+        // The newest turn is kept; the oldest is gone.
+        assert!(out.contains("turn 29"), "recent tail preserved");
+        assert!(!out.contains("turn 0"), "oldest dropped");
+    }
+
+    #[test]
+    fn reflection_messages_use_the_budget() {
+        let h: Vec<Message> = (0..50)
+            .map(|i| Message::User(format!("q{i}: {}", "y".repeat(1000))))
+            .collect();
+        let msgs = reflection_messages(&h, std::path::Path::new("/ws"));
+        let total: usize = msgs
+            .iter()
+            .map(|m| match m {
+                Message::User(u) => u.chars().count(),
+                Message::System(s) => s.chars().count(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            total <= TRANSCRIPT_BUDGET_CHARS + 2_000,
+            "reflection messages stay bounded: {total}"
+        );
     }
 }
