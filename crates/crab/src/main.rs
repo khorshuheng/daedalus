@@ -121,7 +121,15 @@ fn resolve_config_path(explicit: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 fn run(cli: Cli) -> Result<i32, String> {
-    if cli.prompt_parts.is_empty() && cli.mode != Some(Mode::Rpc) {
+    // Interactive modes (REPL on a terminal, TUI) need no initial prompt:
+    // they wait for the user to type. The headless json mode requires one;
+    // rpc reads commands from stdin instead.
+    let needs_prompt = match cli.mode {
+        None => false, // REPL: may start empty
+        Some(Mode::Json) => true,
+        Some(Mode::Rpc) | Some(Mode::Tui) => false,
+    };
+    if needs_prompt && cli.prompt_parts.is_empty() {
         return Err("no prompt given".into());
     }
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
@@ -413,11 +421,14 @@ fn run_repl(
     let worker = rt.clone();
     let _worker_handle = std::thread::spawn(move || worker.run_forever());
 
-    // First message: the initial prompt.
-    rt.prompt(initial);
-    let mut last_answer = consume_until_settled(&rx_events, &busy);
-    if !last_answer.is_empty() {
-        println!("{last_answer}");
+    // First message: the initial prompt, when one was given. With no prompt
+    // the REPL starts empty and waits for the first line at the prompt.
+    if !initial.trim().is_empty() {
+        rt.prompt(initial);
+        let answer = consume_until_settled(&rx_events, &busy);
+        if !answer.is_empty() {
+            println!("{answer}");
+        }
     }
 
     loop {
@@ -444,9 +455,9 @@ fn run_repl(
                     rt.steer(trimmed);
                 } else {
                     rt.prompt(trimmed);
-                    last_answer = consume_until_settled(&rx_events, &busy);
-                    if !last_answer.is_empty() {
-                        println!("{last_answer}");
+                    let answer = consume_until_settled(&rx_events, &busy);
+                    if !answer.is_empty() {
+                        println!("{answer}");
                     }
                 }
             }
