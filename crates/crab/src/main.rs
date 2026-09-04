@@ -185,6 +185,7 @@ fn run(cli: Cli) -> Result<i32, String> {
         }
         Some(Mode::Tui) => {
             let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            rt.set_interactive(true); // human present: no iteration cap
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
@@ -418,6 +419,7 @@ fn run_repl(
     let mem = memory_root.clone().unwrap_or_else(memory::default_root);
 
     let (rt, rx_events) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+    rt.set_interactive(true); // human present: no iteration cap
     let worker = rt.clone();
     let _worker_handle = std::thread::spawn(move || worker.run_forever());
 

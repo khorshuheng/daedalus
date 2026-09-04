@@ -381,6 +381,10 @@ struct Inner {
     /// Per-session cancel, threaded into providers and tools (replaces the
     /// process-global `term::cancel_flag`).
     cancel: AtomicBool,
+    /// Interactive adapters (REPL/TUI) set this: a human is present and can
+    /// abort with Ctrl+C, so the iteration cap is not enforced and long
+    /// exploration (many tool steps before a final answer) is allowed.
+    interactive: AtomicBool,
     busy: AtomicBool,
     history: Mutex<Vec<Message>>,
     anchor: Mutex<(usize, usize)>,
@@ -433,6 +437,7 @@ impl AgentRuntime {
                     busy: false,
                 }),
                 cancel: AtomicBool::new(false),
+                interactive: AtomicBool::new(false),
                 busy: AtomicBool::new(false),
                 history: Mutex::new(Vec::new()),
                 anchor: Mutex::new((0, 0)),
@@ -467,6 +472,14 @@ impl AgentRuntime {
         self.push(CommandKind::Steer {
             text: text.to_string(),
         });
+    }
+
+    /// Mark this runtime as interactive (REPL/TUI). Interactive runs skip the
+    /// iteration cap: the human is the backstop and can abort with Ctrl+C, so
+    /// legitimate long explorations are not cut off at `max_iterations`.
+    /// Headless adapters (json/rpc) leave this off and keep the cap.
+    pub fn set_interactive(&self, on: bool) {
+        self.inner.interactive.store(on, Ordering::SeqCst);
     }
 
     /// Queue a follow-up, delivered when the agent stops (after `settle`).
@@ -952,7 +965,9 @@ impl AgentRuntime {
                 interrupted = true;
                 break 'steps;
             }
-            if iterations >= self.inner.config.max_iterations {
+            if iterations >= self.inner.config.max_iterations
+                && !self.inner.interactive.load(Ordering::SeqCst)
+            {
                 let msg = format!(
                     "iteration cap exceeded: no final answer after {} iterations",
                     self.inner.config.max_iterations
@@ -1314,6 +1329,64 @@ mod tests {
             _ => None,
         });
         assert_eq!(settled_event, Some(true), "cap should settle interrupted");
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn interactive_mode_is_not_capped_by_max_iterations() {
+        // Interactive adapters (REPL/TUI) opt out of the iteration cap: a
+        // human is present and can abort with Ctrl+C, so legitimate long
+        // exploration (many reads/checks before a final answer) must not be
+        // killed at the configured cap. Same provider as the cap test but
+        // with interactive=true: all three tool calls run, then the provider
+        // falls back to a final text and the turn settles cleanly.
+        let (dir, ws) = workspace("interactive");
+        let provider = Box::new(GateProvider::new(vec![
+            Response::ToolCalls(vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "true"}),
+            }]),
+            Response::ToolCalls(vec![ToolCall {
+                id: "c2".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "true"}),
+            }]),
+            Response::ToolCalls(vec![ToolCall {
+                id: "c3".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "true"}),
+            }]),
+        ]));
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 2, // deliberately below the 3 tool calls
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        rt.set_interactive(true);
+        let worker = rt.clone();
+        let handle = std::thread::spawn(move || worker.run_forever());
+        rt.prompt("keep going");
+        let (events, settled) = collect_until_settled(&rx);
+        assert!(settled);
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Error { .. })),
+            "interactive mode must not emit the iteration-cap error"
+        );
+        let settled_event = events.iter().find_map(|e| match e {
+            Event::AgentSettled {
+                text, interrupted, ..
+            } => Some((text.clone(), *interrupted)),
+            _ => None,
+        });
+        assert_eq!(
+            settled_event,
+            Some(("done".to_string(), false)),
+            "all tool calls run and the turn settles with the final text"
+        );
         rt.shutdown();
         handle.join().unwrap_or(());
     }

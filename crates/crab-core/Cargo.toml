@@ -27,7 +27,7 @@ thiserror = "=1.0.69"
 directories = "=5.0.1"
 tempfile = "=3.15.0"
 similar = "=2.6.0"
-keyring = "=3.6.2"
+keyring = { version = "=3.6.2", features = ["sync-secret-service"] }
 # bash process-group kill (CRAB-107 #14) uses libc setsid/kill on Unix.
 libc = "0.2"
 # NFKC normalization for fuzzy edit matching (CRAB-107 #15).
