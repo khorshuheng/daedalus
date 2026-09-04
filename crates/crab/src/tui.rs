@@ -3,8 +3,10 @@
 //! The TUI is a **client of `AgentRuntime`** — it never owns the agent loop.
 //! It sends commands (`prompt`/`steer`/`abort`/`set_model`/`set_effort`/
 //! `switch_workspace`/`clear`/`resume`) and renders the runtime's Event
-//! stream. Layout: input editor at the bottom, transcript above, a
-//! footer/status line (provider, model, effort, spinner while busy).
+//! stream. Layout: transcript on top, a line-editing input with a visible
+//! caret at the bottom (CRAB-126), a centered picker overlay for /model and
+//! /effort (CRAB-127), and a footer/status line (provider, model, effort,
+//! animated spinner while busy, CRAB-128).
 //!
 //! This module is split so the behavior is testable without a terminal:
 //! the pure model (`parse_slash`, `LineAction` routing, `apply_event`
@@ -19,14 +21,21 @@ use std::time::{Duration, Instant};
 
 use crab_core::config::ProviderKind;
 use crab_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
-use crossterm::event::{self, Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEventKind,
+    KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Position, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::Clear;
 use ratatui::Frame;
 use ratatui::Terminal;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// A line submitted in the input editor, classified into the action the TUI
 /// should take. Pure routing: what the runtime does with it depends on
@@ -227,6 +236,244 @@ pub fn model_choices(provider: ProviderKind) -> &'static [&'static str] {
     }
 }
 
+/// A single-line text editor for the input box (CRAB-126): the text plus a
+/// byte cursor that always sits on a UTF-8 char boundary. Pure logic — no
+/// terminal I/O — so cursor movement, insertion, deletion and the visible
+/// window are unit-testable. Insert-style (arrow keys); vim modal editing is
+/// an explicit non-goal.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct InputEditor {
+    text: String,
+    /// Byte offset into `text` on a char boundary (`== text.len()` at end).
+    cursor: usize,
+}
+
+// The `new`/`text`/`cursor` accessors are exercised only by unit tests — the
+// shell reads the visible window/caret instead — hence the targeted allow.
+#[allow(dead_code)]
+impl InputEditor {
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        Self {
+            cursor: text.len(),
+            text,
+        }
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Take the whole text and reset for the next line.
+    pub fn take(&mut self) -> String {
+        self.cursor = 0;
+        std::mem::take(&mut self.text)
+    }
+
+    /// Insert at the cursor. The editor is single-line, so pasted control
+    /// characters (CR/LF from bracketed paste) are flattened to spaces.
+    pub fn insert(&mut self, s: &str) {
+        let cleaned: String = s
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let at = self.cursor;
+        self.text.insert_str(at, &cleaned);
+        self.cursor = at + cleaned.len();
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
+    }
+
+    /// Delete the char before the cursor (Backspace).
+    pub fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let prev = self.prev_boundary(self.cursor);
+            self.text.replace_range(prev..self.cursor, "");
+            self.cursor = prev;
+        }
+    }
+
+    /// Delete the char after the cursor (Delete / Ctrl-D).
+    pub fn delete(&mut self) {
+        if self.cursor < self.text.len() {
+            let next = self.next_boundary(self.cursor);
+            self.text.replace_range(self.cursor..next, "");
+        }
+    }
+
+    /// Move the caret one char left; no-op at the start of the line.
+    pub fn left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.prev_boundary(self.cursor);
+        }
+    }
+
+    /// Move the caret one char right; no-op at the end of the line.
+    pub fn right(&mut self) {
+        if self.cursor < self.text.len() {
+            self.cursor = self.next_boundary(self.cursor);
+        }
+    }
+
+    pub fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn end(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    /// Kill back to the start of the previous word (Ctrl-W, readline-style:
+    /// the word and the whitespace before it).
+    pub fn kill_prev_word(&mut self) {
+        let start = self.word_start(self.cursor);
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+    }
+
+    /// Kill everything before the cursor (Ctrl-U).
+    pub fn kill_to_start(&mut self) {
+        self.text.replace_range(0..self.cursor, "");
+        self.cursor = 0;
+    }
+
+    /// Kill everything from the cursor to the end (Ctrl-K).
+    pub fn kill_to_end(&mut self) {
+        self.text.replace_range(self.cursor.., "");
+    }
+
+    /// Byte index of the char boundary before `i`. Precondition: `i` is a
+    /// char boundary with `i > 0` (callers guard the edges; stepping below 0
+    /// would underflow, and `is_char_boundary` is false for index > len, so
+    /// an unguarded call could loop forever).
+    fn prev_boundary(&self, mut i: usize) -> usize {
+        debug_assert!(i > 0 && i <= self.text.len());
+        i -= 1;
+        while !self.text.is_char_boundary(i) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Byte index of the char boundary after `i`. Precondition: `i` is a
+    /// char boundary with `i < text.len()` (see `prev_boundary`).
+    fn next_boundary(&self, mut i: usize) -> usize {
+        debug_assert!(i < self.text.len());
+        i += 1;
+        while !self.text.is_char_boundary(i) {
+            i += 1;
+        }
+        i
+    }
+
+    /// Start byte of the previous word before `from` (readline Ctrl-W: the
+    /// word under/ending at the cursor plus the whitespace before it).
+    /// `from` must be a char boundary.
+    fn word_start(&self, from: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        let mut i = from;
+        while i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// The visible window of the text for a viewport `width` columns wide,
+    /// returned as `(window, cursor_column)`. The caret behaves like a block
+    /// cursor and occupies a cell inside the window, so the cursor column is
+    /// always `< width` (never clipped onto the border): when the caret sits
+    /// at the end of a full window, the leftmost char scrolls out of view.
+    /// The whole text fits when short, else the tail is shown and the window
+    /// follows the cursor. Widths come from unicode-width so wide (CJK)
+    /// chars keep the caret aligned.
+    pub fn window(&self, width: usize) -> (String, usize) {
+        if width == 0 {
+            return (String::new(), 0);
+        }
+        let chars: Vec<char> = self.text.chars().collect();
+        // Cumulative column of each char boundary, plus the cursor's char index.
+        let mut prefix = Vec::with_capacity(chars.len() + 1);
+        prefix.push(0usize);
+        for c in &chars {
+            let w = UnicodeWidthChar::width(*c).unwrap_or(1);
+            prefix.push(prefix.last().unwrap() + w);
+        }
+        let mut cursor_char = chars.len();
+        for (i, (b, _)) in self.text.char_indices().enumerate() {
+            if b == self.cursor {
+                cursor_char = i;
+                break;
+            }
+        }
+        let total = *prefix.last().unwrap();
+        let cursor_col = prefix[cursor_char];
+        // Show the tail by default; scroll so the cursor stays in view.
+        let mut start = total.saturating_sub(width);
+        if cursor_col < start {
+            start = cursor_col;
+        } else if cursor_col >= start + width {
+            start = cursor_col + 1 - width;
+        }
+        // Snap the start column back to a char boundary, keeping zero-width
+        // chars attached to their base glyph.
+        let mut start_char = prefix.partition_point(|&p| p <= start).saturating_sub(1);
+        while start_char > 0 && prefix[start_char] == prefix[start_char - 1] {
+            start_char -= 1;
+        }
+        let base = prefix[start_char];
+        let mut end_char = start_char;
+        while end_char < chars.len() && prefix[end_char + 1] - base <= width {
+            end_char += 1;
+        }
+        let window: String = chars[start_char..end_char].iter().collect();
+        (window, cursor_col.saturating_sub(base))
+    }
+}
+
+/// Braille spinner frames, advanced by elapsed time (CRAB-128) so the
+/// animation runs at a steady cadence independent of the render loop.
+const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The spinner frame for a point in time (one step per 100ms).
+fn spinner_frame(elapsed: Duration) -> char {
+    SPINNER_FRAMES[(elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len()]
+}
+
+/// First visible row of a picker list so `selected` stays inside the viewport
+/// (CRAB-127): the list only scrolls when the selection leaves the window.
+fn picker_offset(selected: usize, viewport: usize) -> usize {
+    if viewport == 0 {
+        return selected;
+    }
+    if selected < viewport {
+        0
+    } else {
+        selected + 1 - viewport
+    }
+}
+
+/// A `width x height` rectangle centered inside `area` (clamped to it).
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
 /// Ratatui rendering + event loop shell. Owns the screen (crossterm raw
 /// mode + alternate screen); all *state* lives in the pure model above.
 /// Never prints to stdout directly — ratatui owns the terminal.
@@ -238,23 +485,29 @@ pub fn run_tui(
 ) -> Result<i32, String> {
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(|e| format!("cannot enter alt screen: {e}"))?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .map_err(|e| format!("cannot enter alt screen: {e}"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
     let mut model = UiModel::new(rt.state());
-    let mut input = String::new();
+    let mut input = InputEditor::default();
     let mut picker: Option<Picker> = None;
     let mut login_pending = false;
     let mut should_exit = false;
 
     let result = (|| -> Result<i32, String> {
+        // One-time editing-key hint so the line editor is discoverable.
+        model.push_notice(
+            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · /help commands",
+        );
         // Seed the transcript with the initial prompt, then start the turn.
         if !initial.trim().is_empty() {
             model.push_user(initial);
             rt.prompt(initial);
         }
 
+        let clock = Instant::now();
         let mut last_render = Instant::now();
         loop {
             if should_exit {
@@ -271,27 +524,45 @@ pub fn run_tui(
             // Render at ~30fps (also drives the busy spinner).
             if last_render.elapsed() >= Duration::from_millis(33) {
                 let provider = rt.provider_kind();
+                let spinner = if rt.is_busy() {
+                    spinner_frame(clock.elapsed())
+                } else {
+                    ' '
+                };
                 terminal
-                    .draw(|f| draw(f, &model, &input, &picker, rt.is_busy(), provider.name()))
+                    .draw(|f| {
+                        draw(
+                            f,
+                            &model,
+                            &input,
+                            &picker,
+                            rt.is_busy(),
+                            spinner,
+                            provider.name(),
+                        )
+                    })
                     .map_err(|e| e.to_string())?;
                 last_render = Instant::now();
             }
             // Poll for a key (short timeout keeps the spinner/event drain live).
             if event::poll(Duration::from_millis(33)).map_err(|e| e.to_string())? {
-                if let TermEvent::Key(key) = event::read().map_err(|e| e.to_string())? {
-                    if key.kind == KeyEventKind::Press {
-                        handle_key(
-                            rt,
-                            &mut model,
-                            &mut input,
-                            &mut picker,
-                            &mut login_pending,
-                            &mut should_exit,
-                            session_root,
-                            key.code,
-                            key.modifiers,
-                        );
-                    }
+                match event::read().map_err(|e| e.to_string())? {
+                    TermEvent::Key(key) if key.kind == KeyEventKind::Press => handle_key(
+                        rt,
+                        &mut model,
+                        &mut input,
+                        &mut picker,
+                        &mut login_pending,
+                        &mut should_exit,
+                        session_root,
+                        key.code,
+                        key.modifiers,
+                    ),
+                    // Bracketed paste: insert the whole pasted text at the
+                    // caret (so Ctrl+Shift+V works for keys / long inputs);
+                    // CR/LF is flattened because the editor is single-line.
+                    TermEvent::Paste(text) => input.insert(&text),
+                    _ => {}
                 }
             }
         }
@@ -303,7 +574,12 @@ pub fn run_tui(
     })();
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste
+    )
+    .ok();
     terminal.show_cursor().ok();
     result
 }
@@ -325,7 +601,7 @@ enum Picker {
 fn handle_key(
     rt: &AgentRuntime,
     model: &mut UiModel,
-    input: &mut String,
+    input: &mut InputEditor,
     picker: &mut Option<Picker>,
     login_pending: &mut bool,
     should_exit: &mut bool,
@@ -341,6 +617,9 @@ fn handle_key(
             Picker::Effort { .. } => EFFORT_CHOICES.len(),
         };
         match code {
+            // Ctrl-C cancels the overlay (like Esc); a second Ctrl-C at the
+            // prompt then exits. Without this the picker would swallow it.
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => *picker = None,
             KeyCode::Esc => *picker = None,
             KeyCode::Down | KeyCode::Char('j') => match p {
                 Picker::Model { selected, .. } | Picker::Effort { selected } => {
@@ -381,17 +660,26 @@ fn handle_key(
             }
         }
         KeyCode::Enter => {
-            let line = std::mem::take(input);
+            let line = input.take();
             if submit_line(rt, model, picker, session_root, login_pending, &line) {
                 *should_exit = true;
             }
         }
-        KeyCode::Backspace => {
-            input.pop();
-        }
-        KeyCode::Char(c) => {
-            input.push(c);
-        }
+        // Line editing at the caret (CRAB-126): movement, insert, delete,
+        // word/line kill. Insert-style; no vim modal editing.
+        KeyCode::Left => input.left(),
+        KeyCode::Right => input.right(),
+        KeyCode::Home => input.home(),
+        KeyCode::End => input.end(),
+        KeyCode::Backspace => input.backspace(),
+        KeyCode::Delete => input.delete(),
+        KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => input.home(),
+        KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => input.end(),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => input.delete(),
+        KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_prev_word(),
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_to_start(),
+        KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_to_end(),
+        KeyCode::Char(c) => input.insert_char(c),
         _ => {}
     }
 }
@@ -514,13 +802,16 @@ fn run_command(
     false
 }
 
-/// Render a frame: transcript on top, input editor at the bottom, footer.
+/// Render a frame: transcript on top, input editor (with a visible caret) at
+/// the bottom, footer with an animated spinner while busy. The model/effort
+/// picker renders as a centered overlay sized to its choices (CRAB-127).
 fn draw(
     f: &mut Frame,
     model: &UiModel,
-    input: &str,
+    input: &InputEditor,
     picker: &Option<Picker>,
     busy: bool,
+    spinner: char,
     provider: &str,
 ) {
     use ratatui::layout::{Constraint, Direction, Layout};
@@ -571,47 +862,35 @@ fn draw(
     // Input editor (or picker overlay).
     match picker {
         Some(Picker::Model { choices, selected }) => {
-            let items: Vec<TLine> = choices
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    let marker = if i == *selected { "❯ " } else { "  " };
-                    TLine::from(Span::raw(format!("{marker}{c}")))
-                })
-                .collect();
-            let p = Paragraph::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" model "))
-                .scroll((*selected as u16, 0));
-            f.render_widget(p, chunks[1]);
+            let title = " model — ↑/↓ · Enter apply · Esc cancel ";
+            draw_picker(f, choices, *selected, title);
         }
         Some(Picker::Effort { selected }) => {
-            let items: Vec<TLine> = EFFORT_CHOICES
+            let title = " effort — ↑/↓ · Enter apply · Esc cancel ";
+            let names: Vec<String> = EFFORT_CHOICES
                 .iter()
-                .enumerate()
-                .map(|(i, e)| {
-                    let marker = if i == *selected { "❯ " } else { "  " };
-                    TLine::from(Span::raw(format!("{marker}{}", e.name())))
-                })
+                .map(|e| e.name().to_string())
                 .collect();
-            let p = Paragraph::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" effort "))
-                .scroll((*selected as u16, 0));
-            f.render_widget(p, chunks[1]);
+            draw_picker(f, &names, *selected, title);
         }
         None => {
-            let editor = Paragraph::new(input)
-                .block(Block::default().borders(Borders::ALL).title(" input "))
-                .scroll((0, 0));
+            // Show the window of the text that contains the caret so long
+            // lines stay editable (CRAB-126), and place the terminal cursor
+            // on the caret so typing position is visible.
+            let inner_w = chunks[1].width.saturating_sub(2) as usize;
+            let (window, cursor_col) = input.window(inner_w);
+            let editor = Paragraph::new(window)
+                .block(Block::default().borders(Borders::ALL).title(" input "));
             f.render_widget(editor, chunks[1]);
+            let x = chunks[1].x + 1 + cursor_col as u16;
+            f.set_cursor_position(Position {
+                x: x.min(chunks[1].x + chunks[1].width.saturating_sub(1)),
+                y: chunks[1].y + 1,
+            });
         }
     }
 
     // Footer/status.
-    let spinner = if busy {
-        "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".chars().next().unwrap_or(' ')
-    } else {
-        ' '
-    };
     let status = format!(
         "{} {} ({}) | effort {} | {} | {} | {:?} tokens | {} turn(s){}",
         spinner,
@@ -626,6 +905,39 @@ fn draw(
     );
     let footer = Paragraph::new(TLine::from(Span::raw(status)));
     f.render_widget(footer, chunks[2]);
+}
+
+/// Render the picker overlay: a centered window sized to the choices (not the
+/// 1-row input slot), cleared behind, with a viewport that keeps the selected
+/// row visible and the current selection highlighted.
+fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str) {
+    use ratatui::text::{Line as TLine, Span};
+    use ratatui::widgets::{Block, Borders, Paragraph};
+
+    let item_w = items.iter().map(|s| s.width()).max().unwrap_or(0) as u16;
+    let inner_w = (item_w + 2).max(UnicodeWidthStr::width(title) as u16);
+    let area = centered_rect(inner_w + 2, items.len() as u16 + 2, f.area());
+    f.render_widget(Clear, area);
+
+    let viewport = area.height.saturating_sub(2) as usize;
+    let offset = picker_offset(selected, viewport);
+    let lines: Vec<TLine> = items
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(viewport)
+        .map(|(i, c)| {
+            let marker = if i == selected { "❯ " } else { "  " };
+            let line = TLine::from(Span::raw(format!("{marker}{c}")));
+            if i == selected {
+                line.style(Style::default().add_modifier(Modifier::BOLD))
+            } else {
+                line
+            }
+        })
+        .collect();
+    let picker = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(picker, area);
 }
 
 /// The provider currently configured for this runtime (for /login + /model
@@ -651,6 +963,80 @@ fn provider_for(rt: &AgentRuntime) -> ProviderKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crab_core::config::Config;
+    use crab_core::provider::fake::FakeProvider;
+    use crab_core::tools::resolver::ToolSet;
+    use crab_core::workspace::Workspace;
+
+    /// A runtime backed by the fake provider so `handle_key` (picker routing,
+    /// Ctrl-C semantics) can be exercised without a terminal.
+    fn test_rt() -> AgentRuntime {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let (rt, _rx) = AgentRuntime::new(
+            cfg,
+            Box::new(FakeProvider::new(vec![])),
+            ToolSet::new(1000),
+            ws,
+            None,
+        );
+        rt
+    }
+
+    fn ctrl_c() -> (KeyCode, KeyModifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn ctrl_c_while_picker_open_cancels_the_picker_without_exiting() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut input = InputEditor::default();
+        let mut picker = Some(Picker::Effort { selected: 2 });
+        let mut login_pending = false;
+        let mut should_exit = false;
+        let (code, mods) = ctrl_c();
+        handle_key(
+            &rt,
+            &mut model,
+            &mut input,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            code,
+            mods,
+        );
+        assert!(picker.is_none(), "picker must be cancelled");
+        assert!(!should_exit, "the first Ctrl-C must not quit");
+    }
+
+    #[test]
+    fn ctrl_c_at_an_idle_prompt_quits() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut input = InputEditor::default();
+        let mut picker = None;
+        let mut login_pending = false;
+        let mut should_exit = false;
+        let (code, mods) = ctrl_c();
+        handle_key(
+            &rt,
+            &mut model,
+            &mut input,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            code,
+            mods,
+        );
+        assert!(should_exit);
+    }
 
     #[test]
     fn plain_lines_are_messages() {
@@ -807,5 +1193,155 @@ mod tests {
         m.push_notice("resumed");
         assert_eq!(m.transcript[0], TranscriptLine::User("hello".into()));
         assert_eq!(m.transcript[1], TranscriptLine::Notice("resumed".into()));
+    }
+
+    // --- CRAB-126: line-editing input editor ---
+
+    #[test]
+    fn input_editor_inserts_at_cursor_and_moves() {
+        let mut e = InputEditor::new("abcd");
+        assert_eq!(e.cursor(), 4);
+        e.left();
+        e.left();
+        e.insert_char('X');
+        assert_eq!(e.text(), "abXcd");
+        assert_eq!(e.cursor(), 3);
+        e.home();
+        assert_eq!(e.cursor(), 0);
+        e.end();
+        assert_eq!(e.cursor(), 5);
+        e.backspace();
+        assert_eq!(e.text(), "abXc");
+        // Delete at the end is a no-op.
+        e.delete();
+        assert_eq!(e.text(), "abXc");
+        // Delete after the cursor removes the following char.
+        e.left();
+        e.delete();
+        assert_eq!(e.text(), "abX");
+    }
+
+    #[test]
+    fn input_editor_arrow_keys_are_noops_at_the_edges() {
+        // Regression: unguarded left()/right() at the edges looped forever —
+        // prev_boundary(0) underflowed and next_boundary(len) scanned past the
+        // end, where is_char_boundary is false for every index.
+        let mut e = InputEditor::new("hi");
+        e.home();
+        e.left();
+        e.left();
+        e.left();
+        assert_eq!(e.cursor(), 0);
+        e.end();
+        e.right();
+        e.right();
+        e.right();
+        assert_eq!(e.cursor(), 2);
+        // Empty input too.
+        let mut e = InputEditor::default();
+        e.left();
+        e.right();
+        assert_eq!(e.cursor(), 0);
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn input_editor_arrow_keys_move_by_char_not_byte() {
+        let mut e = InputEditor::new("éx");
+        e.home();
+        e.right();
+        // é is two bytes; the cursor must land past the whole char.
+        assert_eq!(e.cursor(), 2);
+        e.backspace();
+        assert_eq!(e.text(), "x");
+    }
+
+    #[test]
+    fn input_editor_kill_commands() {
+        // Ctrl-W: previous word plus the whitespace before it (readline-style).
+        let mut e = InputEditor::new("foo bar   baz");
+        e.end();
+        e.kill_prev_word();
+        assert_eq!(e.text(), "foo bar");
+        assert_eq!(e.cursor(), 7);
+        // Ctrl-U: kill to line start.
+        e.kill_to_start();
+        assert_eq!(e.text(), "");
+        // Ctrl-K: kill to line end.
+        e.insert("keep");
+        e.left();
+        e.kill_to_end();
+        assert_eq!(e.text(), "kee");
+    }
+
+    #[test]
+    fn input_editor_take_resets_for_the_next_line() {
+        let mut e = InputEditor::new("hello");
+        assert_eq!(e.take(), "hello");
+        assert_eq!(e.text(), "");
+        assert_eq!(e.cursor(), 0);
+        e.insert("next");
+        assert_eq!(e.text(), "next");
+    }
+
+    #[test]
+    fn input_editor_flattens_pasted_control_chars() {
+        let mut e = InputEditor::default();
+        e.insert("line1\nline2\r\n");
+        assert_eq!(e.text(), "line1 line2  ");
+        assert_eq!(e.cursor(), e.text().len());
+    }
+
+    #[test]
+    fn input_editor_window_shows_tail_and_keeps_cursor_visible() {
+        let mut e = InputEditor::new("hello world");
+        e.end();
+        let (w, col) = e.window(5);
+        // Block-cursor model: 4 chars + the caret cell fill the viewport.
+        assert_eq!((w.as_str(), col), ("orld", 4));
+        // Five lefts put the cursor at column 6; the window follows it so the
+        // caret stays visible (at the left edge of the viewport).
+        for _ in 0..5 {
+            e.left();
+        }
+        let (w, col) = e.window(5);
+        assert_eq!((w.as_str(), col), ("world", 0));
+        e.home();
+        let (w, col) = e.window(5);
+        assert_eq!((w.as_str(), col), ("hello", 0));
+    }
+
+    #[test]
+    fn input_editor_window_fits_short_text_whole() {
+        let e = InputEditor::new("hi");
+        let (w, col) = e.window(10);
+        assert_eq!(w, "hi");
+        assert_eq!(col, 2);
+        // Degenerate zero-width viewport.
+        let (w, col) = e.window(0);
+        assert_eq!((w, col), (String::new(), 0));
+    }
+
+    // --- CRAB-127: picker overlay helpers ---
+
+    #[test]
+    fn picker_offset_keeps_selection_visible() {
+        assert_eq!(picker_offset(0, 3), 0);
+        assert_eq!(picker_offset(2, 3), 0);
+        assert_eq!(picker_offset(3, 3), 1);
+        assert_eq!(picker_offset(4, 3), 2);
+        // Degenerate zero-height viewport.
+        assert_eq!(picker_offset(9, 0), 9);
+    }
+
+    // --- CRAB-128: animated spinner ---
+
+    #[test]
+    fn spinner_frame_advances_with_elapsed_time() {
+        assert_eq!(spinner_frame(Duration::from_millis(0)), '⠋');
+        assert_eq!(spinner_frame(Duration::from_millis(100)), '⠙');
+        assert_eq!(spinner_frame(Duration::from_millis(900)), '⠏');
+        // One full cycle wraps back to the first frame.
+        assert_eq!(spinner_frame(Duration::from_millis(1000)), '⠋');
     }
 }

@@ -20,6 +20,9 @@ anyhow = "=1.0.95"
 # TUI (CRAB-121): ratatui 0.29 (MSRV 1.74) + crossterm 0.28 (MSRV 1.63).
 ratatui = "=0.29.0"
 crossterm = "=0.28.1"
+# CRAB-126: display-width of input text so the caret column is correct for
+# wide (CJK) and zero-width chars. Already in the tree via ratatui 0.29.
+unicode-width = "=0.2.0"
 directories = "=5.0.1"
 
 # The crab binary owns its frontend dependencies (term, stdio modes). Async
