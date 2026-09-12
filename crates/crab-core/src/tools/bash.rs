@@ -10,10 +10,11 @@
 //! to drain, then are stopped (CRAB-147, mirroring pi's `EXIT_STDIO_GRACE_MS`).
 
 use futures::future::BoxFuture;
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -92,16 +93,48 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCaptu
     });
 }
 
-/// Run `sh -c <command>` capturing stdout/stderr, with an optional timeout in
-/// seconds. Both pipes are drained on background threads so a chatty child
-/// cannot deadlock the parent on a full pipe buffer while we wait.
+/// Resolve the shell used by the `bash` tool, mirroring pi: `/bin/bash`, then
+/// `bash` on `PATH`, then `sh` (CRAB-154). Cached because it is pure.
+fn resolve_shell() -> PathBuf {
+    static SHELL: OnceLock<PathBuf> = OnceLock::new();
+    SHELL
+        .get_or_init(|| {
+            pick_shell(
+                Path::new("/bin/bash").is_file(),
+                std::env::var_os("PATH").as_deref(),
+            )
+        })
+        .clone()
+}
+
+/// Pure shell selection, split out so it can be tested without touching the
+/// real filesystem or environment.
+fn pick_shell(bin_bash: bool, path: Option<&OsStr>) -> PathBuf {
+    if bin_bash {
+        return PathBuf::from("/bin/bash");
+    }
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
+            let candidate = dir.join("bash");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("sh")
+}
+
+/// Run the resolved shell with `-c <command>` capturing stdout/stderr, with an
+/// optional timeout in seconds. Both pipes are drained on background threads so
+/// a chatty child cannot deadlock the parent on a full pipe buffer while we
+/// wait.
 fn run_command(
     command: &str,
     cwd: &Path,
     timeout_secs: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<Output, ToolError> {
-    let mut cmd = Command::new("sh");
+    let mut cmd = Command::new(resolve_shell());
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -331,6 +364,45 @@ mod tests {
 
     fn token() -> CancellationToken {
         CancellationToken::new()
+    }
+
+    /// CRAB-154: shell resolution prefers /bin/bash, then bash on PATH, then sh.
+    #[test]
+    fn shell_resolution_order() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            super::pick_shell(true, None),
+            std::path::PathBuf::from("/bin/bash")
+        );
+        assert_eq!(
+            super::pick_shell(false, None),
+            std::path::PathBuf::from("sh")
+        );
+        assert_eq!(
+            super::pick_shell(false, Some(OsStr::new("/nonexistent-dir"))),
+            std::path::PathBuf::from("sh")
+        );
+        // A `bash` on PATH is chosen when /bin/bash is absent.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let bash = dir.path().join("bash");
+        std::fs::write(&bash, "").unwrap();
+        assert_eq!(super::pick_shell(false, Some(dir.path().as_os_str())), bash);
+    }
+
+    /// CRAB-154: the tool now runs bash, so a bash-only construct works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_bash_only_syntax() {
+        let (ws, _dir) = setup("bash-only");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
+        let out = tool
+            .run(&ws, &json!({"command": "[[ 1 == 1 ]] && echo ok"}), token())
+            .await
+            .unwrap();
+        assert!(out.content.contains("ok"), "{}", out.content);
     }
 
     #[tokio::test]
