@@ -3,8 +3,8 @@
 # The split keeps the synchronous core (crab-core) free of any async or
 # frontend dependency, and gives each frontend its own dependency tree.
 # Members:
-#   crates/crab-core — the sync library (config, tools, provider, session,
-#                      memory, reflect, index, runtime, workspace).
+#   crates/crab-core — the async library (config, tools, provider, session,
+#                      runtime, workspace).
 #   crates/crab     — the CLI binary (main + stdio modes + TUI frontend; the
 #                     interactive REPL was removed in CRAB-135).
 #

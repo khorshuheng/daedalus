@@ -21,13 +21,6 @@ rig-core = "=0.42.0"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tokio-util = "0.7"
 futures = "0.3"
-# Era pins from CRAB-119 are retired with the MSRV-1.85 floor (CRAB-130).
-# CRAB-136: the database layer moved to sqlx 0.9 (async, compile-checked
-# queries). `sqlite-unbundled` links the pkg-config system libsqlite3, which
-# must ship FTS5 (Arch's does); fall back to `sqlite-bundled` only if a
-# target distribution's sqlite lacks it. No TLS features: sqlite needs none.
-# Builds use committed .sqlx metadata (SQLX_OFFLINE) — see docs in index.rs.
-sqlx = { version = "=0.9.0", features = ["runtime-tokio", "sqlite-unbundled"] }
 thiserror = "2"
 directories = "6"
 tempfile = "3"

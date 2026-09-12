@@ -6,9 +6,6 @@
 //! - `tools` (CRAB-102): the four built-in tools (read, bash, edit, write).
 //! - `provider` (CRAB-103): LLM providers behind an extensible `Provider` trait.
 //! - `session` (CRAB-109): on-disk conversation persistence for `/resume`.
-//! - `index` (CRAB-114): SQLite FTS5 search over lessons + system-prompt injection.
-//! - `memory` (CRAB-113): append-only JSONL lesson store for agent memory.
-//! - `reflect` (CRAB-112): LLM-backed lesson extraction from session transcripts.
 //! - `runtime` (CRAB-116): stateful AgentRuntime engine + Event/Command surface.
 //! - `paths` (CRAB-119): XDG config/data base directories.
 //!
@@ -18,11 +15,8 @@
 
 pub mod config;
 pub mod credential;
-pub mod index;
-pub mod memory;
 pub mod paths;
 pub mod provider;
-pub mod reflect;
 pub mod runtime;
 pub mod session;
 pub mod tools;

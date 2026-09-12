@@ -367,15 +367,14 @@ fn trim_history(
 /// The shared state behind an `AgentRuntime` handle. The worker thread owns
 /// the turn loop and mutates the conversation; adapters send commands through
 /// the queue and read events from the channel. `history` is behind a mutex so
-/// adapters can snapshot it (session save / reflect) while a turn runs.
+/// adapters can snapshot it (session save) while a turn runs.
 struct Inner {
     config: Config,
     provider: Arc<dyn Provider>,
     tools: Arc<ToolSet>,
     /// Canonical workspace; `switch_workspace` replaces it (re-seeding the
-    /// system prompt). Read by adapters (session/memory keying).
+    /// system prompt). Read by adapters (session keying).
     workspace: Mutex<Workspace>,
-    memory_root: Option<PathBuf>,
     /// Mutable runtime state (model/effort), guarded for adapter `get_state`.
     state: Mutex<RuntimeState>,
     /// Per-session cancel, threaded into providers and tools (replaces the
@@ -420,7 +419,6 @@ impl AgentRuntime {
         provider: Box<dyn Provider>,
         tools: ToolSet,
         workspace: Workspace,
-        memory_root: Option<PathBuf>,
     ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -435,7 +433,6 @@ impl AgentRuntime {
                 provider: Arc::from(provider),
                 tools,
                 workspace: Mutex::new(workspace),
-                memory_root,
                 state: Mutex::new(RuntimeState {
                     model,
                     effort,
@@ -536,14 +533,10 @@ impl AgentRuntime {
     }
 
     /// Synchronously reset the conversation to a fresh seed. Intended for
-    /// handlers that run while the worker is idle (e.g. the REPL `/clear`);
-    /// adapters driving through the queue use `clear()`.
+    /// handlers that run while the worker is idle; adapters driving through
+    /// the queue use `clear()`.
     pub fn reset_sync(&self) {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("reset_sync tokio runtime");
-        rt.block_on(self.reset_to_seed());
+        self.reset_to_seed();
     }
 
     /// Ask the runtime to emit a `state_changed` event with current state.
@@ -577,7 +570,7 @@ impl AgentRuntime {
         self.inner.workspace.lock().unwrap().root().to_path_buf()
     }
 
-    /// The provider backing this runtime (reflection reuses it, CRAB-112).
+    /// The provider backing this runtime.
     pub fn provider(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.inner.provider)
     }
@@ -636,7 +629,7 @@ impl AgentRuntime {
                 CommandKind::Abort {} => self.cancel_clear(),
                 CommandKind::GetState {} => self.emit_state_changed(),
                 CommandKind::Clear {} => {
-                    self.reset_to_seed().await;
+                    self.reset_to_seed();
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
@@ -715,9 +708,8 @@ impl AgentRuntime {
         });
     }
 
-    /// The seed system prompt for the current workspace. Memory injection
-    /// (CRAB-114) appends the top lessons ranked against `task`.
-    async fn system_prompt(&self, task: &str) -> String {
+    /// The seed system prompt for the current workspace.
+    fn system_prompt(&self) -> String {
         let base = format!(
             "You are crab, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
              You have exactly four tools and no others: read, bash, edit, write.\n\
@@ -732,24 +724,14 @@ impl AgentRuntime {
              - When finished, give a concise final answer.",
             self.workspace_path().display()
         );
-        let Some(root) = self.inner.memory_root.clone() else {
-            return base;
-        };
-        let ws = self.workspace_path();
-        let budget = (self.inner.config.max_context_tokens / 20).max(64);
-        // CRAB-136: the index layer is natively async (sqlx) — awaited
-        // directly, no blocking-pool hop.
-        match crate::index::injection_block(&root, &ws, task, budget).await {
-            Ok(block) if !block.is_empty() => format!("{base}\n\n{block}"),
-            _ => base,
-        }
+        base
     }
 
     /// Reset the conversation to a fresh seed: system prompt only, ranked
     /// against nothing yet (the first user message re-seeds via the turn
     /// engine).
-    async fn reset_to_seed(&self) {
-        let seed = self.system_prompt("").await;
+    fn reset_to_seed(&self) {
+        let seed = self.system_prompt();
         let mut h = self.inner.history.lock().unwrap();
         h.clear();
         h.push(Message::System(seed));
@@ -774,7 +756,7 @@ impl AgentRuntime {
             CommandKind::SwitchWorkspace { path } => match Workspace::new(PathBuf::from(&path)) {
                 Ok(ws) => {
                     *self.inner.workspace.lock().unwrap() = ws;
-                    self.reset_to_seed().await;
+                    self.reset_to_seed();
                     self.emit_state_changed();
                 }
                 Err(e) => self.emit(Event::Error {
@@ -825,7 +807,7 @@ impl AgentRuntime {
                 }
                 CommandKind::GetState {} => self.emit_state_changed(),
                 CommandKind::Clear {} => {
-                    self.reset_to_seed().await;
+                    self.reset_to_seed();
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
@@ -839,8 +821,8 @@ impl AgentRuntime {
 
     /// Append `text` as the next user message, replacing the seed system
     /// prompt with one ranked against it when memory is enabled.
-    async fn push_user(&self, text: &str) {
-        let seed = self.system_prompt(text).await;
+    fn push_user(&self, text: &str) {
+        let seed = self.system_prompt();
         let mut h = self.inner.history.lock().unwrap();
         // Refresh the seed system prompt (history[0]) for this task.
         if h.is_empty() {
@@ -980,7 +962,7 @@ impl AgentRuntime {
         saved: &mut VecDeque<String>,
     ) -> (String, bool, Option<String>) {
         self.emit(Event::TurnStart {});
-        self.push_user(user_text).await;
+        self.push_user(user_text);
         let seed_len = 2; // [System, first User] are never trimmed.
         let mut iterations = 0usize;
         let mut final_text = String::new();
@@ -996,7 +978,7 @@ impl AgentRuntime {
                 // A steer arrived after the assistant's tool phase: append it
                 // as a user message and keep looping (no settle).
                 for steer in steers {
-                    self.push_user(&steer).await;
+                    self.push_user(&steer);
                     iterations = 0; // fresh turn budget for the steer
                 }
             }
@@ -1308,7 +1290,7 @@ mod tests {
             workspace: root.clone(),
             ..Config::defaults(root)
         };
-        let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone());
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         (rt, rx, handle, ws)
@@ -1367,7 +1349,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone());
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("keep going");
@@ -1415,7 +1397,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone());
         rt.set_interactive(true);
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
@@ -1567,7 +1549,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(builder), tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(builder), tools, ws.clone());
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("run a command");
@@ -1677,7 +1659,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone());
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
 
@@ -1719,7 +1701,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone());
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("first question");
@@ -1744,75 +1726,6 @@ mod tests {
             .any(|m| matches!(m, Message::User(u) if u == "second question")));
         rt.shutdown();
         handle.join().unwrap_or(());
-    }
-
-    #[test]
-    fn memory_lessons_are_injected_into_the_system_prompt() {
-        let (dir, ws) = workspace("mem-inject");
-        let memory_root = dir.path().join("memory");
-        // Seed a lesson about building with make.
-        let lesson = crate::memory::Lesson {
-            id: "l1".into(),
-            text: "always build with make, never cargo".into(),
-            kind: "rule".into(),
-            tags: vec!["build".into()],
-            cwd: ws.root().to_string_lossy().into_owned(),
-            source_session_id: Some("s1".into()),
-            created_at: 1,
-            retracted: false,
-        };
-        crate::memory::append_lesson(&memory_root, ws.root(), &lesson).unwrap();
-
-        let tools = ToolSet::new(1000);
-        let cfg = Config {
-            max_iterations: 10,
-            workspace: dir.path().to_path_buf(),
-            ..Config::defaults(dir.path().to_path_buf())
-        };
-        let (rt, _rx) = AgentRuntime::new(
-            cfg,
-            Box::new(RecordingProvider::default()),
-            tools,
-            ws.clone(),
-            Some(memory_root),
-        );
-        let answer = rt.run_once("how do i build").unwrap();
-        assert_eq!(answer, "done");
-        // The seed system prompt included the retrieved lesson.
-        let h = rt.history();
-        let Some(Message::System(system)) = h.first() else {
-            panic!("history must start with a system prompt");
-        };
-        assert!(
-            system.contains("always build with make"),
-            "lesson injected: {system}"
-        );
-    }
-
-    /// A provider that answers "done" and records histories.
-    #[derive(Default)]
-    struct RecordingProvider {
-        histories: Mutex<Vec<Vec<Message>>>,
-    }
-
-    impl Provider for RecordingProvider {
-        fn complete<'a>(
-            &'a self,
-            history: &'a [Message],
-            _tools: &'a [serde_json::Value],
-            _effort_params: &'a serde_json::Value,
-            _cancel: CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
-        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
-            Box::pin(async move {
-                self.histories.lock().unwrap().push(history.to_vec());
-                Ok(Completion {
-                    response: Response::Text("done".into()),
-                    prompt_tokens: None,
-                    aborted: false,
-                })
-            })
-        }
     }
 
     /// A provider that always reports an aborted stream with partial text.
@@ -1852,8 +1765,7 @@ mod parallel_tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, _rx) =
-            AgentRuntime::new(cfg, Box::new(ParallelCallProvider), tools, ws.clone(), None);
+        let (rt, _rx) = AgentRuntime::new(cfg, Box::new(ParallelCallProvider), tools, ws.clone());
         // Two bash calls each sleep 400ms; parallel wall time is ~400ms, not
         // ~800ms.
         let start = std::time::Instant::now();
@@ -1936,8 +1848,7 @@ mod compaction_tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, _rx) =
-            AgentRuntime::new(cfg, Box::new(FakeProvider::new(responses)), tools, ws, None);
+        let (rt, _rx) = AgentRuntime::new(cfg, Box::new(FakeProvider::new(responses)), tools, ws);
         rt
     }
 
@@ -2014,7 +1925,6 @@ mod accessor_tests {
             Box::new(crate::provider::fake::FakeProvider::new(vec![])),
             tools,
             ws,
-            None,
         );
         assert_eq!(rt.provider_kind(), ProviderKind::Anthropic);
     }
@@ -2084,7 +1994,6 @@ mod effort_tests {
             Box::new(SharedRecorder(recorder_for_runtime)),
             tools,
             ws,
-            None,
         );
         rt.set_effort(Effort::High);
         rt.run_once("task").unwrap();

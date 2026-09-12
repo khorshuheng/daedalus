@@ -139,10 +139,6 @@ fn new_id(created_at: u64) -> String {
 /// Encode a working directory into a filesystem-safe directory name, following
 /// pi's scheme: leading separators are stripped, separators and `:` become
 /// `-`, wrapped in `--…--` (`/home/user/proj` -> `--home-user-proj--`).
-///
-/// `pub(crate)` so the memory store (CRAB-113) keys its per-project
-/// `lessons.jsonl` under the same encoding; CRAB-119 will consolidate the
-/// shared storage helpers.
 pub(crate) fn encode_cwd(cwd: &Path) -> String {
     let s = cwd.to_string_lossy();
     let inner = s
@@ -348,9 +344,8 @@ pub fn clear_previous(root: &Path, cwd: &Path) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// Read the session `id` recorded in a saved file's header line. Used as
-/// lesson provenance when reflecting over a just-saved session (CRAB-112);
-/// `None` when the file has no parseable header.
+/// Read the session `id` recorded in a saved file's header line; `None`
+/// when the file has no parseable header.
 pub fn file_id(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let first = BufReader::new(file).lines().next()?.ok()?;

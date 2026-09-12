@@ -69,7 +69,7 @@ fn integration_multi_step_session() {
     ]);
 
     let tools = ToolSet::new(1000);
-    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws, None);
+    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws);
 
     let answer = rt.run_once("create a file and edit it").unwrap();
     assert_eq!(answer, "all done");
@@ -119,7 +119,7 @@ fn integration_iteration_cap() {
         )]),
     ]);
     let tools = ToolSet::new(1000);
-    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws, None);
+    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws);
 
     let err = rt.run_once("keep going").unwrap_err();
     assert!(matches!(err, RuntimeError::IterationCap(3)));
@@ -200,7 +200,7 @@ fn integration_path_escape_is_rejected() {
         Response::Text("ok".into()),
     ]);
     let tools = ToolSet::new(1000);
-    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws, None);
+    let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws);
     let _ = rt.run_once("try to escape").unwrap();
 
     // The escape error was fed back, and the outside file is untouched.
@@ -290,107 +290,6 @@ fn cli_unknown_mode_fails() {
     assert!(stderr.contains("json, rpc, tui"));
 }
 
-/// End-to-end memory pipeline (CRAB-111 epic acceptance): a session is
-/// reflected into lessons, lessons persist in the JSONL log, the SQLite
-/// index is rebuilt from them, and a later, similar task injects the relevant
-/// lesson into its system prompt.
-#[test]
-fn memory_pipeline_reflect_store_index_inject() {
-    use crab_core::reflect;
-    use crab_core::runtime::AgentRuntime;
-
-    let tmp = tempdir("memory-pipeline");
-    let root = tmp.path().join("memory");
-    let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
-    let tools = ToolSet::new(1000);
-
-    // 1. A session where the agent learned to build with make.
-    let transcript = vec![
-        Message::System("you are crab".into()),
-        Message::User("how do i build this project".into()),
-        Message::Assistant {
-            text: Some("run make, not cargo".into()),
-            tool_calls: vec![],
-        },
-    ];
-
-    // 2. Reflect over it: the provider answers with a JSON lesson list.
-    let fake = FakeProvider::new(vec![Response::Text(
-        r#"[{"text":"build with make, never cargo","kind":"rule","tags":["build"]}]"#.into(),
-    )]);
-    let added = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap()
-        .block_on(reflect::reflect_and_store(
-            &root,
-            ws.root(),
-            &fake,
-            tokio_util::sync::CancellationToken::new(),
-            &transcript,
-            Some("sess-mem".into()),
-            100,
-        ))
-        .expect("reflect should succeed");
-    assert_eq!(added, 1);
-
-    // The JSONL log is the source of truth.
-    let stored = crab_core::memory::list_lessons(&root, ws.root()).unwrap();
-    assert_eq!(stored.len(), 1);
-    assert_eq!(stored[0].text, "build with make, never cargo");
-    assert_eq!(stored[0].source_session_id.as_deref(), Some("sess-mem"));
-
-    // 3. Build the SQLite index from the log and confirm retrieval.
-    // CRAB-136: the index layer is async; block_on from this sync test.
-    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(fut)
-    }
-    let synced = block_on(crab_core::index::sync(&root, ws.root())).unwrap();
-    assert_eq!(synced, 1);
-    let hits = block_on(crab_core::index::search(
-        &root,
-        ws.root(),
-        "how do i build",
-        5,
-    ))
-    .unwrap();
-    assert!(
-        hits.iter().any(|l| l.text.contains("make")),
-        "index should return the lesson for a build query: {hits:?}"
-    );
-
-    // 4. A later, similar session (new runtime, same memory root) injects the
-    // lesson into its system prompt.
-    let cfg = Config {
-        provider: ProviderKind::Fake,
-        max_iterations: 5,
-        workspace: tmp.path().to_path_buf(),
-        ..Config::defaults(tmp.path().to_path_buf())
-    };
-    let later_provider = FakeProvider::new(vec![Response::Text("ok".into())]);
-    let (rt, _rx) = AgentRuntime::new(
-        cfg,
-        Box::new(later_provider),
-        tools,
-        ws.clone(),
-        Some(root.clone()),
-    );
-    let answer = rt.run_once("how do i build").unwrap();
-    assert_eq!(answer, "ok");
-    let h = rt.history();
-    let Some(Message::System(system)) = h.first() else {
-        panic!("history must start with a system prompt");
-    };
-    assert!(
-        system.contains("build with make, never cargo"),
-        "later session should inject the lesson: {system}"
-    );
-}
-
 /// CRAB-130: the provider-reported prompt token count must flow through the
 /// adapter into the runtime's `usage` event (context budgeting's anchor).
 #[test]
@@ -422,8 +321,7 @@ fn usage_event_carries_provider_reported_prompt_tokens() {
     let tmp = tempdir("usage-flow");
     let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
     let cfg = config_for(tmp.path(), 5);
-    let (rt, mut rx) =
-        AgentRuntime::new(cfg, Box::new(TokenReporter), ToolSet::new(1000), ws, None);
+    let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(TokenReporter), ToolSet::new(1000), ws);
     let worker = rt.clone();
     let handle = std::thread::spawn(move || worker.run_forever());
     rt.prompt("hi");

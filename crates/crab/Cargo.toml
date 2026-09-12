@@ -12,7 +12,7 @@ path = "src/main.rs"
 [dependencies]
 crab-core = { path = "../crab-core" }
 serde_json = "1"
-# CRAB-130: blocking bridges over crab-core's async seams (auto-save reflect)
+# CRAB-130: blocking bridges over crab-core's async seams (session auto-save)
 # and the async Provider trait used by the test fakes.
 tokio = { version = "1", features = ["rt"] }
 tokio-util = "0.7"

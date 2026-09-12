@@ -13,9 +13,6 @@
 //!   `{"type":"response","id":...}` line after the command's events so
 //!   clients can correlate replies (pi's RPC mode).
 //!
-//! These headless modes do **not** auto-reflect lessons into memory
-//! (CRAB-123 #4, documented non-goal): the session-save + reflection trigger
-//! belongs to the interactive TUI.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -329,7 +326,6 @@ mod tests {
             Box::new(FakeProvider::new(responses)),
             tools,
             ws.clone(),
-            None,
         );
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());

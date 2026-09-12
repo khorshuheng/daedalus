@@ -18,9 +18,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use crab_core::config::{Config, PartialConfig, ProviderKind};
-use crab_core::memory;
-use crab_core::provider::{self, Message};
-use crab_core::reflect;
+use crab_core::provider;
 use crab_core::runtime::AgentRuntime;
 use crab_core::session;
 use crab_core::tools::resolver::ToolSet;
@@ -142,9 +140,6 @@ fn run(cli: Cli) -> Result<i32, String> {
     let workspace = Workspace::new(config.workspace.clone())?;
     let provider = provider::from_config(&config);
     let tools = ToolSet::new(config.max_output_bytes);
-    // Memory injection (CRAB-114): real sessions rank lessons for the
-    // workspace into the system prompt.
-    let memory_root = Some(memory::default_root());
 
     // No --mode: an interactive terminal gets the TUI (CRAB-135: the REPL
     // was removed). Piped/non-tty stdin without an explicit mode is an
@@ -163,14 +158,14 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
     match mode {
         Some(Mode::Json) => {
-            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let mut stdout = std::io::stdout();
             modes::run_json(&rt, &mut rx, &cli.prompt(), &mut stdout)
         }
         Some(Mode::Rpc) => {
-            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
@@ -180,129 +175,27 @@ fn run(cli: Cli) -> Result<i32, String> {
             modes::run_rpc(&rt, &mut rx, &root, reader, &mut stdout)
         }
         Some(Mode::Tui) | None => {
-            let mem = memory_root.clone().unwrap_or_else(memory::default_root);
-            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
             rt.set_interactive(true); // human present: no iteration cap
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
-            tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path(), mem.as_path())
+            tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path())
         }
     }
 }
 
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Persist the current session history to disk (auto-save on exit, CRAB-109)
-/// and, when the conversation produced output, reflect it into memory
-/// (auto-reflect at session end, CRAB-112). Failures are warnings only —
-/// quitting must never be blocked by persistence or reflection.
-fn auto_save(rt: &AgentRuntime, root: &Path, memory_root: &Path) {
-    let saved = match session::save_session(root, &rt.workspace_root(), &rt.history()) {
+/// Persist the current session history to disk (auto-save on exit, CRAB-109).
+/// Failures are warnings only — quitting must never be blocked by persistence.
+/// (CRAB-137 removed the auto-reflection that used to follow the save.)
+fn auto_save(rt: &AgentRuntime, root: &Path) {
+    match session::save_session(root, &rt.workspace_root(), &rt.history()) {
         Ok(path) => {
             eprintln!("session saved: {}", path.display());
-            Some(path)
         }
         Err(e) => {
             eprintln!("crab: warning: could not save session: {e}");
-            None
         }
-    };
-    if !has_conversation(&rt.history()) {
-        return;
-    }
-    let history = rt.history();
-    // Skip a redundant auto-reflect when this exact conversation was already
-    // reflected (e.g. the user ran /reflect, then quit) — CRAB-123 #1. The
-    // marker stores a content fingerprint, so re-saving the same conversation
-    // (a new session id each time) is recognized as already reflected.
-    let fingerprint = crab_core::reflect::history_fingerprint(&history);
-    if crab_core::reflect::last_reflected(memory_root, &rt.workspace_root()).as_deref()
-        == Some(fingerprint.as_str())
-    {
-        return;
-    }
-    // The session was just saved, so lessons can carry its real id.
-    let source = saved.as_deref().and_then(session::file_id);
-    let ws = rt.workspace_root();
-    // Reflection is an LLM call (async, CRAB-130); block the caller on it —
-    // this runs at session end, where nothing else needs the thread.
-    let block_on = |fut| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("auto_save tokio runtime")
-            .block_on(fut)
-    };
-    match block_on(reflect::reflect_and_store(
-        memory_root,
-        &ws,
-        rt.provider().as_ref(),
-        rt.cancel_token(),
-        &history,
-        source,
-        now_millis(),
-    )) {
-        Ok(0) => {}
-        Ok(n) => {
-            crab_core::reflect::mark_reflected(memory_root, &ws, &fingerprint);
-            eprintln!("memory: reflected {n} new lesson(s) from this session");
-        }
-        Err(e) => eprintln!("crab: warning: could not reflect lessons: {e}"),
-    }
-}
-
-/// True when the history contains at least one assistant message — i.e. the
-/// conversation actually produced output. A session holding only the system
-/// prompt (or an unanswered user message) is not worth resuming.
-fn has_conversation(history: &[Message]) -> bool {
-    history
-        .iter()
-        .any(|m| matches!(m, Message::Assistant { .. }))
-}
-
-/// `/reflect` (CRAB-112): reflect on the running conversation (auto-saving it
-/// first so lessons carry a real session id as provenance) and append new
-/// lessons to memory. Shared by the TUI command and its tests (CRAB-135: the
-/// TUI is the only interactive frontend).
-fn handle_reflect(rt: &AgentRuntime, root: &Path, memory_root: &Path) -> String {
-    if !has_conversation(&rt.history()) {
-        return "no conversation to reflect on".to_string();
-    }
-    let path = match session::save_session(root, &rt.workspace_root(), &rt.history()) {
-        Ok(p) => p,
-        Err(e) => return format!("could not save session: {e}"),
-    };
-    let history = rt.history();
-    let ws = rt.workspace_root();
-    let fingerprint = crab_core::reflect::history_fingerprint(&history);
-    let block_on = |fut| {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("reflect tokio runtime")
-            .block_on(fut)
-    };
-    match block_on(reflect::reflect_and_store(
-        memory_root,
-        &ws,
-        rt.provider().as_ref(),
-        rt.cancel_token(),
-        &history,
-        session::file_id(&path),
-        now_millis(),
-    )) {
-        Ok(0) => "reflected: no new lessons".to_string(),
-        Ok(n) => {
-            crab_core::reflect::mark_reflected(memory_root, &ws, &fingerprint);
-            format!("reflected: added {n} new lesson(s)")
-        }
-        Err(e) => format!("reflection failed: {e}"),
     }
 }
 
@@ -319,10 +212,20 @@ fn main() {
     std::process::exit(code);
 }
 
+/// True when the history contains at least one assistant message — i.e. the
+/// conversation actually produced output.
+#[cfg(test)]
+fn has_conversation(history: &[crab_core::provider::Message]) -> bool {
+    history
+        .iter()
+        .any(|m| matches!(m, crab_core::provider::Message::Assistant { .. }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crab_core::config::Config;
+    use crab_core::provider::Message;
     use crab_core::provider::{Provider, ProviderError, Response};
     use crab_core::runtime::AgentRuntime;
     use crab_core::tools::resolver::ToolSet;
@@ -356,39 +259,6 @@ mod tests {
         }
     }
 
-    /// A provider that plays a scripted `Response` per call.
-    struct ScriptedProvider {
-        responses: Mutex<std::collections::VecDeque<crab_core::provider::Response>>,
-        histories: Mutex<Vec<Vec<Message>>>,
-    }
-
-    impl Provider for ScriptedProvider {
-        fn complete<'a>(
-            &'a self,
-            history: &'a [Message],
-            _tools: &'a [serde_json::Value],
-            _effort_params: &'a serde_json::Value,
-            _cancel: tokio_util::sync::CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
-        ) -> futures::future::BoxFuture<'a, Result<crab_core::provider::Completion, ProviderError>>
-        {
-            Box::pin(async move {
-                self.histories.lock().unwrap().push(history.to_vec());
-                let response = self
-                    .responses
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or(crab_core::provider::Response::Text("done".into()));
-                Ok(crab_core::provider::Completion {
-                    response,
-                    prompt_tokens: None,
-                    aborted: false,
-                })
-            })
-        }
-    }
-
     /// Build a temp workspace + sessions root + a recording provider.
     fn setup(
         _name: &str,
@@ -403,23 +273,18 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, _rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, _rx) = AgentRuntime::new(cfg, provider, tools, ws.clone());
         (dir, root, rt, ws)
-    }
-
-    fn mem_root(dir: &tempfile::TempDir) -> PathBuf {
-        dir.path().join("memory")
     }
 
     #[test]
     fn clear_resets_history_for_the_next_message() {
-        let (dir, _root, rt, _ws) = setup(
+        let (_dir, _root, rt, _ws) = setup(
             "clear",
             Box::new(RecordingProvider {
                 histories: Mutex::new(Vec::new()),
             }),
         );
-        let memory_root = mem_root(&dir);
         // Establish a conversation.
         assert_eq!(rt.run_once("initial prompt").unwrap(), "done");
         assert!(has_conversation(&rt.history()));
@@ -437,80 +302,6 @@ mod tests {
         assert!(!h
             .iter()
             .any(|m| matches!(m, Message::User(u) if u == "initial prompt")));
-        let _ = memory_root;
-    }
-
-    #[test]
-    fn reflect_dispatching_adds_lessons_with_session_provenance() {
-        let (dir, root, rt, ws) = setup(
-            "reflect",
-            Box::new(ScriptedProvider {
-                responses: Mutex::new(std::collections::VecDeque::from([
-                    crab_core::provider::Response::Text("done with the task".into()),
-                    crab_core::provider::Response::Text(
-                        r#"[{"text":"always run make first","kind":"rule"}]"#.into(),
-                    ),
-                ])),
-                histories: Mutex::new(Vec::new()),
-            }),
-        );
-        let memory_root = mem_root(&dir);
-
-        // Run a conversation turn first (consumes response 1).
-        assert_eq!(rt.run_once("fix the build").unwrap(), "done with the task");
-
-        let msg = handle_reflect(&rt, &root, &memory_root);
-        assert!(msg.contains("added 1 new lesson"), "{msg}");
-
-        // The lesson landed in memory with provenance back to the session.
-        let lessons = crab_core::memory::list_lessons(&memory_root, ws.root()).unwrap();
-        assert_eq!(lessons.len(), 1);
-        assert_eq!(lessons[0].text, "always run make first");
-        assert_eq!(lessons[0].cwd, ws.root().to_string_lossy());
-        assert!(lessons[0].source_session_id.is_some());
-        assert!(session::load_previous(&root, ws.root()).unwrap().is_some());
-    }
-
-    #[test]
-    fn auto_reflect_is_skipped_when_conversation_was_already_reflected() {
-        // Provider: turn answer, then one reflect response. After /reflect
-        // marks the conversation, a later auto_save with the *same* history
-        // must not fire a second reflect LLM call.
-        let (dir, root, rt, ws) = setup(
-            "reflect-skip",
-            Box::new(ScriptedProvider {
-                responses: Mutex::new(std::collections::VecDeque::from([
-                    crab_core::provider::Response::Text("done".into()),
-                    crab_core::provider::Response::Text(
-                        r#"[{"text":"a rule","kind":"rule"}]"#.into(),
-                    ),
-                ])),
-                histories: Mutex::new(Vec::new()),
-            }),
-        );
-        let memory_root = mem_root(&dir);
-        assert_eq!(rt.run_once("task").unwrap(), "done"); // call 1
-        let msg = handle_reflect(&rt, &root, &memory_root);
-        assert!(msg.contains("added 1 new lesson"), "{msg}"); // call 2 (reflect)
-
-        // auto_save with the unchanged conversation: the fingerprint matches
-        // the marker, so no third provider call and no new lesson.
-        auto_save(&rt, &root, &memory_root);
-        let lessons = crab_core::memory::list_lessons(&memory_root, ws.root()).unwrap();
-        assert_eq!(lessons.len(), 1);
-    }
-
-    #[test]
-    fn reflect_with_no_conversation_reports_clearly() {
-        let (dir, root, rt, _ws) = setup(
-            "reflect-empty",
-            Box::new(RecordingProvider {
-                histories: Mutex::new(Vec::new()),
-            }),
-        );
-        let memory_root = mem_root(&dir);
-        let msg = handle_reflect(&rt, &root, &memory_root);
-        assert!(msg.contains("no conversation to reflect on"), "{msg}");
     }
 
     #[test]
