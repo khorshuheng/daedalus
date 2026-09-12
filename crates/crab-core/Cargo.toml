@@ -1,6 +1,6 @@
 [package]
 name = "crab-core"
-description = "Crab core library: synchronous agent engine, tools, providers, persistence and memory (CRAB-117 workspace split)."
+description = "Crab core library: async agent engine, tools, providers, persistence and skills (CRAB-117 workspace split)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
