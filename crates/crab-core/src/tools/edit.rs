@@ -255,6 +255,21 @@ impl EditTool {
             };
 
         let resolved = resolve(workspace, Path::new(&path))?;
+        // Reject non-regular files before opening: a FIFO/device/socket would
+        // block the read forever, and blocking tasks cannot be cancelled
+        // (CRAB-139 review).
+        let meta = match std::fs::metadata(&resolved) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ToolError::NotFound(path));
+            }
+            Err(e) => return Err(ToolError::Io(e.to_string())),
+        };
+        if !meta.is_file() {
+            return Err(ToolError::Invalid(format!(
+                "refusing to edit '{path}': not a regular file"
+            )));
+        }
         let bytes = match std::fs::read(&resolved) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -481,5 +496,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
+    }
+
+    /// CRAB-139 review: a FIFO must be rejected before the read, which would
+    /// otherwise block forever.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_non_regular_files() {
+        use std::ffi::CString;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let fifo = root.join("pipe");
+        let c = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo with a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let ws = Workspace::new(root).unwrap();
+        let err = EditTool
+            .run(
+                &ws,
+                &json!({"path": "pipe", "oldText": "a", "newText": "b"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 }

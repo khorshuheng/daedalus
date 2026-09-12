@@ -52,6 +52,16 @@ impl WriteTool {
             .ok_or_else(|| ToolError::Argument("'content' must be a string".into()))?;
 
         let resolved = resolve(workspace, Path::new(&path))?;
+        // A FIFO/device/socket at this path would block `fs::write` on open, so
+        // reject an existing non-regular file. A missing path is a normal
+        // create (CRAB-139 review).
+        if let Ok(meta) = std::fs::metadata(&resolved) {
+            if !meta.is_file() {
+                return Err(ToolError::Invalid(format!(
+                    "refusing to write '{path}': not a regular file"
+                )));
+            }
+        }
         if let Some(parent) = resolved.parent() {
             std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
         }
@@ -124,5 +134,26 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
             "deep"
         );
+    }
+
+    /// CRAB-139 review: writing to an existing FIFO would block on open.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_writing_to_non_regular_files() {
+        use std::ffi::CString;
+        let (ws, dir) = setup("fifo");
+        let fifo = dir.path().join("pipe");
+        let c = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo with a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+        let err = WriteTool
+            .run(
+                &ws,
+                &json!({"path": "pipe", "content": "x"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 }
