@@ -18,7 +18,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crab_core::config::ProviderKind;
 use crab_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEventKind,
@@ -223,17 +222,6 @@ pub const EFFORT_CHOICES: &[Effort] = &[
     Effort::Medium,
     Effort::High,
 ];
-
-/// Candidate models offered by the `/model` picker (provider presets; the
-/// user can also type a custom model).
-pub fn model_choices(provider: ProviderKind) -> &'static [&'static str] {
-    match provider {
-        ProviderKind::Openai => &["gpt-4o-mini", "gpt-4o", "o3-mini"],
-        ProviderKind::Anthropic => &["claude-3-5-sonnet-latest", "claude-3-5-haiku-latest"],
-        ProviderKind::Deepseek => &["deepseek-chat", "deepseek-reasoner"],
-        ProviderKind::Fake => &["fake-model"],
-    }
-}
 
 /// A single-line text editor for the input box (CRAB-126): the text plus a
 /// byte cursor that always sits on a UTF-8 char boundary. Pure logic — no
@@ -538,7 +526,7 @@ pub fn run_tui(
                             &picker,
                             rt.is_busy(),
                             spinner,
-                            provider.name(),
+                            provider.name,
                         )
                     })
                     .map_err(|e| e.to_string())?;
@@ -587,13 +575,7 @@ pub fn run_tui(
 
 /// A modal picker overlay (model / effort selection).
 enum Picker {
-    Model {
-        choices: Vec<String>,
-        selected: usize,
-    },
-    Effort {
-        selected: usize,
-    },
+    Effort { selected: usize },
 }
 
 /// Route one key press. Pure decisions delegated to the model where possible;
@@ -614,7 +596,6 @@ fn handle_key(
         // Picker navigation consumes keys. Copy the current selection out so
         // we do not hold a borrow across the mutations below.
         let max = match p {
-            Picker::Model { choices, .. } => choices.len(),
             Picker::Effort { .. } => EFFORT_CHOICES.len(),
         };
         match code {
@@ -623,22 +604,16 @@ fn handle_key(
             KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => *picker = None,
             KeyCode::Esc => *picker = None,
             KeyCode::Down | KeyCode::Char('j') => match p {
-                Picker::Model { selected, .. } | Picker::Effort { selected } => {
+                Picker::Effort { selected } => {
                     *selected = (*selected + 1).min(max - 1);
                 }
             },
             KeyCode::Up | KeyCode::Char('k') => match p {
-                Picker::Model { selected, .. } | Picker::Effort { selected } => {
+                Picker::Effort { selected } => {
                     *selected = selected.saturating_sub(1);
                 }
             },
             KeyCode::Enter => match p {
-                Picker::Model { choices, selected } => {
-                    let model_name = choices[*selected].clone();
-                    rt.set_model(&model_name);
-                    model.state.model = model_name;
-                    *picker = None;
-                }
                 Picker::Effort { selected } => {
                     let effort = EFFORT_CHOICES[*selected];
                     rt.set_effort(effort);
@@ -703,9 +678,9 @@ fn submit_line(
             model.push_notice("login cancelled");
             return false;
         }
-        let provider = provider_for(rt);
+        let provider = rt.provider_kind();
         match crab_core::credential::store_api_key(provider, key) {
-            Ok(()) => model.push_notice(&format!("stored API key for {}", provider.name())),
+            Ok(()) => model.push_notice(&format!("stored API key for {}", provider.name)),
             Err(e) => model.push_notice(&format!("could not store key: {e}")),
         }
         return false;
@@ -769,15 +744,8 @@ fn run_command(
         }
         SlashCommand::Model(arg) => {
             if arg.is_empty() {
-                let provider = provider_for(rt);
-                let choices = model_choices(provider)
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                *picker = Some(Picker::Model {
-                    choices,
-                    selected: 0,
-                });
+                // CRAB-132: no static model lists — the user types the model.
+                model.push_notice("usage: /model <model>");
             } else {
                 rt.set_model(&arg);
                 model.state.model = arg;
@@ -862,10 +830,6 @@ fn draw(
 
     // Input editor (or picker overlay).
     match picker {
-        Some(Picker::Model { choices, selected }) => {
-            let title = " model — ↑/↓ · Enter apply · Esc cancel ";
-            draw_picker(f, choices, *selected, title);
-        }
         Some(Picker::Effort { selected }) => {
             let title = " effort — ↑/↓ · Enter apply · Esc cancel ";
             let names: Vec<String> = EFFORT_CHOICES
@@ -939,26 +903,6 @@ fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str) {
         .collect();
     let picker = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(picker, area);
-}
-
-/// The provider currently configured for this runtime (for /login + /model
-/// picker). Reads it from the runtime's shared state via the config the
-/// runtime was built with — exposed through `state` indirectly; for the
-/// picker we infer from the model preset.
-fn provider_for(rt: &AgentRuntime) -> ProviderKind {
-    // The runtime state carries the workspace/model but not the provider
-    // kind; infer from the model name's preset (best effort for the picker).
-    let m = rt.state().model;
-    for p in [
-        ProviderKind::Openai,
-        ProviderKind::Anthropic,
-        ProviderKind::Deepseek,
-    ] {
-        if p.preset_model() == m {
-            return p;
-        }
-    }
-    ProviderKind::Openai
 }
 
 #[cfg(test)]
@@ -1097,13 +1041,6 @@ mod tests {
             Effort::High,
         ];
         assert_eq!(EFFORT_CHOICES, all);
-    }
-
-    #[test]
-    fn model_choices_are_provider_specific() {
-        assert!(model_choices(ProviderKind::Openai).contains(&"gpt-4o"));
-        assert!(model_choices(ProviderKind::Deepseek).contains(&"deepseek-reasoner"));
-        assert_eq!(model_choices(ProviderKind::Fake), &["fake-model"]);
     }
 
     fn state() -> RuntimeState {

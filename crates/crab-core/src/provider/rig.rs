@@ -21,7 +21,7 @@ use rig_core::completion::message::{
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, FinishReason, ToolDefinition,
 };
-use rig_core::providers::{anthropic, openai};
+use rig_core::providers::{anthropic, gemini, groq, mistral, ollama, openai, openrouter, xai};
 use rig_core::streaming::StreamedAssistantContent;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -36,11 +36,18 @@ use super::{
 const MAX_RETRIES: usize = 3;
 
 enum Backend {
-    /// OpenAI chat-completions; also serves DeepSeek via a configurable base
-    /// URL (as the old hand-written client did).
+    /// OpenAI chat-completions; also serves DeepSeek and LM Studio via a
+    /// configurable base URL.
     OpenAiCompatible(openai::completion::GenericCompletionModel<openai::OpenAICompletionsExt>),
     /// Anthropic Messages API.
     Anthropic(anthropic::completion::CompletionModel),
+    Gemini(gemini::completion::CompletionModel),
+    Mistral(mistral::completion::CompletionModel),
+    /// Groq rides rig's shared OpenAI-compatible transport.
+    Groq(groq::CompletionModel),
+    Xai(xai::completion::CompletionModel),
+    OpenRouter(openrouter::completion::CompletionModel),
+    Ollama(ollama::CompletionModel),
 }
 
 /// The rig-backed provider. Construct via [`RigProvider::openai_compatible`]
@@ -51,38 +58,96 @@ pub struct RigProvider {
 }
 
 impl RigProvider {
-    /// OpenAI chat-completions wire for the OpenAI/DeepSeek presets. crab's
-    /// configured `base_url` historically pointed at the API root (the client
-    /// appended `/v1/chat/completions`), while rig expects the base to carry
-    /// the `/v1` prefix — normalized here, preserving the old wire URL.
-    pub fn openai_compatible(config: &crate::config::Config) -> Self {
-        let base = format!("{}/v1", config.base_url.trim_end_matches('/'));
-        let client = openai::Client::builder()
-            .api_key(config.api_key.clone().unwrap_or_default())
-            .base_url(base)
-            .build()
-            .expect("valid OpenAI-compatible client");
-        let model = client
-            .completions_api()
-            .completion_model(config.model.clone());
+    /// Build the backend for `config.provider` (CRAB-132). Each registry name
+    /// maps onto rig's client for that provider; the configured `base_url` is
+    /// always forwarded so a user override wins. Names with no dedicated rig
+    /// client ride the OpenAI-compatible transport.
+    pub fn new(config: &crate::config::Config) -> Self {
+        let key = config.api_key.clone().unwrap_or_default();
+        let base = config.base_url.trim_end_matches('/').to_string();
+        let backend = match config.provider.name {
+            "openai" | "deepseek" | "lmstudio" => {
+                // These presets are API roots: rig expects the `/v1` prefix
+                // on the base, so append it unless the user already did.
+                let base = if base.ends_with("/v1") {
+                    base
+                } else {
+                    format!("{base}/v1")
+                };
+                let client = openai::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid OpenAI-compatible client");
+                Backend::OpenAiCompatible(
+                    client
+                        .completions_api()
+                        .completion_model(config.model.clone()),
+                )
+            }
+            "anthropic" => {
+                let client = anthropic::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid Anthropic client");
+                Backend::Anthropic(client.completion_model(config.model.clone()))
+            }
+            "gemini" => {
+                let client = gemini::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid Gemini client");
+                Backend::Gemini(client.completion_model(config.model.clone()))
+            }
+            "mistral" => {
+                let client = mistral::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid Mistral client");
+                Backend::Mistral(client.completion_model(config.model.clone()))
+            }
+            "groq" => {
+                let client = groq::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid Groq client");
+                Backend::Groq(client.completion_model(config.model.clone()))
+            }
+            "xai" => {
+                let client = xai::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid xAI client");
+                Backend::Xai(client.completion_model(config.model.clone()))
+            }
+            "openrouter" => {
+                let client = openrouter::Client::builder()
+                    .api_key(key)
+                    .base_url(base)
+                    .build()
+                    .expect("valid OpenRouter client");
+                Backend::OpenRouter(client.completion_model(config.model.clone()))
+            }
+            "ollama" => {
+                // Ollama needs no key; an empty key means "no auth header".
+                let client = ollama::Client::builder()
+                    .api_key(String::new())
+                    .base_url(base)
+                    .build()
+                    .expect("valid Ollama client");
+                Backend::Ollama(client.completion_model(config.model.clone()))
+            }
+            other => panic!(
+                "no rig backend for provider '{other}' (config should have been rejected at load)"
+            ),
+        };
         Self {
-            backend: Backend::OpenAiCompatible(model),
-            model: config.model.clone(),
-        }
-    }
-
-    /// Anthropic Messages wire. The configured base URL is passed through;
-    /// rig normalizes it (stripping a `/v1/messages` suffix if present) and
-    /// appends the Messages path.
-    pub fn anthropic(config: &crate::config::Config) -> Self {
-        let client = anthropic::Client::builder()
-            .api_key(config.api_key.clone().unwrap_or_default())
-            .base_url(config.base_url.clone())
-            .build()
-            .expect("valid Anthropic client");
-        let model = client.completion_model(config.model.clone());
-        Self {
-            backend: Backend::Anthropic(model),
+            backend,
             model: config.model.clone(),
         }
     }
@@ -250,6 +315,12 @@ impl Backend {
         match self {
             Backend::OpenAiCompatible(m) => Box::pin(CompletionModel::stream(m, request)),
             Backend::Anthropic(m) => Box::pin(CompletionModel::stream(m, request)),
+            Backend::Gemini(m) => Box::pin(CompletionModel::stream(m, request)),
+            Backend::Mistral(m) => Box::pin(CompletionModel::stream(m, request)),
+            Backend::Groq(m) => Box::pin(CompletionModel::stream(m, request)),
+            Backend::Xai(m) => Box::pin(CompletionModel::stream(m, request)),
+            Backend::OpenRouter(m) => Box::pin(CompletionModel::stream(m, request)),
+            Backend::Ollama(m) => Box::pin(CompletionModel::stream(m, request)),
         }
     }
 }

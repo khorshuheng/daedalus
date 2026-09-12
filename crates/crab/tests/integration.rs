@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crab_core::config::{Config, ProviderKind};
+use crab_core::config::{provider_by_name, Config};
 use crab_core::provider::fake::FakeProvider;
 use crab_core::provider::{Message, Response, ToolCall};
 use crab_core::runtime::{AgentRuntime, RuntimeError};
@@ -29,7 +29,7 @@ fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
 
 fn config_for(dir: &Path, max_iterations: usize) -> Config {
     Config {
-        provider: ProviderKind::Fake,
+        provider: provider_by_name("fake").unwrap(),
         max_iterations,
         workspace: dir.to_path_buf(),
         ..Config::defaults(dir.to_path_buf())

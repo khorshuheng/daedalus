@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, ProviderKind};
+use crate::config::Config;
 
 /// A tool call requested by the model.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -101,12 +101,9 @@ pub trait Provider: Send + Sync {
 /// OpenAI chat-completions adapter (only base URL + model differ); Anthropic
 /// uses its own Messages client; `fake` is the scripted offline provider.
 pub fn from_config(config: &Config) -> Box<dyn Provider> {
-    match config.provider {
-        ProviderKind::Openai | ProviderKind::Deepseek => {
-            Box::new(rig::RigProvider::openai_compatible(config))
-        }
-        ProviderKind::Anthropic => Box::new(rig::RigProvider::anthropic(config)),
-        ProviderKind::Fake => Box::new(fake::FakeProvider::new(vec![])),
+    match config.provider.name {
+        "fake" => Box::new(fake::FakeProvider::new(vec![])),
+        _ => Box::new(rig::RigProvider::new(config)),
     }
 }
 
@@ -166,18 +163,10 @@ mod tests {
 
     #[test]
     fn from_config_builds_each_kind() {
-        for kind in [
-            ProviderKind::Openai,
-            ProviderKind::Deepseek,
-            ProviderKind::Anthropic,
-            ProviderKind::Fake,
-        ] {
+        for info in crate::config::PROVIDERS {
             let mut config = Config::defaults(std::env::temp_dir());
-            config.provider = kind;
+            config.provider = info;
             let p = from_config(&config);
-            let mut c2 = config.clone();
-            c2.provider = ProviderKind::Fake;
-            let _q = from_config(&c2);
             drop(p);
         }
     }

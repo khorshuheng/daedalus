@@ -48,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{Config, ProviderKind};
+use crate::config::{Config, EffortStyle, ProviderInfo};
 use crate::provider::{Message, Provider, Response};
 use crate::tools::resolver::ToolSet;
 use crate::workspace::Workspace;
@@ -126,19 +126,19 @@ impl fmt::Display for Effort {
 
 /// Hardcoded per-provider capability table (CRAB-116): maps a canonical
 /// effort level to the wire value the provider understands. No discovery.
-pub fn provider_effort(provider: ProviderKind, effort: Effort) -> serde_json::Value {
-    match provider {
-        ProviderKind::Openai | ProviderKind::Deepseek => match effort.openai_reasoning_effort() {
+pub fn provider_effort(provider: &ProviderInfo, effort: Effort) -> serde_json::Value {
+    match provider.effort {
+        EffortStyle::OpenaiEffort => match effort.openai_reasoning_effort() {
             Some(v) => serde_json::json!({ "reasoning_effort": v }),
             None => serde_json::json!({}),
         },
-        ProviderKind::Anthropic => match effort.anthropic_thinking_budget() {
+        EffortStyle::AnthropicThinking => match effort.anthropic_thinking_budget() {
             Some(budget) => serde_json::json!({
                 "thinking": { "type": "enabled", "budget_tokens": budget }
             }),
             None => serde_json::json!({ "thinking": { "type": "disabled" } }),
         },
-        ProviderKind::Fake => serde_json::json!({}),
+        EffortStyle::None => serde_json::json!({}),
     }
 }
 
@@ -577,7 +577,7 @@ impl AgentRuntime {
 
     /// The provider kind this runtime was built with (for /login and the
     /// model picker, CRAB-121).
-    pub fn provider_kind(&self) -> ProviderKind {
+    pub fn provider_kind(&self) -> &'static ProviderInfo {
         self.inner.config.provider
     }
 
@@ -1915,7 +1915,7 @@ mod accessor_tests {
         let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
         let tools = ToolSet::new(1000);
         let cfg = Config {
-            provider: ProviderKind::Anthropic,
+            provider: crate::config::provider_by_name("anthropic").unwrap(),
             max_iterations: 5,
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
@@ -1926,7 +1926,7 @@ mod accessor_tests {
             tools,
             ws,
         );
-        assert_eq!(rt.provider_kind(), ProviderKind::Anthropic);
+        assert_eq!(rt.provider_kind().name, "anthropic");
     }
 }
 #[cfg(test)]
@@ -1966,7 +1966,7 @@ mod effort_tests {
         let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
         let tools = ToolSet::new(1000);
         let cfg = Config {
-            provider: ProviderKind::Openai,
+            provider: crate::config::default_provider(),
             max_iterations: 5,
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())

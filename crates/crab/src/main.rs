@@ -17,7 +17,7 @@
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-use crab_core::config::{Config, PartialConfig, ProviderKind};
+use crab_core::config::{Config, PartialConfig};
 use crab_core::provider;
 use crab_core::runtime::AgentRuntime;
 use crab_core::session;
@@ -44,9 +44,10 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     dir: Option<PathBuf>,
 
-    /// openai | anthropic | deepseek | fake (default: openai).
+    /// Provider name from the registry (openai, anthropic, gemini, ollama,
+    /// …). Default: openai.
     #[arg(long, value_name = "NAME", value_parser = parse_provider)]
-    provider: Option<ProviderKind>,
+    provider: Option<&'static crab_core::config::ProviderInfo>,
 
     /// Model identifier (provider-specific default).
     #[arg(long, value_name = "NAME")]
@@ -71,8 +72,8 @@ struct Cli {
     mode: Option<Mode>,
 }
 
-fn parse_provider(s: &str) -> Result<ProviderKind, String> {
-    ProviderKind::parse(s)
+fn parse_provider(s: &str) -> Result<&'static crab_core::config::ProviderInfo, String> {
+    crab_core::config::provider_by_name(s)
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
@@ -94,7 +95,7 @@ impl Cli {
 
     fn flags(&self) -> PartialConfig {
         PartialConfig {
-            provider: self.provider,
+            provider: self.provider.map(|p| p.name.to_string()),
             model: self.model.clone(),
             max_iterations: self.max_iterations,
             ..Default::default()

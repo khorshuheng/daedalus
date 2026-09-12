@@ -7,96 +7,149 @@
 //! via `credential` (`--api-key` > provider-native env > OS keyring), so a
 //! secret can never be stored in the config file.
 //!
-//! Supported providers: `openai`, `anthropic`, `deepseek`. DeepSeek reuses the
-//! OpenAI-compatible client via its own base URL + model (see CRAB-103). The
-//! `provider` key selects the client implementation; unknown values fail fast
-//! listing the supported set.
+//! Supported providers: a registry (`PROVIDERS`) grown from the original
+//! `openai`/`anthropic`/`deepseek` set in CRAB-132 — provider + model +
+//! optional base URL are config-driven strings validated against the registry,
+//! and unknown values fail fast listing the supported set. The adapter
+//! (`provider/rig.rs`) maps each registry entry onto rig-core's client for
+//! that provider; adding a provider is one table row, no client code.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// The supported provider kinds. `Deepseek` is served through the same
-/// OpenAI-compatible wire client as `Openai` (only base URL + model differ).
+/// How a provider's canonical `Effort` level maps to wire parameters
+/// (CRAB-116). `None` = the provider gets no effort params (unsupported or
+/// unknown semantics — capability honesty over guesswork).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderKind {
-    Openai,
-    Anthropic,
-    Deepseek,
-    Fake,
+pub enum EffortStyle {
+    /// OpenAI `reasoning_effort` (OpenAI-family chat-completions wires).
+    OpenaiEffort,
+    /// Anthropic `thinking` block with a token budget.
+    AnthropicThinking,
+    /// No effort parameters.
+    None,
 }
 
-impl ProviderKind {
-    /// Parse a provider name from config/env/flags, failing fast on unknown
-    /// values with the list of supported providers.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "openai" => Ok(Self::Openai),
-            "anthropic" => Ok(Self::Anthropic),
-            "deepseek" => Ok(Self::Deepseek),
-            "fake" => Ok(Self::Fake),
-            other => Err(format!(
-                "unknown provider '{other}' (supported: openai, anthropic, deepseek, fake)"
-            )),
-        }
-    }
+/// One registry entry: the wire facts crab knows about a provider —
+/// endpoint, credential surface, and effort style. Deliberately **no model
+/// presets** (CRAB-132 decision): model catalogs go stale and local
+/// providers have no meaningful default — the user must choose a model.
+/// Adding a provider is a row here plus (if rig has a dedicated client) one
+/// match arm in the adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderInfo {
+    pub name: &'static str,
+    pub preset_base_url: &'static str,
+    /// Provider-native env var carrying the API key (CRAB-118). `None` for
+    /// local providers and the fake.
+    pub api_key_env: Option<&'static str>,
+    pub effort: EffortStyle,
+}
 
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Deepseek => "deepseek",
-            Self::Fake => "fake",
-        }
-    }
+/// The provider registry (CRAB-132). The first row is the default provider
+/// (`openai`) — used when no `provider` is configured.
+pub const PROVIDERS: &[ProviderInfo] = &[
+    ProviderInfo {
+        name: "openai",
+        preset_base_url: "https://api.openai.com",
+        api_key_env: Some("OPENAI_API_KEY"),
+        effort: EffortStyle::OpenaiEffort,
+    },
+    ProviderInfo {
+        name: "deepseek",
+        preset_base_url: "https://api.deepseek.com",
+        api_key_env: Some("DEEPSEEK_API_KEY"),
+        effort: EffortStyle::OpenaiEffort,
+    },
+    ProviderInfo {
+        name: "anthropic",
+        preset_base_url: "https://api.anthropic.com",
+        api_key_env: Some("ANTHROPIC_API_KEY"),
+        effort: EffortStyle::AnthropicThinking,
+    },
+    ProviderInfo {
+        name: "gemini",
+        preset_base_url: "https://generativelanguage.googleapis.com",
+        api_key_env: Some("GEMINI_API_KEY"),
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "mistral",
+        preset_base_url: "https://api.mistral.ai",
+        api_key_env: Some("MISTRAL_API_KEY"),
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "groq",
+        preset_base_url: "https://api.groq.com/openai/v1",
+        api_key_env: Some("GROQ_API_KEY"),
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "xai",
+        preset_base_url: "https://api.x.ai",
+        api_key_env: Some("XAI_API_KEY"),
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "openrouter",
+        preset_base_url: "https://openrouter.ai/api/v1",
+        api_key_env: Some("OPENROUTER_API_KEY"),
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "ollama",
+        preset_base_url: "http://localhost:11434",
+        api_key_env: None,
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "lmstudio",
+        preset_base_url: "http://localhost:1234",
+        api_key_env: None,
+        // Whatever model the user has loaded in LM Studio — no presets.
+        effort: EffortStyle::None,
+    },
+    ProviderInfo {
+        name: "fake",
+        preset_base_url: "",
+        api_key_env: None,
+        effort: EffortStyle::None,
+    },
+];
 
-    /// Default base URL for the provider preset.
-    pub fn preset_base_url(self) -> &'static str {
-        match self {
-            Self::Openai => "https://api.openai.com",
-            Self::Deepseek => "https://api.deepseek.com",
-            Self::Anthropic => "https://api.anthropic.com",
-            Self::Fake => "",
-        }
-    }
+/// Conservative context-window fallback (input tokens) used when the config
+/// does not set `max_context_tokens`. It is model-independent on purpose:
+/// crab does not know which model the user picked. Set `max_context_tokens`
+/// to match a larger model.
+pub const DEFAULT_CONTEXT_WINDOW: usize = 32_000;
 
-    /// Default model for the provider preset.
-    pub fn preset_model(self) -> &'static str {
-        match self {
-            Self::Openai => "gpt-4o-mini",
-            Self::Deepseek => "deepseek-chat",
-            Self::Anthropic => "claude-3-5-sonnet-latest",
-            Self::Fake => "fake-model",
-        }
-    }
+/// The default provider (`openai`, the first registry row).
+pub fn default_provider() -> &'static ProviderInfo {
+    &PROVIDERS[0]
+}
 
-    /// Default context-window size (input tokens) of the provider's default
-    /// model. Used to derive the history budget unless it is overridden.
-    pub fn preset_context_window(self) -> usize {
-        match self {
-            Self::Openai => 128_000,
-            Self::Deepseek => 64_000,
-            Self::Anthropic => 200_000,
-            Self::Fake => 128_000,
-        }
-    }
-
-    /// The provider-native environment variable that carries this provider's
-    /// API key (CRAB-118: secrets never live in the config file).
-    pub fn api_key_env(self) -> Option<&'static str> {
-        match self {
-            Self::Openai => Some("OPENAI_API_KEY"),
-            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
-            Self::Deepseek => Some("DEEPSEEK_API_KEY"),
-            Self::Fake => None,
-        }
-    }
+/// Look up a provider by name (case-insensitive), failing with the supported
+/// list — the registry is the single source of truth for valid names.
+pub fn provider_by_name(s: &str) -> Result<&'static ProviderInfo, String> {
+    let wanted = s.trim().to_ascii_lowercase();
+    PROVIDERS.iter().find(|p| p.name == wanted).ok_or_else(|| {
+        format!(
+            "unknown provider '{s}' (supported: {})",
+            PROVIDERS
+                .iter()
+                .map(|p| p.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 /// Fully-resolved configuration passed to the provider and the agent loop.
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub provider: ProviderKind,
+    pub provider: &'static ProviderInfo,
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
@@ -120,12 +173,18 @@ pub struct Config {
 impl Config {
     /// Built-in defaults, before any file/env/flag override.
     pub fn defaults(workspace: PathBuf) -> Self {
-        let provider = ProviderKind::Openai;
+        Self::from_provider(default_provider(), workspace)
+    }
+
+    /// Defaults derived from one provider's registry row. The model is
+    /// deliberately empty: choosing a model is the user's decision and is
+    /// enforced by [`PartialConfig::resolve`] (CRAB-132).
+    pub fn from_provider(provider: &'static ProviderInfo, workspace: PathBuf) -> Self {
         Self {
             provider,
-            base_url: provider.preset_base_url().to_string(),
+            base_url: provider.preset_base_url.to_string(),
             api_key: None,
-            model: provider.preset_model().to_string(),
+            model: String::new(),
             temperature: 0.7,
             max_iterations: 30,
             max_output_bytes: 32_000,
@@ -133,7 +192,7 @@ impl Config {
             timeout_secs: 60,
             max_retries: 2,
             // Leave headroom for the completion output (max_tokens).
-            max_context_tokens: provider.preset_context_window().saturating_sub(4_096),
+            max_context_tokens: DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096),
             workspace,
         }
     }
@@ -146,7 +205,7 @@ impl Config {
 /// secret can never be stored in the config file (CRAB-118).
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct PartialConfig {
-    pub provider: Option<ProviderKind>,
+    pub provider: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub temperature: Option<f32>,
@@ -190,14 +249,24 @@ impl PartialConfig {
         default_workspace: PathBuf,
         api_key: Option<String>,
     ) -> Result<Config, String> {
-        let provider = self.provider.unwrap_or(ProviderKind::Openai);
+        let provider = match self.provider.as_deref() {
+            Some(name) => provider_by_name(name)?,
+            None => default_provider(),
+        };
         // base_url defaults to the provider preset unless explicitly set.
         let base_url = self
             .base_url
-            .unwrap_or_else(|| provider.preset_base_url().to_string());
-        let model = self
-            .model
-            .unwrap_or_else(|| provider.preset_model().to_string());
+            .unwrap_or_else(|| provider.preset_base_url.to_string());
+        // CRAB-132: the model is the user's choice — there is no preset.
+        let model = match self.model.as_deref() {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => {
+                return Err(format!(
+                    "no model configured for provider '{}': set `model` in the config file or pass --model",
+                    provider.name
+                ))
+            }
+        };
         let workspace = self.workspace.unwrap_or(default_workspace);
 
         if workspace.as_os_str().is_empty() {
@@ -218,7 +287,7 @@ impl PartialConfig {
         }
         let max_context_tokens = self
             .max_context_tokens
-            .unwrap_or_else(|| provider.preset_context_window().saturating_sub(4_096));
+            .unwrap_or_else(|| DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096));
         if max_context_tokens == 0 {
             return Err("max_context_tokens must be >= 1".into());
         }
@@ -280,19 +349,12 @@ impl Config {
         }
         merged.overlay(&flags);
         // Resolve the API key against the final provider (flag > env > keyring).
-        let api_key = crate::credential::resolve_api_key(
-            merged.provider.unwrap_or(ProviderKind::Openai),
-            api_key_flag,
-        );
+        let info = match merged.provider.as_deref() {
+            Some(name) => provider_by_name(name)?,
+            None => default_provider(),
+        };
+        let api_key = crate::credential::resolve_api_key(info, api_key_flag);
         merged.resolve(default_workspace, api_key)
-    }
-}
-
-/// Deserialize `ProviderKind` from a lowercase string (config file / TOML).
-impl<'de> serde::Deserialize<'de> for ProviderKind {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(d)?;
-        ProviderKind::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -311,32 +373,46 @@ mod tests {
 
     #[test]
     fn defaults() {
-        let c = load(ws(), None, PartialConfig::default()).unwrap();
-        assert_eq!(c.provider, ProviderKind::Openai);
-        assert_eq!(c.base_url, "https://api.openai.com");
-        assert_eq!(c.api_key, None);
-        assert_eq!(c.max_iterations, 30);
-        assert_eq!(c.max_context_tokens, 128_000 - 4_096);
-    }
-
-    #[test]
-    fn deepseek_preset_applies_base_url_and_model() {
         let flags = PartialConfig {
-            provider: Some(ProviderKind::Deepseek),
+            model: Some("test-model".into()),
             ..Default::default()
         };
         let c = load(ws(), None, flags).unwrap();
-        assert_eq!(c.provider, ProviderKind::Deepseek);
+        assert_eq!(c.provider.name, "openai");
+        assert_eq!(c.base_url, "https://api.openai.com");
+        assert_eq!(c.api_key, None);
+        assert_eq!(c.max_iterations, 30);
+        assert_eq!(c.max_context_tokens, DEFAULT_CONTEXT_WINDOW - 4_096);
+    }
+
+    #[test]
+    fn missing_model_fails_with_guidance() {
+        // CRAB-132: the model is the user's choice — there is no preset.
+        let err = load(ws(), None, PartialConfig::default()).unwrap_err();
+        assert!(err.contains("no model configured"), "{err}");
+        assert!(err.contains("openai"), "{err}");
+    }
+
+    #[test]
+    fn deepseek_preset_applies_base_url() {
+        let flags = PartialConfig {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-chat".into()),
+            ..Default::default()
+        };
+        let c = load(ws(), None, flags).unwrap();
+        assert_eq!(c.provider.name, "deepseek");
         assert_eq!(c.base_url, "https://api.deepseek.com");
         assert_eq!(c.model, "deepseek-chat");
-        assert_eq!(c.max_context_tokens, 64_000 - 4_096);
+        assert_eq!(c.max_context_tokens, DEFAULT_CONTEXT_WINDOW - 4_096);
     }
 
     #[test]
     fn explicit_base_url_wins_over_preset() {
         let flags = PartialConfig {
-            provider: Some(ProviderKind::Deepseek),
+            provider: Some("deepseek".into()),
             base_url: Some("http://localhost:9000".into()),
+            model: Some("m".into()),
             ..Default::default()
         };
         let c = load(ws(), None, flags).unwrap();
@@ -345,8 +421,8 @@ mod tests {
 
     #[test]
     fn unknown_provider_fails() {
-        let err = ProviderKind::parse("wat").unwrap_err();
-        assert!(err.contains("openai, anthropic, deepseek"));
+        let err = provider_by_name("wat").unwrap_err();
+        assert!(err.contains("openai") && err.contains("ollama"));
     }
 
     #[test]
@@ -386,7 +462,7 @@ mod tests {
         )
         .unwrap();
         let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
-        assert_eq!(c.provider, ProviderKind::Anthropic);
+        assert_eq!(c.provider.name, "anthropic");
         assert_eq!(c.base_url, "https://api.anthropic.com");
         assert_eq!(c.model, "claude-x");
         assert_eq!(c.max_iterations, 7);
