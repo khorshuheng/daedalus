@@ -9,15 +9,17 @@
 //! cannot run away the way `grep -r ~` did.
 //!
 //! The argument set mirrors ripgrep's common flags (`-i/-S/-F/-w/-v/-l/-c/-C/
-//! -A/-B/-m/-g/-t/--hidden/--no-ignore/-L/-o`).
+//! -A/-B/-m/-g/-t/-I/-N/-o/-r/--hidden/--no-ignore/-L`), plus `offset`/`unique`/
+//! `total_count` for the `rg | sed -n 'A,Bp'`, `rg | sort -u` and `rg | wc -l`
+//! idioms.
 
 use futures::future::BoxFuture;
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
-use ignore::WalkBuilder;
+use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
@@ -28,8 +30,8 @@ use crate::workspace::Workspace;
 const DEFAULT_MAX_RESULTS: usize = 100;
 /// Hard ceiling on `max_results`.
 const HARD_MAX_RESULTS: usize = 1_000;
-/// A single matched/context line is clipped to this many characters.
-const MAX_LINE_DISPLAY: usize = 200;
+/// Default clip for a matched/context line (`max_columns` overrides it).
+const DEFAULT_MAX_COLUMNS: usize = 200;
 /// Files larger than this are skipped (matches `read`'s whole-read threshold).
 const MAX_SEARCH_FILE: u64 = 4 * 1024 * 1024;
 /// Total bytes read across all files before the search stops.
@@ -62,12 +64,21 @@ impl Tool for SearchTool {
                 "word": { "type": "boolean", "description": "Match whole words only (rg -w)." },
                 "invert": { "type": "boolean", "description": "Select lines that do NOT match (rg -v)." },
                 "only_matching": { "type": "boolean", "description": "Print only the matched text, one per occurrence (rg -o)." },
+                "replace": { "type": "string", "description": "Replace matches in the output with this template, using $1/${name} capture refs (rg -r)." },
                 "files_with_matches": { "type": "boolean", "description": "Print only paths with at least one match (rg -l)." },
                 "count": { "type": "boolean", "description": "Print a per-file match count (rg -c)." },
+                "total_count": { "type": "boolean", "description": "Print only the total number of matches, like `rg | wc -l`." },
                 "context": { "type": "integer", "minimum": 0, "description": "Lines of context before and after a match (rg -C)." },
                 "after_context": { "type": "integer", "minimum": 0, "description": "Lines of context after a match (rg -A)." },
                 "before_context": { "type": "integer", "minimum": 0, "description": "Lines of context before a match (rg -B)." },
                 "max_count": { "type": "integer", "minimum": 1, "description": "Stop after this many matches per file (rg -m)." },
+                "offset": { "type": "integer", "minimum": 0, "description": "Skip the first N result records before returning any, for paging (`rg | sed -n 'A,Bp'`)." },
+                "unique": { "type": "boolean", "description": "Drop duplicate result lines, like `rg | sort -u`." },
+                "no_filename": { "type": "boolean", "description": "Omit the file path prefix (rg -I)." },
+                "no_line_number": { "type": "boolean", "description": "Omit line numbers (rg -N)." },
+                "sort": { "type": "string", "description": "Sort results by: none (default), path, modified, accessed, or created (rg --sort). Sorting buffers the file list." },
+                "sort_reverse": { "type": "boolean", "description": "Reverse the sort order (rg --sortr)." },
+                "max_columns": { "type": "integer", "minimum": 1, "description": "Clip each displayed line to this many characters (rg -M; default 200)." },
                 "hidden": { "type": "boolean", "description": "Also search hidden files and directories (rg --hidden)." },
                 "no_ignore": { "type": "boolean", "description": "Do not respect .gitignore/.ignore (rg --no-ignore)." },
                 "follow": { "type": "boolean", "description": "Follow symbolic links (rg -L)." },
@@ -96,7 +107,7 @@ impl Tool for SearchTool {
     }
 }
 
-/// Options that shape one file's output.
+/// Options that shape the output.
 struct Opts {
     invert: bool,
     files_with_matches: bool,
@@ -105,15 +116,11 @@ struct Opts {
     before: usize,
     after: usize,
     max_count: Option<usize>,
-}
-
-/// The rendered result for one file.
-struct FileOutcome {
-    output: String,
-    /// Result records produced (match lines, occurrences, or one per file).
-    emitted: usize,
-    /// A cap was reached, so the walk should stop.
-    hit_cap: bool,
+    offset: usize,
+    replace: Option<String>,
+    no_filename: bool,
+    no_line_number: bool,
+    max_columns: usize,
 }
 
 fn get_bool(args: &Value, key: &str) -> bool {
@@ -140,17 +147,28 @@ fn get_globs(args: &Value) -> Result<Vec<String>, ToolError> {
 }
 
 /// Clip a line for display, char-boundary safe.
-fn clip(s: &str) -> String {
-    let mut out: String = s.chars().take(MAX_LINE_DISPLAY).collect();
-    if s.chars().count() > MAX_LINE_DISPLAY {
+fn clip(s: &str, max_columns: usize) -> String {
+    let mut out: String = s.chars().take(max_columns).collect();
+    if s.chars().count() > max_columns {
         out.push('…');
     }
     out
 }
 
-/// Emit rg's `--` separator when the next line is not adjacent to the last one.
-/// Only used when context is requested (rg omits it otherwise).
-fn group_sep(out: &mut String, last: &mut Option<usize>, next: usize, enabled: bool) {
+/// Prefix for a result line, honoring `-I`/`-N`. `:` separates a match, `-` a
+/// context line (rg's convention).
+fn prefix(display: &str, line_no: usize, opts: &Opts, is_context: bool) -> String {
+    let sep = if is_context { '-' } else { ':' };
+    match (opts.no_filename, opts.no_line_number) {
+        (false, false) => format!("{display}{sep}{line_no}{sep}"),
+        (false, true) => format!("{display}{sep}"),
+        (true, false) => format!("{line_no}{sep}"),
+        (true, true) => String::new(),
+    }
+}
+
+/// rg's `--` separator between non-contiguous groups, only with context.
+fn maybe_sep(out: &mut String, last: &mut Option<usize>, next: usize, enabled: bool) {
     if !enabled {
         return;
     }
@@ -159,6 +177,41 @@ fn group_sep(out: &mut String, last: &mut Option<usize>, next: usize, enabled: b
             out.push_str("--\n");
         }
     }
+}
+
+/// Matching lines (or occurrences) in one file, used for `-c` and
+/// `total_count`.
+fn count_matches(
+    re: &Regex,
+    text: &str,
+    invert: bool,
+    only_matching: bool,
+    max: Option<usize>,
+) -> usize {
+    let mut n = 0usize;
+    for line in text.lines() {
+        if re.is_match(line) != invert {
+            n += 1;
+            if let Some(m) = max {
+                if n >= m {
+                    break;
+                }
+            }
+        }
+    }
+    if only_matching && !invert {
+        let mut occ = 0usize;
+        for line in text.lines() {
+            occ += re.find_iter(line).count();
+            if let Some(m) = max {
+                if occ >= m {
+                    return occ;
+                }
+            }
+        }
+        return occ;
+    }
+    n
 }
 
 impl SearchTool {
@@ -176,6 +229,14 @@ impl SearchTool {
         let hidden = get_bool(args, "hidden");
         let no_ignore = get_bool(args, "no_ignore");
         let follow = get_bool(args, "follow");
+        let total_count = get_bool(args, "total_count");
+        let unique = get_bool(args, "unique");
+        let sort = args
+            .get("sort")
+            .and_then(Value::as_str)
+            .unwrap_or("none")
+            .to_ascii_lowercase();
+        let sort_reverse = get_bool(args, "sort_reverse");
 
         let context = arg_usize(args, "context")?.unwrap_or(0);
         let opts = Opts {
@@ -186,6 +247,16 @@ impl SearchTool {
             before: arg_usize(args, "before_context")?.unwrap_or(context),
             after: arg_usize(args, "after_context")?.unwrap_or(context),
             max_count: arg_usize(args, "max_count")?,
+            offset: arg_usize(args, "offset")?.unwrap_or(0),
+            replace: args
+                .get("replace")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            no_filename: get_bool(args, "no_filename"),
+            no_line_number: get_bool(args, "no_line_number"),
+            max_columns: arg_usize(args, "max_columns")?
+                .unwrap_or(DEFAULT_MAX_COLUMNS)
+                .clamp(1, 10_000),
         };
         let max_results = arg_usize(args, "max_results")?
             .unwrap_or(DEFAULT_MAX_RESULTS)
@@ -259,13 +330,46 @@ impl SearchTool {
         }
 
         let mut out = String::new();
-        let mut emitted = 0usize;
+        let mut seen = 0usize; // records seen (pre-offset), across files
+        let mut emitted = 0usize; // records emitted, across files
+        let mut total = 0usize; // total_count accumulator
         let mut scanned = 0u64;
         let mut skipped_binary = 0usize;
         let mut skipped_large = 0usize;
         let mut truncated = false;
 
-        'walk: for result in wb.build() {
+        // `--sort` buffers the (ignore-filtered) file list; otherwise stream.
+        let entries: Box<dyn Iterator<Item = Result<DirEntry, IgnoreError>> + '_> =
+            match sort.as_str() {
+                "none" | "" => Box::new(wb.build()),
+                "path" => {
+                    let mut v: Vec<DirEntry> = wb.build().filter_map(Result::ok).collect();
+                    v.sort_by(|a, b| a.path().cmp(b.path()));
+                    if sort_reverse {
+                        v.reverse();
+                    }
+                    Box::new(v.into_iter().map(Ok))
+                }
+                "modified" | "accessed" | "created" => {
+                    let mut v: Vec<DirEntry> = wb.build().filter_map(Result::ok).collect();
+                    v.sort_by_key(|e| match sort.as_str() {
+                        "modified" => e.metadata().ok().and_then(|m| m.modified().ok()),
+                        "accessed" => e.metadata().ok().and_then(|m| m.accessed().ok()),
+                        _ => e.metadata().ok().and_then(|m| m.created().ok()),
+                    });
+                    if sort_reverse {
+                        v.reverse();
+                    }
+                    Box::new(v.into_iter().map(Ok))
+                }
+                other => {
+                    return Err(ToolError::Argument(format!(
+                        "unknown sort '{other}' (none|path|modified|accessed|created)"
+                    )))
+                }
+            };
+
+        'walk: for result in entries {
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
@@ -303,26 +407,58 @@ impl SearchTool {
                 .display()
                 .to_string();
 
+            if total_count {
+                total += count_matches(&re, &text, opts.invert, opts.only_matching, opts.max_count);
+                continue;
+            }
+
             let match_budget = max_results.saturating_sub(emitted);
             let out_budget = self.max_output.saturating_sub(out.len());
-            let outcome = render_file(&re, &display, &text, &opts, match_budget, out_budget);
-            if !outcome.output.is_empty() {
-                out.push_str(&outcome.output);
-            }
-            emitted += outcome.emitted;
-            if outcome.hit_cap || emitted >= max_results {
+            let (file_out, hit_cap) = render_file(
+                &re,
+                &display,
+                &text,
+                &opts,
+                &mut seen,
+                &mut emitted,
+                match_budget,
+                out_budget,
+            );
+            out.push_str(&file_out);
+            // `hit_cap` is set only when a further result existed but was not
+            // emitted, so the truncation note is accurate.
+            if hit_cap {
                 truncated = true;
                 break 'walk;
             }
         }
 
-        if out.is_empty() {
+        if total_count {
             return Ok(ToolOutput {
-                content: format!("no matches for '{pattern}'"),
+                content: total.to_string(),
             });
         }
 
         let mut content = out.trim_end().to_string();
+        if unique {
+            let mut deduped = String::new();
+            let mut seen_lines: HashSet<&str> = HashSet::new();
+            for line in content.lines() {
+                if line == "--" {
+                    continue;
+                }
+                if seen_lines.insert(line) {
+                    deduped.push_str(line);
+                    deduped.push('\n');
+                }
+            }
+            content = deduped.trim_end().to_string();
+        }
+        if content.is_empty() {
+            return Ok(ToolOutput {
+                content: format!("no matches for '{pattern}'"),
+            });
+        }
         if truncated {
             content.push_str(&format!(
                 "\n\n[truncated at {emitted} results; narrow the pattern, add a glob/type, or raise max_results]"
@@ -338,100 +474,122 @@ impl SearchTool {
     }
 }
 
-/// Render one file's matches/context. `match_budget` caps result records and
-/// `out_budget` caps bytes; reaching either sets `hit_cap`.
+/// Render one file. `seen`/`emitted` are global counters; `match_budget`/`out_budget`
+/// bound this call. Returns the file's output and whether a cap was hit.
+#[allow(clippy::too_many_arguments)]
 fn render_file(
     re: &Regex,
     display: &str,
     text: &str,
     opts: &Opts,
+    seen: &mut usize,
+    emitted: &mut usize,
     match_budget: usize,
     out_budget: usize,
-) -> FileOutcome {
+) -> (String, bool) {
     let mut out = String::new();
-    let mut emitted = 0usize;
-    let mut hit_cap = false;
 
     // `-l` and `-c` emit one record per matched file.
     if opts.files_with_matches || opts.count {
-        let mut n = 0usize;
-        for line in text.lines() {
-            if re.is_match(line) != opts.invert {
-                n += 1;
-            }
+        let n = count_matches(re, text, opts.invert, false, None);
+        if n == 0 {
+            return (out, false);
         }
-        if n > 0 {
-            if emitted >= match_budget || out.len() >= out_budget {
-                hit_cap = true;
-            } else if opts.files_with_matches {
+        let idx = *seen;
+        *seen += 1;
+        if idx >= opts.offset {
+            if *emitted >= match_budget || out.len() >= out_budget {
+                return (out, true);
+            }
+            if opts.files_with_matches {
                 out.push_str(display);
-                out.push('\n');
-                emitted += 1;
             } else {
-                out.push_str(&format!("{display}:{n}\n"));
-                emitted += 1;
+                out.push_str(&format!("{display}:{n}"));
             }
+            out.push('\n');
+            *emitted += 1;
         }
-        return FileOutcome {
-            output: out,
-            emitted,
-            hit_cap,
-        };
+        return (out, false);
     }
 
     let mut before: VecDeque<(usize, String)> = VecDeque::new();
     let mut after_remaining = 0usize;
     let mut last_emitted: Option<usize> = None;
-    // rg prints `--` between non-contiguous groups only with context.
+    let mut file_matches = 0usize;
     let separators = opts.before > 0 || opts.after > 0;
 
-    for (idx, line) in text.lines().enumerate() {
-        let line_no = idx + 1;
+    for (i, line) in text.lines().enumerate() {
+        let line_no = i + 1;
         let is_match = re.is_match(line) != opts.invert;
         if is_match {
+            file_matches += 1;
             if let Some(mc) = opts.max_count {
-                if emitted >= mc {
+                if file_matches > mc {
                     break;
                 }
             }
-            if opts.before > 0 {
-                for (n, t) in before.drain(..) {
-                    group_sep(&mut out, &mut last_emitted, n, separators);
-                    out.push_str(&format!("{display}-{n}-{}\n", clip(&t)));
-                    last_emitted = Some(n);
-                }
-            } else {
-                before.clear();
-            }
+            // Records for this line: one per occurrence in `-o` mode, else one.
             let records: Vec<String> = if opts.only_matching {
-                re.find_iter(line).map(|m| m.as_str().to_string()).collect()
+                re.find_iter(line)
+                    .map(|m| match &opts.replace {
+                        Some(r) => re.replace_all(m.as_str(), r.as_str()).to_string(),
+                        None => m.as_str().to_string(),
+                    })
+                    .collect()
             } else {
-                vec![line.to_string()]
+                vec![match &opts.replace {
+                    Some(r) => re.replace_all(line, r.as_str()).to_string(),
+                    None => line.to_string(),
+                }]
             };
-            for record in records {
-                if emitted >= match_budget || out.len() >= out_budget {
-                    hit_cap = true;
-                    break;
+            let base = *seen;
+            *seen += records.len();
+            let mut emitted_any = false;
+            for (j, record) in records.iter().enumerate() {
+                if base + j < opts.offset {
+                    continue;
                 }
-                group_sep(&mut out, &mut last_emitted, line_no, separators);
-                out.push_str(&format!("{display}:{line_no}:{}\n", clip(&record)));
+                if !emitted_any {
+                    if opts.before > 0 {
+                        for (n, t) in before.drain(..) {
+                            if *emitted >= match_budget || out.len() >= out_budget {
+                                return (out, true);
+                            }
+                            maybe_sep(&mut out, &mut last_emitted, n, separators);
+                            out.push_str(&prefix(display, n, opts, true));
+                            out.push_str(&clip(&t, opts.max_columns));
+                            out.push('\n');
+                            last_emitted = Some(n);
+                            *emitted += 1;
+                        }
+                    } else {
+                        before.clear();
+                    }
+                    emitted_any = true;
+                }
+                if *emitted >= match_budget || out.len() >= out_budget {
+                    return (out, true);
+                }
+                maybe_sep(&mut out, &mut last_emitted, line_no, separators);
+                out.push_str(&prefix(display, line_no, opts, false));
+                out.push_str(&clip(record, opts.max_columns));
+                out.push('\n');
                 last_emitted = Some(line_no);
-                emitted += 1;
+                *emitted += 1;
             }
-            if hit_cap {
-                break;
-            }
-            if !opts.only_matching {
+            if emitted_any {
                 after_remaining = opts.after;
             }
         } else if after_remaining > 0 {
             if out.len() >= out_budget {
-                hit_cap = true;
-                break;
+                return (out, true);
             }
-            group_sep(&mut out, &mut last_emitted, line_no, separators);
-            out.push_str(&format!("{display}-{line_no}-{}\n", clip(line)));
+            maybe_sep(&mut out, &mut last_emitted, line_no, separators);
+            out.push_str(&prefix(display, line_no, opts, true));
+            out.push_str(&clip(line, opts.max_columns));
+            out.push('\n');
             last_emitted = Some(line_no);
+            *emitted += 1;
             after_remaining -= 1;
         } else if opts.before > 0 {
             before.push_back((line_no, line.to_string()));
@@ -441,11 +599,7 @@ fn render_file(
         }
     }
 
-    FileOutcome {
-        output: out,
-        emitted,
-        hit_cap,
-    }
+    (out, false)
 }
 
 #[cfg(test)]
@@ -487,7 +641,6 @@ mod tests {
         write(dir.path(), "visible.txt", "needle\n");
         write(dir.path(), ".cache/hidden.txt", "needle\n");
         write(dir.path(), "target/built.txt", "needle\n");
-        // `ignore` only applies .gitignore inside a git repo.
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".gitignore"), "target/\n").unwrap();
         let out = run(&ws, json!({"pattern": "needle"})).await.unwrap();
@@ -623,6 +776,129 @@ mod tests {
         let out = run(&ws, json!({"pattern": "needle"})).await.unwrap();
         assert!(out.content.contains("a.txt"));
         assert!(!out.content.contains("bin.dat"));
+    }
+
+    #[tokio::test]
+    async fn offset_pages_results() {
+        let (ws, dir) = setup("offset");
+        write(dir.path(), "a.txt", "m1\nm2\nm3\nm4\nm5\n");
+        let out = run(&ws, json!({"pattern": "^m", "offset": 1, "max_results": 2}))
+            .await
+            .unwrap();
+        // The two requested records first, then the (accurate) truncation note.
+        assert!(
+            out.content.starts_with("a.txt:2:m2\na.txt:3:m3"),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("m1"), "{}", out.content);
+        assert!(!out.content.contains("m4"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn replace_rewrites_matches() {
+        let (ws, dir) = setup("replace");
+        write(dir.path(), "a.txt", "foo=1\nbar=2\n");
+        let out = run(
+            &ws,
+            json!({"pattern": r"(\w+)=(\d+)", "replace": "$2 -> $1"}),
+        )
+        .await
+        .unwrap();
+        assert!(out.content.contains("a.txt:1:1 -> foo"), "{}", out.content);
+        assert!(out.content.contains("a.txt:2:2 -> bar"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn no_filename_and_no_line_number() {
+        let (ws, dir) = setup("plain");
+        write(dir.path(), "a.txt", "match here\n");
+        let out = run(
+            &ws,
+            json!({"pattern": "here", "no_filename": true, "no_line_number": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.content, "match here");
+        let out = run(&ws, json!({"pattern": "here", "no_line_number": true}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "a.txt:match here");
+    }
+
+    #[tokio::test]
+    async fn unique_dedupes_occurrences() {
+        let (ws, dir) = setup("unique");
+        write(dir.path(), "a.txt", "foo\nfoo\nbar\n");
+        let out = run(&ws, json!({"pattern": "foo", "only_matching": true}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "a.txt:1:foo\na.txt:2:foo");
+        let out = run(
+            &ws,
+            json!({"pattern": "foo", "only_matching": true, "no_filename": true, "no_line_number": true, "unique": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.content, "foo");
+    }
+
+    #[tokio::test]
+    async fn total_count_returns_a_number() {
+        let (ws, dir) = setup("total");
+        write(dir.path(), "a.txt", "x\nx\n");
+        write(dir.path(), "b.txt", "x\n");
+        let out = run(&ws, json!({"pattern": "x", "total_count": true}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "3");
+    }
+
+    #[tokio::test]
+    async fn max_columns_clips_long_lines() {
+        let (ws, dir) = setup("cols");
+        write(
+            dir.path(),
+            "a.txt",
+            &format!("needle {}\n", "z".repeat(500)),
+        );
+        let out = run(&ws, json!({"pattern": "needle", "max_columns": 20}))
+            .await
+            .unwrap();
+        let line = out.content.lines().next().unwrap();
+        // 20 chars of content plus the "…" marker.
+        let text = line.splitn(3, ':').nth(2).unwrap();
+        assert!(text.ends_with('…'), "{line}");
+        assert_eq!(text.chars().count(), 21, "{line}");
+    }
+
+    #[tokio::test]
+    async fn sorts_by_path_and_reverse() {
+        let (ws, dir) = setup("sort");
+        write(dir.path(), "b.txt", "x\n");
+        write(dir.path(), "a.txt", "x\n");
+        write(dir.path(), "c.txt", "x\n");
+        let out = run(&ws, json!({"pattern": "x", "sort": "path"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "a.txt:1:x\nb.txt:1:x\nc.txt:1:x");
+        let out = run(
+            &ws,
+            json!({"pattern": "x", "sort": "path", "sort_reverse": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.content, "c.txt:1:x\nb.txt:1:x\na.txt:1:x");
+    }
+
+    #[tokio::test]
+    async fn unknown_sort_is_rejected() {
+        let (ws, dir) = setup("badsort");
+        write(dir.path(), "a.txt", "x\n");
+        let err = run(&ws, json!({"pattern": "x", "sort": "sideways"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Argument(_)), "{err:?}");
     }
 
     #[tokio::test]
