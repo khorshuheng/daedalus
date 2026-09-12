@@ -232,7 +232,7 @@ mod tests {
     use super::*;
     use crab_core::config::Config;
     use crab_core::provider::Message;
-    use crab_core::provider::{Provider, ProviderError, Response};
+    use crab_core::provider::{Provider, ProviderError, Response, StreamDelta};
     use crab_core::runtime::AgentRuntime;
     use crab_core::tools::resolver::ToolSet;
     use crab_core::workspace::Workspace;
@@ -251,7 +251,7 @@ mod tests {
             _tools: &'a [serde_json::Value],
             _effort_params: &'a serde_json::Value,
             _cancel: tokio_util::sync::CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
         ) -> futures::future::BoxFuture<'a, Result<crab_core::provider::Completion, ProviderError>>
         {
             Box::pin(async move {

@@ -82,10 +82,11 @@ pub enum ProviderError {
 /// `complete` is async (CRAB-130) but the trait stays object-safe: it returns
 /// a boxed future rather than using `async_trait`. `cancel` is checked
 /// between streamed chunks (via `select!`); when cancelled, the request is
-/// aborted and `Completion.aborted` is set. `on_text` receives text deltas as
-/// they stream in. `effort_params` carries the provider-flavored wire
-/// parameters for the current thinking level (`provider_effort`, CRAB-116) —
-/// an empty object means "nothing to add".
+/// aborted and `Completion.aborted` is set. `on_delta` receives streamed
+/// fragments — assistant text and, for providers that surface it, model
+/// reasoning (`StreamDelta`, CRAB-139). `effort_params` carries the
+/// provider-flavored wire parameters for the current thinking level
+/// (`provider_effort`, CRAB-116) — an empty object means "nothing to add".
 pub trait Provider: Send + Sync {
     fn complete<'a>(
         &'a self,
@@ -93,8 +94,17 @@ pub trait Provider: Send + Sync {
         tools: &'a [Value],
         effort_params: &'a Value,
         cancel: CancellationToken,
-        on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
     ) -> BoxFuture<'a, Result<Completion, ProviderError>>;
+}
+
+/// A streamed fragment of a completion: assistant `Text` or model `Thinking`
+/// (reasoning). Providers that do not surface reasoning only emit `Text`
+/// (CRAB-139).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamDelta {
+    Text(String),
+    Thinking(String),
 }
 
 /// Build the provider selected by `config`. OpenAI and DeepSeek share the

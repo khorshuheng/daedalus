@@ -294,7 +294,7 @@ fn cli_unknown_mode_fails() {
 /// adapter into the runtime's `usage` event (context budgeting's anchor).
 #[test]
 fn usage_event_carries_provider_reported_prompt_tokens() {
-    use crab_core::provider::{Completion, Provider, ProviderError};
+    use crab_core::provider::{Completion, Provider, ProviderError, StreamDelta};
     use std::sync::Mutex;
 
     struct TokenReporter;
@@ -305,7 +305,7 @@ fn usage_event_carries_provider_reported_prompt_tokens() {
             _tools: &'a [serde_json::Value],
             _effort_params: &'a serde_json::Value,
             _cancel: tokio_util::sync::CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
         ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
             Box::pin(async {
                 Ok(Completion {

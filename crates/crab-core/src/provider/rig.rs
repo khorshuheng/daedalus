@@ -12,11 +12,14 @@
 //! - Effort/thinking wire parameters (`provider_effort`, CRAB-116) flow into
 //!   the request via `additional_params`.
 
+use std::collections::HashSet;
+
 use futures::StreamExt;
 use rig_core::client::CompletionClient;
 use rig_core::completion::message::ToolCall as RigToolCall;
 use rig_core::completion::message::{
-    AssistantContent, Text, ToolCallId, ToolFunction, ToolResult, ToolResultContent, UserContent,
+    AssistantContent, Reasoning, ReasoningContent, Text, ToolCallId, ToolFunction, ToolResult,
+    ToolResultContent, UserContent,
 };
 use rig_core::completion::{
     CompletionError, CompletionModel, CompletionRequest, FinishReason, ToolDefinition,
@@ -28,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     is_quota_or_billing, is_transient_status, map_status_error, Completion, Message, Provider,
-    ProviderError, Response, ToolCall,
+    ProviderError, Response, StreamDelta, ToolCall,
 };
 
 /// How many times a transient failure is retried with exponential backoff
@@ -337,6 +340,21 @@ fn tool_name_for_call(history: &[Message], tool_call_id: &str) -> Option<String>
     })
 }
 
+/// The displayable text of a rig reasoning block: concatenated `Text` and
+/// `Summary` content. Encrypted and redacted payloads carry no displayable
+/// text (CRAB-139).
+fn reasoning_text(reasoning: &Reasoning) -> String {
+    let mut out = String::new();
+    for content in &reasoning.content {
+        match content {
+            ReasoningContent::Text { text, .. } => out.push_str(text),
+            ReasoningContent::Summary(summary) => out.push_str(summary),
+            ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => {}
+        }
+    }
+    out
+}
+
 impl Provider for RigProvider {
     fn complete<'a>(
         &'a self,
@@ -344,7 +362,7 @@ impl Provider for RigProvider {
         tools: &'a [Value],
         effort_params: &'a Value,
         cancel: CancellationToken,
-        on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
     ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
         Box::pin(async move {
             let request = self.build_request(history, tools, effort_params);
@@ -355,6 +373,9 @@ impl Provider for RigProvider {
             let mut truncated = false;
             let mut prompt_tokens: Option<usize> = None;
             let mut aborted = false;
+            // rig correlator ids whose reasoning deltas already streamed, so
+            // the superseding complete `Reasoning` block is not emitted twice.
+            let mut seen_reasoning: HashSet<String> = HashSet::new();
 
             loop {
                 let item = tokio::select! {
@@ -369,8 +390,24 @@ impl Provider for RigProvider {
                 let Some(item) = item else { break };
                 match item {
                     Ok(StreamedAssistantContent::Text(Text { text: t, .. })) => {
-                        on_text(&t);
                         text.push_str(&t);
+                        on_delta(StreamDelta::Text(t));
+                    }
+                    Ok(StreamedAssistantContent::ReasoningDelta { id, reasoning, .. }) => {
+                        if !reasoning.is_empty() {
+                            seen_reasoning.insert(id);
+                            on_delta(StreamDelta::Thinking(reasoning));
+                        }
+                    }
+                    Ok(StreamedAssistantContent::Reasoning { reasoning, id }) => {
+                        // The complete block supersedes its deltas, so emit it
+                        // only when nothing streamed for this correlator.
+                        if !seen_reasoning.contains(&id) {
+                            let thinking = reasoning_text(&reasoning);
+                            if !thinking.is_empty() {
+                                on_delta(StreamDelta::Thinking(thinking));
+                            }
+                        }
                     }
                     Ok(StreamedAssistantContent::Final(final_record)) => {
                         if final_record
@@ -391,8 +428,7 @@ impl Provider for RigProvider {
                             args: tool_call.function.arguments.clone(),
                         });
                     }
-                    // Partial tool-call fragments precede the complete call;
-                    // reasoning deltas are not surfaced to the UI today.
+                    // Partial tool-call fragments and other unmodeled items.
                     Ok(_) => {}
                     Err(e) => return Err(Self::map_error(&e).0),
                 }
@@ -425,6 +461,24 @@ impl Provider for RigProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_text_concatenates_text_and_summary() {
+        use rig_core::completion::message::{Reasoning, ReasoningContent};
+        assert_eq!(reasoning_text(&Reasoning::new("plain")), "plain");
+        let r = Reasoning {
+            id: None,
+            content: vec![
+                ReasoningContent::Summary("sum".into()),
+                ReasoningContent::Text {
+                    text: " txt".into(),
+                    signature: None,
+                },
+                ReasoningContent::Encrypted("opaque".into()),
+            ],
+        };
+        assert_eq!(reasoning_text(&r), "sum txt");
+    }
 
     #[test]
     fn tool_names_resolve_from_the_issuing_assistant_message() {

@@ -227,6 +227,8 @@ impl TranscriptScroll {
 pub enum TranscriptLine {
     User(String),
     Assistant(String),
+    /// Streamed model reasoning (CRAB-139), rendered dim and italic.
+    Thinking(String),
     Tool(String),
     Notice(String),
 }
@@ -237,6 +239,8 @@ pub enum TranscriptLine {
 pub struct UiModel {
     pub transcript: Vec<TranscriptLine>,
     pub assistant_buf: String,
+    /// Streamed model reasoning, flushed as a `Thinking` line (CRAB-139).
+    pub thinking_buf: String,
     pub state: RuntimeState,
     pub usage: Option<usize>,
     pub iterations: usize,
@@ -251,6 +255,7 @@ impl UiModel {
         Self {
             transcript: Vec::new(),
             assistant_buf: String::new(),
+            thinking_buf: String::new(),
             state,
             usage: None,
             iterations: 0,
@@ -269,10 +274,14 @@ impl UiModel {
                 self.iterations += 1;
             }
             Event::TextDelta { text } => {
+                self.flush_thinking();
                 self.assistant_buf.push_str(text);
             }
-            Event::ThinkingDelta { .. } => {} // rendered inline by the shell if desired
+            Event::ThinkingDelta { text } => {
+                self.thinking_buf.push_str(text);
+            }
             Event::ToolStart { name, args, .. } => {
+                self.flush_thinking();
                 self.flush_assistant();
                 let line = match tool_detail(name, args.as_ref()) {
                     Some(detail) => format!("⚙ {name} {detail}"),
@@ -281,11 +290,13 @@ impl UiModel {
                 self.transcript.push(TranscriptLine::Tool(line));
             }
             Event::ToolEnd { name, ok, .. } => {
+                self.flush_thinking();
                 let marker = if *ok { "✓" } else { "✗" };
                 self.transcript
                     .push(TranscriptLine::Tool(format!("{marker} {name}")));
             }
             Event::TurnEnd {} => {
+                self.flush_thinking();
                 self.flush_assistant();
             }
             Event::Usage { prompt_tokens } => {
@@ -306,6 +317,7 @@ impl UiModel {
                 interrupted: _,
             } => {
                 self.settled = true;
+                self.flush_thinking();
                 // `turn_end` already flushed streamed text, so `assistant_buf`
                 // is empty here even when the answer streamed — the previous
                 // `!assistant_buf.contains(text)` guard therefore re-appended
@@ -322,10 +334,23 @@ impl UiModel {
                 self.flush_assistant();
             }
             Event::Error { message } => {
+                self.flush_thinking();
                 self.flush_assistant();
                 self.transcript
                     .push(TranscriptLine::Notice(format!("error: {message}")));
             }
+        }
+    }
+
+    /// Push accumulated model reasoning (if any) as a transcript line.
+    /// Always called before `flush_assistant`, so thinking renders before the
+    /// answer it precedes (CRAB-139).
+    fn flush_thinking(&mut self) {
+        if !self.thinking_buf.is_empty() {
+            self.transcript
+                .push(TranscriptLine::Thinking(std::mem::take(
+                    &mut self.thinking_buf,
+                )));
         }
     }
 
@@ -1036,6 +1061,12 @@ fn draw(
                 t.to_string(),
                 ratatui::style::Style::default().fg(ratatui::style::Color::White),
             )),
+            TranscriptLine::Thinking(t) => TLine::from(Span::styled(
+                format!("  {t}"),
+                ratatui::style::Style::default()
+                    .fg(ratatui::style::Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
             TranscriptLine::Tool(t) => TLine::from(Span::styled(
                 format!("  {t}"),
                 ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
@@ -1524,6 +1555,40 @@ mod tests {
         assert_eq!(
             m.transcript,
             vec![TranscriptLine::Assistant("answer".into())]
+        );
+    }
+
+    #[test]
+    fn thinking_delta_renders_before_assistant_text() {
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::TurnStart {});
+        m.apply_event(&Event::ThinkingDelta { text: "hmm".into() });
+        m.apply_event(&Event::ThinkingDelta {
+            text: " more".into(),
+        });
+        m.apply_event(&Event::TextDelta {
+            text: "answer".into(),
+        });
+        m.apply_event(&Event::TurnEnd {});
+        assert_eq!(
+            m.transcript,
+            vec![
+                TranscriptLine::Thinking("hmm more".into()),
+                TranscriptLine::Assistant("answer".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn thinking_flushes_on_turn_end_and_error() {
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ThinkingDelta {
+            text: "reason".into(),
+        });
+        m.apply_event(&Event::TurnEnd {});
+        assert_eq!(
+            m.transcript,
+            vec![TranscriptLine::Thinking("reason".into())]
         );
     }
 

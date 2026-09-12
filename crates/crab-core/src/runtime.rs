@@ -50,7 +50,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EffortStyle, ProviderInfo};
-use crate::provider::{Message, Provider, Response};
+use crate::provider::{Message, Provider, Response, StreamDelta};
 use crate::skills::{self, Skill};
 use crate::tools::resolver::ToolSet;
 use crate::workspace::Workspace;
@@ -969,11 +969,11 @@ impl AgentRuntime {
         let history = vec![Message::User(prompt)];
         static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
         let empty = EMPTY.get_or_init(|| serde_json::Value::Object(Default::default()));
-        let mut on_text = |_: &str| {}; // do not stream a compaction into the UI
+        let mut on_delta = |_: StreamDelta| {}; // do not stream a compaction into the UI
         match self
             .inner
             .provider
-            .complete(&history, &[], empty, self.cancel_token(), &mut on_text)
+            .complete(&history, &[], empty, self.cancel_token(), &mut on_delta)
             .await
         {
             Ok(completion) => match completion.response {
@@ -1063,10 +1063,13 @@ impl AgentRuntime {
                 };
                 let cancel = self.cancel_token();
                 let emit = self.inner.events.clone();
-                let mut on_text = |t: &str| {
-                    let _ = emit.send(Event::TextDelta {
-                        text: t.to_string(),
-                    });
+                let mut on_delta = |delta: StreamDelta| match delta {
+                    StreamDelta::Text(text) => {
+                        let _ = emit.send(Event::TextDelta { text });
+                    }
+                    StreamDelta::Thinking(text) => {
+                        let _ = emit.send(Event::ThinkingDelta { text });
+                    }
                 };
                 self.inner
                     .provider
@@ -1075,7 +1078,7 @@ impl AgentRuntime {
                         &self.inner.schemas,
                         &effort_params,
                         cancel,
-                        &mut on_text,
+                        &mut on_delta,
                     )
                     .await
             };
@@ -1264,6 +1267,7 @@ impl AgentRuntime {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::provider::fake::FakeProvider;
     use crate::provider::{Completion, ProviderError, ToolCall};
     use std::sync::mpsc;
     use std::sync::Mutex;
@@ -1298,7 +1302,7 @@ mod tests {
             _tools: &'a [serde_json::Value],
             _effort_params: &'a serde_json::Value,
             _cancel: CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
         ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
             Box::pin(async move {
                 let mut q = self.completions.lock().unwrap();
@@ -1615,6 +1619,30 @@ mod tests {
     }
 
     #[test]
+    fn thinking_deltas_are_emitted_and_stay_out_of_history() {
+        let (rt, mut rx, handle, _ws) = runtime_with(
+            "thinking",
+            Box::new(
+                FakeProvider::new(vec![Response::Text(text("answer"))])
+                    .with_thinking(vec!["hmm".into()]),
+            ),
+        );
+        rt.prompt("what model are you");
+        let (events, settled) = collect_until_settled(&mut rx);
+        assert!(settled);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ThinkingDelta { text } if text == "hmm")));
+        // Reasoning is display-only: it never enters the canonical history.
+        assert!(!rt
+            .history()
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { text: Some(t), .. } if t.contains("hmm"))));
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
     fn tool_calls_execute_and_emit_lifecycle_events() {
         let (dir, ws) = workspace("tools");
         let builder = GateProvider::new(vec![
@@ -1695,7 +1723,7 @@ mod tests {
             _tools: &'a [serde_json::Value],
             _effort_params: &'a serde_json::Value,
             _cancel: CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
         ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
             Box::pin(async move {
                 let _ = self.started_tx.send(());
@@ -1823,7 +1851,7 @@ mod tests {
             _tools: &'a [serde_json::Value],
             _effort_params: &'a serde_json::Value,
             _cancel: CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
         ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
             Box::pin(async move {
                 Ok(Completion {
@@ -1874,7 +1902,7 @@ mod parallel_tests {
             _tools: &'a [serde_json::Value],
             _effort_params: &'a serde_json::Value,
             _cancel: tokio_util::sync::CancellationToken,
-            _on_text: &'a mut (dyn FnMut(&str) + Send),
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
         ) -> futures::future::BoxFuture<
             'a,
             Result<crate::provider::Completion, crate::provider::ProviderError>,
@@ -2035,7 +2063,7 @@ mod effort_tests {
                 _tools: &'a [serde_json::Value],
                 effort_params: &'a serde_json::Value,
                 _cancel: tokio_util::sync::CancellationToken,
-                _on_text: &'a mut (dyn FnMut(&str) + Send),
+                _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
             ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
                 Box::pin(async move {
                     self.seen.lock().unwrap().push(effort_params.clone());
@@ -2069,10 +2097,10 @@ mod effort_tests {
                 tools: &'a [serde_json::Value],
                 effort_params: &'a serde_json::Value,
                 cancel: tokio_util::sync::CancellationToken,
-                on_text: &'a mut (dyn FnMut(&str) + Send),
+                on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
             ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
                 self.0
-                    .complete(history, tools, effort_params, cancel, on_text)
+                    .complete(history, tools, effort_params, cancel, on_delta)
             }
         }
         let (rt, _rx) = AgentRuntime::new(

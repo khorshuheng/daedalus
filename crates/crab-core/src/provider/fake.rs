@@ -11,10 +11,12 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::{Completion, Message, Provider, ProviderError, Response};
+use super::{Completion, Message, Provider, ProviderError, Response, StreamDelta};
 
 pub struct FakeProvider {
     responses: Mutex<VecDeque<Response>>,
+    /// Scripted reasoning fragments, one per `complete` call (CRAB-139).
+    thinking: Mutex<VecDeque<String>>,
     /// History of every `complete` call, in order, for assertions.
     histories: Mutex<Vec<Vec<Message>>>,
 }
@@ -25,8 +27,16 @@ impl FakeProvider {
     pub fn new(responses: Vec<Response>) -> Self {
         Self {
             responses: Mutex::new(responses.into()),
+            thinking: Mutex::new(VecDeque::new()),
             histories: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Script one reasoning fragment per `complete` call, streamed before the
+    /// scripted response (CRAB-139).
+    pub fn with_thinking(mut self, thinking: Vec<String>) -> Self {
+        self.thinking = Mutex::new(thinking.into());
+        self
     }
 
     /// Number of `complete` calls made so far.
@@ -62,7 +72,7 @@ impl Provider for FakeProvider {
         _tools: &'a [Value],
         _effort_params: &'a Value,
         cancel: CancellationToken,
-        _on_text: &'a mut (dyn FnMut(&str) + Send),
+        on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
     ) -> BoxFuture<'a, Result<Completion, ProviderError>> {
         Box::pin(async move {
             self.histories.lock().unwrap().push(history.to_vec());
@@ -72,6 +82,9 @@ impl Provider for FakeProvider {
                 None => Response::Text("done".into()),
             };
             drop(q);
+            if let Some(thinking) = self.thinking.lock().unwrap().pop_front() {
+                on_delta(StreamDelta::Thinking(thinking));
+            }
             if cancel.is_cancelled() {
                 let text = match response {
                     Response::Text(t) => t,
@@ -116,16 +129,16 @@ mod tests {
             }]),
             Response::Text("final".into()),
         ]);
-        let mut on_text = |_: &str| {};
+        let mut on_delta = |_: StreamDelta| {};
         assert!(matches!(
-            p.complete(&[], &[], effort, cancel.clone(), &mut on_text)
+            p.complete(&[], &[], effort, cancel.clone(), &mut on_delta)
                 .await
                 .unwrap()
                 .response,
             Response::ToolCalls(_)
         ));
         assert_eq!(
-            p.complete(&[], &[], effort, cancel.clone(), &mut on_text)
+            p.complete(&[], &[], effort, cancel.clone(), &mut on_delta)
                 .await
                 .unwrap()
                 .response,
@@ -133,7 +146,7 @@ mod tests {
         );
         // Exhausted -> final "done".
         assert_eq!(
-            p.complete(&[], &[], effort, cancel, &mut on_text)
+            p.complete(&[], &[], effort, cancel, &mut on_delta)
                 .await
                 .unwrap()
                 .response,
@@ -149,8 +162,8 @@ mod tests {
             tool_call_id: "abc".into(),
             result: "r".into(),
         }];
-        let mut on_text = |_: &str| {};
-        p.complete(&hist, &[], effort, cancel, &mut on_text)
+        let mut on_delta = |_: StreamDelta| {};
+        p.complete(&hist, &[], effort, cancel, &mut on_delta)
             .await
             .unwrap();
         assert_eq!(p.calls(), 1);
@@ -162,9 +175,9 @@ mod tests {
         let (effort, cancel) = blank();
         cancel.cancel();
         let p = FakeProvider::new(vec![Response::Text("never seen".into())]);
-        let mut on_text = |_: &str| {};
+        let mut on_delta = |_: StreamDelta| {};
         let c = p
-            .complete(&[], &[], effort, cancel, &mut on_text)
+            .complete(&[], &[], effort, cancel, &mut on_delta)
             .await
             .unwrap();
         // Like a real provider, the scripted (partial) text is preserved and
