@@ -14,6 +14,7 @@
 //! (`provider/rig.rs`) maps each registry entry onto rig-core's client for
 //! that provider; adding a provider is one table row, no client code.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -172,6 +173,10 @@ pub struct Config {
     pub workspace: PathBuf,
     /// External MCP tool servers (CRAB-133), started at runtime construction.
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Optional identity -> workspace map (CRAB-124): a request identity (e.g.
+    /// a Tailscale login header) selects a session workspace. Empty = use
+    /// `workspace` for every session.
+    pub identity_workspaces: BTreeMap<String, PathBuf>,
 }
 
 impl Config {
@@ -199,6 +204,7 @@ impl Config {
             max_context_tokens: DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096),
             workspace,
             mcp_servers: Vec::new(),
+            identity_workspaces: BTreeMap::new(),
         }
     }
 }
@@ -224,6 +230,9 @@ pub struct PartialConfig {
     /// `[[mcp_servers]]` tables (CRAB-133).
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// `[identities]` table: identity -> workspace directory (CRAB-124).
+    #[serde(default, rename = "identities")]
+    pub identity_workspaces: Option<BTreeMap<String, PathBuf>>,
 }
 
 impl PartialConfig {
@@ -249,6 +258,7 @@ impl PartialConfig {
         take!(max_context_tokens);
         take!(workspace);
         take!(mcp_servers);
+        take!(identity_workspaces);
     }
 
     /// Resolve to a complete `Config`: fill defaults (provider presets) and
@@ -302,6 +312,17 @@ impl PartialConfig {
         }
         let mcp_servers = self.mcp_servers.unwrap_or_default();
         validate_servers(&mcp_servers)?;
+        let identity_workspaces = self.identity_workspaces.unwrap_or_default();
+        for (identity, path) in &identity_workspaces {
+            if identity.trim().is_empty() {
+                return Err("identities entries need a non-empty identity".into());
+            }
+            if path.as_os_str().is_empty() {
+                return Err(format!(
+                    "identity '{identity}' maps to an empty workspace path"
+                ));
+            }
+        }
 
         Ok(Config {
             provider,
@@ -317,6 +338,7 @@ impl PartialConfig {
             max_context_tokens,
             workspace,
             mcp_servers,
+            identity_workspaces,
         })
     }
 }
@@ -549,6 +571,26 @@ url = "http://localhost:8000/mcp"
         std::fs::write(&path, "model = \"m\"\n[[mcp_servers]]\nname = \"fs\"\n").unwrap();
         let err = load(ws(), Some(&path), PartialConfig::default()).unwrap_err();
         assert!(err.contains("needs a 'command'"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_file_parses_identity_workspaces() {
+        let dir = std::env::temp_dir().join("crab-config-identities");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "model = \"m\"\n[identities]\n\"alice@example.com\" = \"/home/alice/projects\"\n",
+        )
+        .unwrap();
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(
+            c.identity_workspaces
+                .get("alice@example.com")
+                .map(PathBuf::as_path),
+            Some(Path::new("/home/alice/projects"))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

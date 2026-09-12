@@ -11,24 +11,34 @@ use crab_server::{build_router, AppState};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 
 type Client = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 fn fake_config(workspace: &Path) -> Config {
-    Config {
+    fake_config_with(workspace, &[])
+}
+
+/// Fake-provider config with an optional identity -> workspace map.
+fn fake_config_with(workspace: &Path, identities: &[(&str, &Path)]) -> Config {
+    let mut config = Config {
         provider: provider_by_name("fake").unwrap(),
         model: "fake-model".into(),
         workspace: workspace.to_path_buf(),
         ..Config::defaults(workspace.to_path_buf())
+    };
+    for (identity, path) in identities {
+        config
+            .identity_workspaces
+            .insert((*identity).to_string(), path.to_path_buf());
     }
+    config
 }
 
-/// Start the router on an ephemeral port; return its address.
-async fn start(dir: &Path) -> SocketAddr {
-    let workspace = Workspace::new(dir.to_path_buf()).unwrap();
-    let state = AppState::new(fake_config(dir), workspace, dir.join("sessions"));
+async fn start_state(state: AppState) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -37,16 +47,32 @@ async fn start(dir: &Path) -> SocketAddr {
     addr
 }
 
+/// Start the router on an ephemeral port; return its address.
+async fn start(dir: &Path) -> SocketAddr {
+    let workspace = Workspace::new(dir.to_path_buf()).unwrap();
+    let state = AppState::new(fake_config(dir), workspace, dir.join("sessions"));
+    start_state(state).await
+}
+
 async fn connect(addr: SocketAddr) -> Client {
-    let (ws, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
-    ws
+    connect_raw(addr, "/ws", &[]).await
 }
 
 async fn connect_workspace(addr: SocketAddr, workspace: &Path) -> Client {
     let path = workspace.to_string_lossy().replace(' ', "%20");
-    let (ws, _) = connect_async(format!("ws://{addr}/ws?workspace={path}"))
-        .await
-        .unwrap();
+    connect_raw(addr, &format!("/ws?workspace={path}"), &[]).await
+}
+
+/// Connect with extra handshake headers (e.g. the tailnet identity header).
+async fn connect_raw(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Client {
+    let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+    for (name, value) in headers {
+        request.headers_mut().insert(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    let (ws, _) = connect_async(request).await.unwrap();
     ws
 }
 
@@ -171,6 +197,127 @@ async fn id_carrying_command_gets_a_response_frame() {
     assert_eq!(response["type"], "response");
     assert_eq!(response["id"], "req-1");
     assert_eq!(response["ok"], true);
+}
+
+async fn state_workspace(ws: &mut Client) -> PathBuf {
+    send(ws, json!({"type": "get_state"})).await;
+    let event = until(ws, "state_changed").await.pop().unwrap();
+    PathBuf::from(event["workspace"].as_str().unwrap())
+}
+
+#[tokio::test]
+async fn identity_header_selects_the_mapped_workspace() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let alice = tempfile::tempdir().unwrap();
+    let config = fake_config_with(server_dir.path(), &[("alice@example.com", alice.path())]);
+    let workspace = Workspace::new(server_dir.path().to_path_buf()).unwrap();
+    let state = AppState::new(config, workspace, server_dir.path().join("sessions"));
+    let addr = start_state(state).await;
+
+    let mut ws = connect_raw(
+        addr,
+        "/ws",
+        &[("tailscale-user-login", "alice@example.com")],
+    )
+    .await;
+    assert_eq!(
+        state_workspace(&mut ws).await,
+        alice.path().canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn identity_mapping_wins_over_the_query_override() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let alice = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let config = fake_config_with(server_dir.path(), &[("alice@example.com", alice.path())]);
+    let workspace = Workspace::new(server_dir.path().to_path_buf()).unwrap();
+    let state = AppState::new(config, workspace, server_dir.path().join("sessions"));
+    let addr = start_state(state).await;
+
+    let query = format!("/ws?workspace={}", other.path().to_string_lossy());
+    let mut ws = connect_raw(
+        addr,
+        &query,
+        &[("tailscale-user-login", "alice@example.com")],
+    )
+    .await;
+    assert_eq!(
+        state_workspace(&mut ws).await,
+        alice.path().canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn unmapped_identity_is_rejected_when_a_map_exists() {
+    let server_dir = tempfile::tempdir().unwrap();
+    let alice = tempfile::tempdir().unwrap();
+    let config = fake_config_with(server_dir.path(), &[("alice@example.com", alice.path())]);
+    let workspace = Workspace::new(server_dir.path().to_path_buf()).unwrap();
+    let state = AppState::new(config, workspace, server_dir.path().join("sessions"));
+    let addr = start_state(state).await;
+
+    let mut ws = connect_raw(addr, "/ws", &[("tailscale-user-login", "bob@example.com")]).await;
+    let event = next_event(&mut ws).await;
+    assert_eq!(event["type"], "error");
+    assert!(event["message"]
+        .as_str()
+        .unwrap()
+        .contains("no workspace mapped"));
+}
+
+#[tokio::test]
+async fn identity_header_is_ignored_without_a_map() {
+    // A single-workspace server (no `[identities]`) accepts any identity and
+    // uses the default workspace.
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    let mut ws = connect_raw(addr, "/ws", &[("tailscale-user-login", "bob@example.com")]).await;
+    assert_eq!(
+        state_workspace(&mut ws).await,
+        dir.path().canonicalize().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn steer_abort_and_switch_workspace_are_dispatched() {
+    let dir = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    let mut ws = connect(addr).await;
+
+    // steer while idle starts a turn; the fake provider settles with "done".
+    send(&mut ws, json!({"type": "steer", "text": "go"})).await;
+    let events = until(&mut ws, "agent_settled").await;
+    assert_eq!(events.last().unwrap()["text"], "done");
+
+    // switch_workspace: the ack and the worker's state_changed can arrive in
+    // either order, so collect until both are seen.
+    send(
+        &mut ws,
+        json!({"type": "switch_workspace", "path": other.path().to_string_lossy(), "id": "sw"}),
+    )
+    .await;
+    let wanted = other.path().canonicalize().unwrap();
+    let mut saw_response = false;
+    let mut saw_state = false;
+    while !(saw_response && saw_state) {
+        let event = next_event(&mut ws).await;
+        if event["type"] == "response" && event["id"] == "sw" {
+            saw_response = true;
+        }
+        if event["type"] == "state_changed"
+            && Path::new(event["workspace"].as_str().unwrap()) == wanted
+        {
+            saw_state = true;
+        }
+    }
+
+    // abort is accepted and acknowledged even while idle.
+    send(&mut ws, json!({"type": "abort", "id": "ab"})).await;
+    let events = until(&mut ws, "response").await;
+    assert_eq!(events.last().unwrap()["id"], "ab");
 }
 
 #[tokio::test]

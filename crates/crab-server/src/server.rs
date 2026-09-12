@@ -7,12 +7,21 @@
 //! itself: it binds an address the operator chooses (loopback by default) and
 //! is meant to sit behind `tailscale serve`, which adds HTTPS + tailnet
 //! identity. No `tailscale funnel` — public exposure is out of scope.
+//!
+//! # Deployment (tailnet)
+//!
+//! Run `crab-server --bind 127.0.0.1:8787` and front it with
+//! `tailscale serve --bg 8787`, which terminates HTTPS on the tailnet and
+//! injects the `Tailscale-User-Login` header. Configure `[identities]` in the
+//! crab config to map those logins to workspaces; when a map is configured, an
+//! unmapped identity is rejected rather than given another user's workspace.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
@@ -64,20 +73,35 @@ async fn health() -> &'static str {
     "{\"status\":\"ok\"}"
 }
 
+/// The identity header injected by `tailscale serve` (HTTPS + tailnet
+/// identity). Other fronters can set an equivalent header; the server trusts
+/// it only because it binds loopback behind such a proxy.
+const IDENTITY_HEADER: &str = "tailscale-user-login";
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| session_loop(socket, state, query))
+    let identity = headers
+        .get(IDENTITY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    ws.on_upgrade(move |socket| session_loop(socket, state, query, identity))
 }
 
 /// Drive one connected session: pump runtime events out, client commands in.
-async fn session_loop(socket: WebSocket, state: AppState, query: WsQuery) {
+async fn session_loop(
+    socket: WebSocket,
+    state: AppState,
+    query: WsQuery,
+    identity: Option<String>,
+) {
     let (mut sink, mut stream) = socket.split();
 
-    // Resolve the session workspace, rejecting an invalid override.
-    let workspace = match resolve_workspace(&state, &query) {
+    // Resolve the session workspace, rejecting an invalid mapping/override.
+    let workspace = match resolve_workspace(&state, &query, identity.as_deref()) {
         Ok(ws) => ws,
         Err(e) => {
             let event = Event::Error { message: e };
@@ -156,7 +180,26 @@ async fn session_loop(socket: WebSocket, state: AppState, query: WsQuery) {
     let _ = handle.join();
 }
 
-fn resolve_workspace(state: &AppState, query: &WsQuery) -> Result<Workspace, String> {
+/// Pick the session workspace. Precedence: mapped identity (from the proxy
+/// header, CRAB-124) > explicit `?workspace=` override > server default. When
+/// an identity map is configured, an identity the proxy vouched for but the
+/// map does not cover is **rejected** rather than falling back — otherwise a
+/// tailnet user could reach the admin's default workspace. A request with no
+/// identity header (local/direct use) may still use the override or default.
+fn resolve_workspace(
+    state: &AppState,
+    query: &WsQuery,
+    identity: Option<&str>,
+) -> Result<Workspace, String> {
+    if let Some(identity) = identity {
+        if let Some(path) = state.config.identity_workspaces.get(identity) {
+            return Workspace::new(path.clone())
+                .map_err(|e| format!("workspace for identity '{identity}' is invalid: {e}"));
+        }
+        if !state.config.identity_workspaces.is_empty() {
+            return Err(format!("no workspace mapped for identity '{identity}'"));
+        }
+    }
     match query.workspace.as_deref() {
         Some(path) if !path.trim().is_empty() => {
             Workspace::new(PathBuf::from(path)).map_err(|e| format!("bad workspace: {e}"))

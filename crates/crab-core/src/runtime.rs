@@ -717,11 +717,18 @@ impl AgentRuntime {
     }
 
     fn emit_state_changed(&self) {
-        let st = self.inner.state.lock().unwrap().clone();
+        // Re-read the workspace from the canonical source: `switch_workspace`
+        // replaces it without going through `set_busy`, so a cached
+        // `state.workspace` would report the previous directory.
+        let workspace = self.workspace_path().to_string_lossy().into_owned();
+        let mut guard = self.inner.state.lock().unwrap();
+        guard.workspace = workspace.clone();
+        let st = guard.clone();
+        drop(guard);
         self.emit(Event::StateChanged {
             model: st.model,
             effort: st.effort,
-            workspace: st.workspace,
+            workspace,
         });
     }
 
