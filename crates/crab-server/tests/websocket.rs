@@ -160,6 +160,20 @@ async fn malformed_command_yields_error_event() {
 }
 
 #[tokio::test]
+async fn id_carrying_command_gets_a_response_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    let mut ws = connect(addr).await;
+
+    send(&mut ws, json!({"type": "get_state", "id": "req-1"})).await;
+    let events = until(&mut ws, "response").await;
+    let response = events.last().unwrap();
+    assert_eq!(response["type"], "response");
+    assert_eq!(response["id"], "req-1");
+    assert_eq!(response["ok"], true);
+}
+
+#[tokio::test]
 async fn sessions_are_isolated_by_workspace() {
     let server_dir = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();

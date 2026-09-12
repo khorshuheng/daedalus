@@ -112,11 +112,32 @@ async fn session_loop(socket: WebSocket, state: AppState, query: WsQuery) {
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if let Err(message) = dispatch(&rt, &text, &state.session_root).await {
-                            let event = Event::Error { message };
-                            let json = serde_json::to_string(&event).unwrap();
-                            if sink.send(Message::Text(json.into())).await.is_err() {
-                                break;
+                        match dispatch(&rt, &text, &state.session_root).await {
+                            // An id-carrying request gets a terminal response frame,
+                            // matching the stdio RPC adapter (CRAB-120). The WS loop
+                            // stays concurrent so steering can arrive mid-turn, so
+                            // this is an acceptance ack rather than a post-turn one.
+                            Ok(Some(id)) => {
+                                let response = serde_json::json!({
+                                    "type": "response",
+                                    "id": id,
+                                    "ok": true
+                                });
+                                if sink
+                                    .send(Message::Text(response.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(message) => {
+                                let event = Event::Error { message };
+                                let json = serde_json::to_string(&event).unwrap();
+                                if sink.send(Message::Text(json.into())).await.is_err() {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -128,6 +149,9 @@ async fn session_loop(socket: WebSocket, state: AppState, query: WsQuery) {
         }
     }
 
+    // Abort first: a disconnect mid-turn would otherwise leave `shutdown`
+    // waiting for the turn to settle.
+    rt.abort();
     rt.shutdown();
     let _ = handle.join();
 }
@@ -141,11 +165,17 @@ fn resolve_workspace(state: &AppState, query: &WsQuery) -> Result<Workspace, Str
     }
 }
 
-/// Apply one client `Command`. Returns an error message (sent back as an
-/// `error` event) for a malformed frame or a failed resume.
-async fn dispatch(rt: &AgentRuntime, text: &str, session_root: &Path) -> Result<(), String> {
+/// Apply one client `Command`. Returns the command's `id` (for a terminal
+/// `response` frame) or an error message (sent back as an `error` event) for a
+/// malformed frame or a failed resume.
+async fn dispatch(
+    rt: &AgentRuntime,
+    text: &str,
+    session_root: &Path,
+) -> Result<Option<String>, String> {
     let command: Command =
         serde_json::from_str(text).map_err(|e| format!("malformed command: {e}"))?;
+    let id = command.id.clone();
     match command.kind {
         CommandKind::Prompt { text } => rt.prompt(&text),
         CommandKind::Steer { text } => rt.steer(&text),
@@ -162,5 +192,5 @@ async fn dispatch(rt: &AgentRuntime, text: &str, session_root: &Path) -> Result<
             Err(e) => return Err(format!("could not resume: {e}")),
         },
     }
-    Ok(())
+    Ok(id)
 }
