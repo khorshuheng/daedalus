@@ -1081,9 +1081,22 @@ impl AgentRuntime {
             };
             match completion {
                 Err(e) => {
-                    self.emit(Event::Error {
-                        message: format!("provider error: {e}"),
-                    });
+                    // Auth failures carry the provider name and remediation, so a
+                    // revoked or incorrect key is actionable rather than a bare
+                    // provider status (CRAB-143).
+                    let message = match &e {
+                        crate::provider::ProviderError::Auth(_) => format!(
+                            "authentication failed for provider '{}': check the API key ({}, --api-key, or /login) — {e}",
+                            self.inner.config.provider.name,
+                            self.inner
+                                .config
+                                .provider
+                                .api_key_env
+                                .unwrap_or("<PROVIDER>_API_KEY"),
+                        ),
+                        _ => format!("provider error: {e}"),
+                    };
+                    self.emit(Event::Error { message });
                     break 'steps;
                 }
                 Ok(completion) => {

@@ -149,6 +149,14 @@ pub fn provider_by_name(s: &str) -> Result<&'static ProviderInfo, String> {
     })
 }
 
+impl ProviderInfo {
+    /// True when the provider needs an API key. Local providers (Ollama,
+    /// LM Studio) and the fake do not.
+    pub fn requires_key(&self) -> bool {
+        self.api_key_env.is_some()
+    }
+}
+
 /// Fully-resolved configuration passed to the provider and the agent loop.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -207,6 +215,20 @@ impl Config {
             identity_workspaces: BTreeMap::new(),
         }
     }
+}
+
+/// Reject a configuration whose provider needs a key but has none (CRAB-143).
+/// Shared by `Config::load` and `provider::from_config` so no code path can
+/// build a client that sends `Authorization: Bearer ` (empty).
+pub fn ensure_api_key(config: &Config) -> Result<(), String> {
+    if !config.provider.requires_key() || !config.api_key.as_deref().unwrap_or("").is_empty() {
+        return Ok(());
+    }
+    let env = config.provider.api_key_env.unwrap_or("<PROVIDER>_API_KEY");
+    Err(format!(
+        "no API key for provider '{}': set {env}, pass --api-key, or run /login",
+        config.provider.name
+    ))
 }
 
 /// Partial configuration from one source (config file or CLI flags). All
@@ -388,7 +410,9 @@ impl Config {
             None => default_provider(),
         };
         let api_key = crate::credential::resolve_api_key(info, api_key_flag);
-        merged.resolve(default_workspace, api_key)
+        let config = merged.resolve(default_workspace, api_key)?;
+        ensure_api_key(&config)?;
+        Ok(config)
     }
 }
 
@@ -401,8 +425,10 @@ mod tests {
         PathBuf::from("/tmp/crab-config-test")
     }
 
+    /// Most tests exercise the happy path, so supply a dummy key for the
+    /// hosted providers that now require one (CRAB-143).
     fn load(ws: PathBuf, file: Option<&Path>, flags: PartialConfig) -> Result<Config, String> {
-        Config::load(ws, file, flags, None)
+        Config::load(ws, file, flags, Some("test-key".into()))
     }
 
     #[test]
@@ -414,7 +440,7 @@ mod tests {
         let c = load(ws(), None, flags).unwrap();
         assert_eq!(c.provider.name, "openai");
         assert_eq!(c.base_url, "https://api.openai.com");
-        assert_eq!(c.api_key, None);
+        assert_eq!(c.api_key.as_deref(), Some("test-key"));
         assert_eq!(c.max_iterations, 30);
         assert_eq!(c.max_context_tokens, DEFAULT_CONTEXT_WINDOW - 4_096);
     }
@@ -425,6 +451,28 @@ mod tests {
         let err = load(ws(), None, PartialConfig::default()).unwrap_err();
         assert!(err.contains("no model configured"), "{err}");
         assert!(err.contains("openai"), "{err}");
+    }
+
+    #[test]
+    fn ensure_api_key_requires_one_for_hosted_providers() {
+        let mut c = Config::defaults(ws());
+        c.provider = provider_by_name("deepseek").unwrap();
+        c.model = "deepseek-chat".into();
+        c.api_key = None;
+        let err = ensure_api_key(&c).unwrap_err();
+        assert!(err.contains("no API key for provider 'deepseek'"), "{err}");
+        assert!(
+            err.contains("DEEPSEEK_API_KEY") && err.contains("--api-key") && err.contains("/login"),
+            "{err}"
+        );
+        c.api_key = Some("sk-x".into());
+        assert!(ensure_api_key(&c).is_ok());
+        // Local providers and the fake need no key.
+        let mut c = Config::defaults(ws());
+        c.provider = provider_by_name("ollama").unwrap();
+        c.model = "llama3".into();
+        c.api_key = None;
+        assert!(ensure_api_key(&c).is_ok());
     }
 
     #[test]

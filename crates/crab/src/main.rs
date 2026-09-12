@@ -139,7 +139,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     )?;
 
     let workspace = Workspace::new(config.workspace.clone())?;
-    let provider = provider::from_config(&config);
+    let provider = provider::from_config(&config)?;
     // CRAB-133: built-ins plus configured MCP servers. Server startup is
     // non-fatal — a failure is a warning and the agent keeps the rest.
     let (tools, mcp_warnings) = ToolSet::from_config(&config, config.max_output_bytes);

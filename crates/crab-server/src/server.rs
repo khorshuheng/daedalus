@@ -114,7 +114,16 @@ async fn session_loop(
 
     let mut config = (*state.config).clone();
     config.workspace = workspace.root().to_path_buf();
-    let provider = provider::from_config(&config);
+    let provider = match provider::from_config(&config) {
+        Ok(provider) => provider,
+        Err(e) => {
+            let event = Event::Error { message: e };
+            let _ = sink
+                .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
+                .await;
+            return;
+        }
+    };
     let (tools, _mcp_warnings) = ToolSet::from_config(&config, config.max_output_bytes);
     let (rt, mut events) = AgentRuntime::new(config, provider, tools, workspace);
 
