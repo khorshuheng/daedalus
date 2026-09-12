@@ -17,7 +17,7 @@
 //! the TUI `/skill <name>` command, which pushes the content as a user
 //! message. The model can also self-serve by reading the file with the
 //! existing `read` tool — but only for **workspace** skills, whose path is
-//! inside the sandbox (a user-level skill lives outside the workspace and is
+//! inside the workspace (a user-level skill lives outside the workspace and is
 //! therefore `/skill`-only; see [`catalog_block`]). No new tool, no extra
 //! model call.
 
@@ -102,14 +102,20 @@ pub fn discover_in(user_dir: &Path, workspace: &Workspace) -> Vec<Skill> {
     skills.into_values().collect()
 }
 
+/// True when `path` canonicalizes to a location inside `workspace`.
+fn within(workspace: &Workspace, path: &Path) -> Option<PathBuf> {
+    let canon = path.canonicalize().ok()?;
+    canon.starts_with(workspace.root()).then_some(canon)
+}
+
 /// Read every markdown file in `dir` into `out`, keyed by file stem (later
 /// inserts, i.e. the workspace level, replace earlier ones).
 ///
-/// When `sandbox` is set, both the directory and every file must resolve
-/// inside that workspace. That blocks a symlinked skill — or a symlinked
-/// `.crab/skills` itself — from pulling content from outside the workspace,
-/// matching the `read` tool's guard (`Workspace::resolve`). User-level skills
-/// are not sandboxed (they live outside the workspace by design).
+/// Skills are workspace-based: when `sandbox` is set, both the directory and
+/// every file must canonicalize inside that workspace, so a symlinked skill — or
+/// a symlinked `.crab/skills` — cannot pull content from outside it. This is a
+/// skills-specific rule; it does not reintroduce the general tool path guard,
+/// which was removed. User-level skills are exempt (they live outside by design).
 fn read_dir_into(
     dir: &Path,
     level: SkillLevel,
@@ -117,9 +123,9 @@ fn read_dir_into(
     out: &mut BTreeMap<String, Skill>,
 ) {
     let dir = match sandbox {
-        Some(ws) => match ws.resolve(dir) {
-            Ok(p) => p,
-            Err(_) => return, // symlinked/escaping skills dir
+        Some(ws) => match within(ws, dir) {
+            Some(p) => p,
+            None => return, // symlinked/escaping skills dir
         },
         None => dir.to_path_buf(),
     };
@@ -135,9 +141,9 @@ fn read_dir_into(
             continue;
         };
         let resolved = match sandbox {
-            Some(ws) => match ws.resolve(&path) {
-                Ok(p) => p,
-                Err(_) => continue, // symlink escaping the workspace
+            Some(ws) => match within(ws, &path) {
+                Some(p) => p,
+                None => continue, // symlink escaping the workspace
             },
             None => path.clone(),
         };
@@ -379,7 +385,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_skill_escaping_the_workspace_is_ignored() {
+    fn symlinked_skill_outside_the_workspace_is_ignored() {
         use std::os::unix::fs::symlink;
         let ws = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
@@ -393,7 +399,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn symlinked_skills_directory_escaping_the_workspace_is_ignored() {
+    fn symlinked_skills_directory_outside_the_workspace_is_ignored() {
         use std::os::unix::fs::symlink;
         let ws = tempfile::tempdir().unwrap();
         let user = tempfile::tempdir().unwrap();
@@ -410,7 +416,7 @@ mod tests {
         let base = "base prompt";
         assert_eq!(with_catalog(base, &[]), base);
 
-        // A workspace skill advertises its in-sandbox read path.
+        // A workspace skill advertises its in-workspace read path.
         let workspace_skill = skill("demo", SkillLevel::Workspace);
         let block = catalog_block(std::slice::from_ref(&workspace_skill)).unwrap();
         assert!(block.contains("Available skills"));

@@ -40,9 +40,6 @@ pub enum ToolError {
     /// I/O failure.
     #[error("io error: {0}")]
     Io(String),
-    /// A path escapes the workspace.
-    #[error("path escaped: {0}")]
-    Escape(String),
     /// A command failed (non-zero exit or killed by signal).
     #[error("{0}")]
     Command(String),
@@ -223,10 +220,10 @@ pub(crate) fn arg_usize(args: &Value, key: &str) -> Result<Option<usize>, ToolEr
     }
 }
 
-/// Resolve a tool-supplied path relative to the workspace, mapping an escape to
-/// a `ToolError::Escape`.
+/// Resolve a tool-supplied path: relative paths join the workspace root, while
+/// absolute paths and `..` are honored (the workspace guard was removed).
 pub(crate) fn resolve(workspace: &Workspace, rel: &Path) -> Result<std::path::PathBuf, ToolError> {
-    workspace.resolve(rel).map_err(ToolError::Escape)
+    workspace.resolve(rel).map_err(ToolError::Io)
 }
 
 #[cfg(test)]

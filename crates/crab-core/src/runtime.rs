@@ -749,12 +749,12 @@ impl AgentRuntime {
              - edit: apply precise text replacements; each oldText must match exactly once.\n\
              - write: create or overwrite a file.\n\
              Rules:\n\
-             - All file paths are relative to the workspace and must stay inside it.\n\
+             - Paths are relative to the workspace by default; absolute paths and `..` are allowed.\n\
              - Read before editing; verify changes with bash.\n\
              - Make the smallest change that satisfies the request.\n\
-             - Keep searches inside the workspace and prefer `rg` (it respects\n\
-               .gitignore, so `target/` is skipped); never recursively scan the\n\
-               home directory or caches (e.g. `grep -r … ~`).\n\
+             - Prefer `rg` for searches (it respects .gitignore, so `target/` is\n\
+               skipped); do not recursively scan the home directory or caches\n\
+               (e.g. `grep -r … ~`).\n\
              - When finished, give a concise final answer.",
             self.workspace_path().display()
         );

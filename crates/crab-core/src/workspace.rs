@@ -1,9 +1,9 @@
 //! Workspace scoping (CRAB-105).
 //!
-//! The workspace is the single root that all `read`/`write`/`edit` paths and
-//! `bash` commands resolve against. `resolve` rejects any path that escapes the
-//! workspace after resolving `..` and symlinks (the canonical path must remain
-//! under the canonical workspace root).
+//! The workspace is the default root that relative `read`/`write`/`edit` paths
+//! and `bash` commands resolve against. Absolute paths and `..` are allowed:
+//! tools can reach anywhere the user can (as `bash` always could), so the
+//! workspace is a default location, not a security boundary.
 
 use std::path::{Path, PathBuf};
 
@@ -52,12 +52,12 @@ impl Workspace {
         &self.root
     }
 
-    /// Resolve `rel` (absolute or relative) to a path inside the workspace,
-    /// rejecting anything that escapes the root via `..` or symlinks.
+    /// Resolve `rel` to a path: relative paths join the workspace root, while
+    /// absolute paths and `..` are honored as given.
     ///
     /// For paths that do not yet exist (e.g. a `write` target), the deepest
-    /// existing ancestor is canonicalized and checked, then the non-existing
-    /// remainder is re-appended.
+    /// existing ancestor is canonicalized (resolving symlinks) and the
+    /// non-existing remainder is re-appended.
     pub fn resolve(&self, rel: &Path) -> Result<PathBuf, String> {
         let normalized = normalize_path(rel);
         let joined = if normalized.is_absolute() {
@@ -82,14 +82,6 @@ impl Workspace {
         let canon_existing = existing
             .canonicalize()
             .map_err(|e| format!("cannot resolve '{}': {e}", rel.display()))?;
-
-        if !canon_existing.starts_with(&self.root) {
-            return Err(format!(
-                "path '{}' escapes the workspace '{}'",
-                rel.display(),
-                self.root.display()
-            ));
-        }
 
         suffix.reverse();
         let mut out = canon_existing;
@@ -123,23 +115,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_dotdot_escape() {
+    fn allows_dotdot_outside_the_workspace() {
         let (_guard, dir) = tempdir("dotdot");
-        std::fs::write(dir.join("a.txt"), "hi").unwrap();
         let ws = Workspace::new(dir.clone()).unwrap();
-        assert!(ws.resolve(Path::new("../a.txt")).is_err());
-        assert!(ws.resolve(Path::new("../../etc/passwd")).is_err());
+        // `..` is honored: the workspace's parent resolves to a real path.
+        let p = ws.resolve(Path::new("../")).unwrap();
+        assert_eq!(p, dir.parent().unwrap().canonicalize().unwrap());
     }
 
     #[test]
-    fn rejects_absolute_outside() {
+    fn allows_absolute_outside_the_workspace() {
         let (_guard, dir) = tempdir("abs");
         let ws = Workspace::new(dir.clone()).unwrap();
-        assert!(ws.resolve(Path::new("/etc/passwd")).is_err());
+        let p = ws.resolve(Path::new("/etc")).unwrap();
+        assert_eq!(p, Path::new("/etc").canonicalize().unwrap());
     }
 
     #[test]
-    fn rejects_symlink_escape() {
+    fn follows_symlinks_outside_the_workspace() {
         let (_guard, dir) = tempdir("symlink");
         let outside = std::env::temp_dir().join(format!("crab-outside-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&outside);
@@ -148,8 +141,8 @@ mod tests {
         symlink(&outside, dir.join("link")).unwrap();
 
         let ws = Workspace::new(dir.clone()).unwrap();
-        let err = ws.resolve(Path::new("link/secret.txt")).unwrap_err();
-        assert!(err.contains("escapes the workspace"));
+        let p = ws.resolve(Path::new("link/secret.txt")).unwrap();
+        assert_eq!(p, outside.canonicalize().unwrap().join("secret.txt"));
         std::fs::remove_dir_all(&outside).ok();
     }
 

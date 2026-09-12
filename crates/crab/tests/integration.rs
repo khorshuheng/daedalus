@@ -180,14 +180,13 @@ fn cli_smoke_unknown_provider_fails() {
     assert!(stderr.contains("fake"));
 }
 
-/// Path-escape through a tool call is rejected and handed back as an error.
+/// Paths outside the workspace are allowed (the workspace guard was removed in
+/// favour of the bash timeout + prompt guidance).
 #[test]
-fn integration_path_escape_is_rejected() {
-    let tmp = tempdir("escape");
-    // Create an outside file to prove the tool never touches it.
+fn integration_path_outside_workspace_is_allowed() {
+    let tmp = tempdir("outside");
     let outside = std::env::temp_dir().join(format!("crab-outside-it-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&outside);
-    std::fs::write(&outside, "secret").unwrap();
+    let _ = std::fs::remove_file(&outside);
 
     let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
     let cfg = config_for(tmp.path(), 5);
@@ -195,21 +194,16 @@ fn integration_path_escape_is_rejected() {
         Response::ToolCalls(vec![call(
             "e1",
             "write",
-            serde_json::json!({"path": format!("../../{}", outside.file_name().unwrap().to_str().unwrap()), "content": "pwned"}),
+            serde_json::json!({"path": outside.to_string_lossy(), "content": "ok"}),
         )]),
-        Response::Text("ok".into()),
+        Response::Text("done".into()),
     ]);
     let tools = ToolSet::new(1000);
     let (rt, _rx) = AgentRuntime::new(cfg, Box::new(fake), tools, ws);
-    let _ = rt.run_once("try to escape").unwrap();
+    let _ = rt.run_once("write outside").unwrap();
 
-    // The escape error was fed back, and the outside file is untouched.
-    let h = rt.history();
-    assert!(h.iter().any(|m| {
-        matches!(m, Message::ToolResult { result, .. } if result.contains("escapes the workspace"))
-    }));
-    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
-    std::fs::remove_dir_all(&outside).ok();
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "ok");
+    std::fs::remove_file(&outside).ok();
 }
 
 /// CLI smoke: `--mode rpc` drives a full session over stdin/stdout with no
