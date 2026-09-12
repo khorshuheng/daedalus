@@ -10,24 +10,30 @@
 //!   server that fails to start is reported as a warning and the agent runs
 //!   with the remaining tools.
 //! - Every remote tool becomes a [`McpTool`] implementing the same [`Tool`]
-//!   trait as the built-ins, named `mcp:<server>:<tool>`, so the existing
+//!   trait as the built-ins, named `mcp__<server>__<tool>`, so the existing
 //!   `ToolSet`/resolver and the `tool_start`/`tool_end` events carry the
 //!   qualified name with no runtime changes.
 //! - MCP schemas are JSON Schema, a superset of crab's internal validation
 //!   subset, so argument validation for external tools is delegated to the
 //!   server.
-//! - A hanging call honors the session [`CancellationToken`]: the in-flight
-//!   request future is dropped (request teardown) and the tool reports
-//!   [`ToolError::Cancelled`]. Server processes are torn down when the owning
-//!   runtime is dropped (rmcp's child cleanup), not per call.
+//! - A cancelled call (session `CancellationToken`) sends the MCP
+//!   `notifications/cancelled` for the in-flight request (request teardown) and
+//!   returns [`ToolError::Cancelled`]. Server processes are torn down when the
+//!   owning runtime is dropped (rmcp's child cleanup), not per call.
 //!
 //! The [`McpClient`] seam keeps the bridge testable without child processes:
-//! offline tests inject a scripted in-process stub.
+//! offline tests inject a scripted in-process stub, and an end-to-end test
+//! wires a real rmcp server over an in-process duplex transport.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use rmcp::model::{
+    CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
+    ClientRequest, ContentBlock, ServerResult,
+};
+use rmcp::service::{serve_client, PeerRequestOptions, RoleClient, RunningService};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -122,12 +128,15 @@ pub struct McpToolDescriptor {
 }
 
 /// The client seam: call a remote tool by its unqualified name. Implemented by
-/// the rmcp adapter and by offline test stubs.
+/// the rmcp adapter and by offline test stubs. Implementations must honor
+/// `cancel`: return [`ToolError::Cancelled`] promptly when it fires (the rmcp
+/// adapter also sends the MCP `notifications/cancelled`).
 pub trait McpClient: Send + Sync {
     fn call_tool<'a>(
         &'a self,
         name: &'a str,
         args: Value,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<String, ToolError>>;
 }
 
@@ -222,12 +231,10 @@ impl Tool for McpTool {
                     "MCP tool arguments must be a JSON object".into(),
                 ));
             }
-            let call = self.client.call_tool(&self.remote, args.clone());
-            let result = tokio::select! {
-                res = call => res,
-                _ = cancel.cancelled() => Err(ToolError::Cancelled),
-            };
-            let content = result?;
+            let content = self
+                .client
+                .call_tool(&self.remote, args.clone(), cancel)
+                .await?;
             let (content, _truncated) = truncate_tail(&content, self.max_output);
             Ok(ToolOutput { content })
         })
@@ -287,35 +294,48 @@ async fn connect_one(
     runtime: Arc<tokio::runtime::Runtime>,
     max_output: usize,
 ) -> Result<ConnectedServer, String> {
-    use rmcp::service::{serve_client, RoleClient, RunningService};
-
-    let service: RunningService<RoleClient, ()> = match config.transport {
+    match config.transport {
         McpTransportKind::Stdio => {
             let command = config.command.clone().unwrap_or_default();
             let mut cmd = tokio::process::Command::new(&command);
             cmd.args(&config.args).envs(&config.env);
             let transport = rmcp::transport::TokioChildProcess::new(cmd)
                 .map_err(|e| format!("spawn '{command}': {e}"))?;
-            serve_client((), transport)
-                .await
-                .map_err(|e| format!("initialize: {e}"))?
+            connect_transport(&config.name, transport, Some(runtime), max_output).await
         }
         McpTransportKind::Http => {
             let url = config.url.clone().unwrap_or_default();
             let transport = rmcp::transport::StreamableHttpClientTransport::from_uri(url);
-            serve_client((), transport)
-                .await
-                .map_err(|e| format!("initialize: {e}"))?
+            connect_transport(&config.name, transport, Some(runtime), max_output).await
         }
-    };
+    }
+}
 
+/// Finish a connection once a client transport is available: initialize the
+/// MCP session, list every tool (following pagination), and wrap them. Split
+/// from [`connect_one`] so tests can drive it over an in-process duplex
+/// transport instead of a child process.
+async fn connect_transport<T, E, A>(
+    name: &str,
+    transport: T,
+    runtime: Option<Arc<tokio::runtime::Runtime>>,
+    max_output: usize,
+) -> Result<ConnectedServer, String>
+where
+    T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let service: RunningService<RoleClient, ()> = serve_client((), transport)
+        .await
+        .map_err(|e| format!("initialize: {e}"))?;
+
+    // `list_all_tools` follows `next_cursor` to the end (CRAB-133 follow-up).
     let listed = service
-        .list_tools(None)
+        .list_all_tools()
         .await
         .map_err(|e| format!("list_tools: {e}"))?;
 
     let tools = listed
-        .tools
         .into_iter()
         .map(|t| McpToolDescriptor {
             name: t.name.to_string(),
@@ -329,20 +349,21 @@ async fn connect_one(
         _runtime: runtime,
     });
     Ok(ConnectedServer {
-        name: config.name.clone(),
+        name: name.to_string(),
         client,
         tools,
         max_output,
     })
 }
 
-/// The rmcp-backed client. Holds the running service and the runtime that
-/// drives it; `call_tool` sends a request and awaits the reply (the service
-/// loop keeps running on `_runtime`).
+/// The rmcp-backed client. Holds the running service and (optionally) the
+/// runtime that drives it; `call_tool` sends a cancellable request so a session
+/// cancellation notifies the server and stops waiting.
 struct RmcpClient {
-    service: Arc<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>,
-    /// Keeps the runtime (and thus the service task) alive.
-    _runtime: Arc<tokio::runtime::Runtime>,
+    service: Arc<RunningService<RoleClient, ()>>,
+    /// Keeps the runtime (and thus the service task) alive. `None` when the
+    /// caller already owns the driving runtime (in-process tests).
+    _runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl McpClient for RmcpClient {
@@ -350,20 +371,55 @@ impl McpClient for RmcpClient {
         &'a self,
         name: &'a str,
         args: Value,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<String, ToolError>> {
         Box::pin(async move {
-            use rmcp::model::CallToolRequestParams;
             let arguments: Map<String, Value> = args.as_object().cloned().unwrap_or_default();
             let params = CallToolRequestParams::new(name.to_string()).with_arguments(arguments);
-            let result = self
+            // A raw cancellable request (rather than the MRTR-driving
+            // `RunningService::call_tool`) so a session cancellation can send
+            // `notifications/cancelled`. crab's client handler is `()`, so it
+            // cannot service MRTR input-required rounds anyway — only the
+            // direct `CallToolResult` is handled.
+            let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+
+            let handle = self
                 .service
-                .call_tool(params)
+                .send_cancellable_request(request, PeerRequestOptions::no_options())
                 .await
                 .map_err(|e| ToolError::Command(format!("MCP call '{name}' failed: {e}")))?;
+            // Keep what we need to cancel: `await_response` consumes the handle.
+            let peer = handle.peer.clone();
+            let id = handle.id.clone();
+
+            let response = tokio::select! {
+                res = handle.await_response() => res
+                    .map_err(|e| ToolError::Command(format!("MCP call '{name}' failed: {e}")))?,
+                _ = cancel.cancelled() => {
+                    // Tell the server to stop, then report the cancellation.
+                    let notification = CancelledNotification::new(
+                        CancelledNotificationParam::new(
+                            Some(id),
+                            Some("session cancelled".to_string()),
+                        ),
+                    );
+                    let _ = peer.send_notification(notification.into()).await;
+                    return Err(ToolError::Cancelled);
+                }
+            };
+
+            let result = match response {
+                ServerResult::CallToolResult(result) => result,
+                _ => {
+                    return Err(ToolError::Command(format!(
+                        "MCP tool '{name}' returned an unexpected response"
+                    )))
+                }
+            };
 
             let mut text = String::new();
             for block in &result.content {
-                if let rmcp::model::ContentBlock::Text(t) = block {
+                if let ContentBlock::Text(t) = block {
                     if !text.is_empty() {
                         text.push('\n');
                     }
@@ -421,6 +477,7 @@ mod tests {
             &'a self,
             name: &'a str,
             _args: Value,
+            _cancel: CancellationToken,
         ) -> BoxFuture<'a, Result<String, ToolError>> {
             let reply = self.replies.lock().unwrap().get(name).cloned();
             Box::pin(async move {
@@ -586,8 +643,12 @@ mod tests {
                 &'a self,
                 _name: &'a str,
                 _args: Value,
+                cancel: CancellationToken,
             ) -> BoxFuture<'a, Result<String, ToolError>> {
-                Box::pin(std::future::pending())
+                Box::pin(async move {
+                    cancel.cancelled().await;
+                    Err(ToolError::Cancelled)
+                })
             }
         }
         let (_dir, ws) = workspace();
@@ -599,5 +660,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Cancelled));
+    }
+
+    /// End-to-end over a real rmcp client <-> real rmcp server on an
+    /// in-process duplex transport: no child process, no network. Exercises
+    /// `connect_transport` (list_all_tools + wrapping) and a real tool call
+    /// through the bridge.
+    #[tokio::test]
+    async fn real_in_process_mcp_server_end_to_end() {
+        use rmcp::model::{
+            CallToolResponse, CallToolResult, ListToolsResult, ServerCapabilities, ServerInfo, Tool,
+        };
+        use rmcp::service::{RequestContext, RoleServer};
+        use rmcp::ServerHandler;
+
+        struct EchoServer;
+        impl ServerHandler for EchoServer {
+            fn get_info(&self) -> ServerInfo {
+                ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            }
+            async fn list_tools(
+                &self,
+                _request: Option<rmcp::model::PaginatedRequestParams>,
+                _context: RequestContext<RoleServer>,
+            ) -> Result<ListToolsResult, rmcp::ErrorData> {
+                Ok(ListToolsResult {
+                    tools: vec![Tool::new("echo", "Echo a message", serde_json::Map::new())],
+                    ..Default::default()
+                })
+            }
+            async fn call_tool(
+                &self,
+                request: CallToolRequestParams,
+                _context: RequestContext<RoleServer>,
+            ) -> Result<CallToolResponse, rmcp::ErrorData> {
+                let msg = request
+                    .arguments
+                    .as_ref()
+                    .and_then(|a| a.get("msg"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                Ok(CallToolResult::success(vec![ContentBlock::text(msg)]).into())
+            }
+        }
+
+        let (server_io, client_io) = tokio::io::duplex(8192);
+        // The server must run concurrently: `serve_server` waits for the
+        // client's initialize, so it cannot be awaited before the client
+        // exists.
+        let server_task = tokio::spawn(rmcp::serve_server(EchoServer, server_io));
+
+        let connected = connect_transport("srv", client_io, None, 1000)
+            .await
+            .unwrap();
+        let mut tools = connected.into_tools();
+        assert_eq!(tools.len(), 1);
+        let tool = tools.pop().unwrap();
+        assert_eq!(tool.name(), "mcp__srv__echo");
+        assert_eq!(tool.description(), "Echo a message");
+
+        let (_dir, ws) = workspace();
+        let out = tool
+            .run(
+                &ws,
+                &serde_json::json!({"msg": "hi from mcp"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "hi from mcp");
+
+        server_task.abort();
     }
 }

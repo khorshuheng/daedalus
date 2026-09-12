@@ -43,3 +43,8 @@ rmcp = { version = "3.3.0", default-features = false, features = [
 
 # CRAB-130: the crate is async now (tokio). The runtime stays runtime-agnostic
 # (no #[tokio::main]); the worker thread owns a current-thread runtime.
+
+[dev-dependencies]
+# CRAB-133: the server half of rmcp, used only by the in-process end-to-end
+# test (real client <-> real server over a duplex transport, no child process).
+rmcp = { version = "3.3.0", default-features = false, features = ["server"] }
