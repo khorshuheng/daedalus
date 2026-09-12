@@ -174,6 +174,13 @@ fn check_property(key: &str, prop: &Value, value: &Value) -> Result<(), ToolErro
             }
         }
     }
+    if let Some(max) = prop.get("maximum").and_then(Value::as_i64) {
+        if let Some(n) = value.as_i64() {
+            if n > max {
+                return Err(ToolError::Argument(format!("'{key}' must be <= {max}")));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -272,6 +279,18 @@ mod validate_tests {
         let err = validate_args(&schema, &json!({"timeout": 0})).unwrap_err();
         assert!(err.to_string().contains("'timeout' must be >= 1"));
         assert!(validate_args(&schema, &json!({"timeout": 5})).is_ok());
+    }
+
+    #[test]
+    fn enforces_maximum_on_integers() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"timeout": {"type": "integer", "maximum": 10}},
+            "required": []
+        });
+        let err = validate_args(&schema, &json!({"timeout": 11})).unwrap_err();
+        assert!(err.to_string().contains("'timeout' must be <= 10"));
+        assert!(validate_args(&schema, &json!({"timeout": 10})).is_ok());
     }
 
     #[test]

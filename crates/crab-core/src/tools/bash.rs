@@ -37,6 +37,12 @@ pub struct BashTool {
 /// pipe write end open must not hold the tool hostage.
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(150);
 
+/// Upper bound for a model-supplied `timeout`, matching pi's `MAX_TIMEOUT_MS`
+/// (2_147_483_647 ms). Keeps `Instant + Duration` far from overflow and rejects
+/// nonsense values with a clear error instead of a panic in the blocking task
+/// (CRAB-153).
+const MAX_TIMEOUT_SECS: u64 = i32::MAX as u64;
+
 /// State shared between `run_command` and its reader threads. stdout and
 /// stderr append to one buffer in arrival order (CRAB-155), matching pi's
 /// single `OutputAccumulator`.
@@ -218,7 +224,7 @@ impl Tool for BashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Shell command to run in the workspace." },
-                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (optional; a server default applies otherwise)." }
+                "timeout": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS, "description": "Timeout in seconds (optional; a server default applies otherwise)." }
             },
             "required": ["command"]
         })
@@ -259,6 +265,11 @@ impl BashTool {
         let command = arg_string(args, "command")?;
         let timeout = match arg_usize(args, "timeout")? {
             Some(0) => return Err(ToolError::Argument("'timeout' must be >= 1".into())),
+            Some(s) if s as u64 > MAX_TIMEOUT_SECS => {
+                return Err(ToolError::Argument(format!(
+                    "'timeout' must be <= {MAX_TIMEOUT_SECS}"
+                )))
+            }
             Some(s) => Some(s as u64),
             None => self.default_timeout_secs,
         };
@@ -430,6 +441,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    /// CRAB-153: an absurd timeout is a bad argument, not an `Instant` overflow
+    /// panic inside the blocking task.
+    #[tokio::test]
+    async fn huge_timeout_is_a_bad_argument() {
+        let (ws, _dir) = setup("huge-timeout");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
+        let err = tool
+            .run(
+                &ws,
+                &json!({"command": "true", "timeout": i64::MAX}),
+                token(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Argument(_)), "{err}");
+        assert!(err.to_string().contains("must be <="), "{err}");
     }
 
     #[tokio::test]
