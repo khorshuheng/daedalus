@@ -1,16 +1,26 @@
-//! The `read` tool: read a file, optionally a line range.
+//! The `read` tool: read a file, a list of files, or a glob of files, with an
+//! optional line range.
 
 use futures::future::BoxFuture;
+use ignore::overrides::OverrideBuilder;
+use ignore::WalkBuilder;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io::BufRead;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
-use super::{arg_string, arg_usize, resolve, Tool, ToolError, ToolOutput};
+use super::{arg_usize, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
 
-/// Maximum number of lines returned per read (matches pi's default).
+/// Maximum number of lines returned per file (matches pi's default).
 const MAX_LINES: usize = 2000;
+/// Maximum number of files read in one call.
+const MAX_FILES: usize = 32;
+/// Files at or below this size are read whole (the continuation hint keeps
+/// exact totals); larger files are streamed so a huge file is never loaded
+/// into memory just to return a capped slice.
+const MAX_FULL_READ: u64 = 4 * 1024 * 1024;
 
 pub struct ReadTool {
     pub max_output: usize,
@@ -42,6 +52,72 @@ fn head_truncate<'a>(
     (kept, truncated)
 }
 
+/// `path` accepts a single string or an array of strings.
+fn get_paths(args: &Value) -> Result<Vec<String>, ToolError> {
+    match args.get("path") {
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(items)) => {
+            let paths: Result<Vec<String>, ToolError> = items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| ToolError::Argument("'path' entries must be strings".into()))
+                })
+                .collect();
+            let paths = paths?;
+            if paths.is_empty() {
+                return Err(ToolError::Argument("'path' must not be empty".into()));
+            }
+            Ok(paths)
+        }
+        _ => Err(ToolError::Argument(
+            "'path' must be a string or an array of strings".into(),
+        )),
+    }
+}
+
+/// `glob` accepts a single string or an array of strings.
+fn get_globs(args: &Value) -> Result<Vec<String>, ToolError> {
+    match args.get("glob") {
+        None => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ToolError::Argument("'glob' entries must be strings".into()))
+            })
+            .collect(),
+        Some(_) => Err(ToolError::Argument(
+            "'glob' must be a string or an array of strings".into(),
+        )),
+    }
+}
+
+/// Files under `dir` matching `globs`, honoring .gitignore/hidden like rg.
+fn collect_files(dir: &Path, globs: &[String]) -> Result<Vec<PathBuf>, ToolError> {
+    let mut wb = WalkBuilder::new(dir);
+    let mut ob = OverrideBuilder::new(dir);
+    for g in globs {
+        ob.add(g)
+            .map_err(|e| ToolError::Argument(format!("bad glob '{g}': {e}")))?;
+    }
+    wb.overrides(
+        ob.build()
+            .map_err(|e| ToolError::Argument(format!("bad globs: {e}")))?,
+    );
+    let mut files: Vec<PathBuf> = wb
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|e| e.into_path())
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 impl Tool for ReadTool {
     fn name(&self) -> &'static str {
         "read"
@@ -51,9 +127,20 @@ impl Tool for ReadTool {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Path to read, relative to the workspace." },
-                "offset": { "type": "integer", "minimum": 1, "description": "1-indexed starting line." },
-                "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to return." }
+                "path": {
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ],
+                    "description": "File(s) to read, relative to the workspace. Pass a directory together with 'glob' to read matching files."
+                },
+                "glob": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "When 'path' is a directory, read the files matching these globs (a leading '!' excludes)."
+                },
+                "offset": { "type": "integer", "minimum": 1, "description": "1-indexed starting line (applies per file)." },
+                "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to return per file." }
             },
             "required": ["path"]
         })
@@ -76,15 +163,11 @@ impl Tool for ReadTool {
     }
 }
 
-/// Files at or below this size are read whole (the continuation hint keeps
-/// exact totals); larger files are streamed so a huge file is never loaded
-/// into memory just to return a capped slice.
-const MAX_FULL_READ: u64 = 4 * 1024 * 1024;
-
 impl ReadTool {
     /// The synchronous body, executed on the blocking pool (CRAB-130).
     fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
-        let path = arg_string(args, "path")?;
+        let paths = get_paths(args)?;
+        let globs = get_globs(args)?;
         let offset = arg_usize(args, "offset")?.unwrap_or(1);
         if offset == 0 {
             return Err(ToolError::Argument("'offset' must be >= 1".into()));
@@ -94,28 +177,111 @@ impl ReadTool {
             return Err(ToolError::Argument("'limit' must be >= 1".into()));
         }
 
-        let resolved = resolve(workspace, Path::new(&path))?;
-        // Refuse anything that is not a regular file: opening a FIFO, device,
-        // or socket blocks until a peer appears, which hangs the turn (and the
-        // blocking task cannot be cancelled). Directories are not readable
-        // text either. `metadata` stats without opening, so it cannot block.
-        let meta = match std::fs::metadata(&resolved) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::NotFound(path));
+        // Build the (deduped, sorted) file list from the given paths/globs.
+        let mut files: Vec<PathBuf> = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        for p in &paths {
+            let resolved = resolve(workspace, Path::new(p))?;
+            // `metadata` stats without opening, so a FIFO/device cannot block.
+            let meta = match std::fs::metadata(&resolved) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ToolError::NotFound(p.clone()));
+                }
+                Err(e) => return Err(ToolError::Io(e.to_string())),
+            };
+            if meta.is_dir() {
+                if globs.is_empty() {
+                    return Err(ToolError::Invalid(format!(
+                        "'{p}' is a directory; pass 'glob' to read matching files"
+                    )));
+                }
+                for f in collect_files(&resolved, &globs)? {
+                    let f = f.canonicalize().unwrap_or(f);
+                    if seen.insert(f.clone()) {
+                        files.push(f);
+                    }
+                }
+            } else if meta.is_file() {
+                if seen.insert(resolved.clone()) {
+                    files.push(resolved);
+                }
+            } else {
+                return Err(ToolError::Invalid(format!(
+                    "refusing to read '{p}': not a regular file"
+                )));
             }
-            Err(e) => return Err(ToolError::Io(e.to_string())),
-        };
-        if !meta.is_file() {
-            return Err(ToolError::Invalid(format!(
-                "refusing to read '{path}': not a regular file"
-            )));
+        }
+        files.sort();
+
+        let mut capped = false;
+        if files.len() > MAX_FILES {
+            files.truncate(MAX_FILES);
+            capped = true;
+        }
+        if files.is_empty() {
+            return Ok(ToolOutput {
+                content: "(no files matched)".to_string(),
+            });
         }
 
+        let multi = files.len() > 1;
+        let mut out = String::new();
+        for (i, f) in files.iter().enumerate() {
+            let display = f
+                .strip_prefix(workspace.root())
+                .unwrap_or(f)
+                .display()
+                .to_string();
+            // A file may vanish between listing and reading; skip it quietly.
+            let content = match self.read_one(f, &display, offset, limit) {
+                Ok(c) => c,
+                Err(ToolError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if multi {
+                if i > 0 {
+                    out.push('\n'); // blank line between files (head-style)
+                }
+                out.push_str(&format!("==> {display} <==\n"));
+            }
+            out.push_str(&content);
+            out.push('\n');
+        }
+        let mut out = out.trim_end().to_string();
+
+        if capped {
+            out.push_str(&format!(
+                "\n\n[stopped after {MAX_FILES} files; narrow the glob]"
+            ));
+        }
+        // Single-file reads already bound their own output (including the
+        // targeted long-line hint, which may exceed the cap by design).
+        if multi && out.len() > self.max_output {
+            let mut cut = self.max_output;
+            while cut > 0 && !out.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            out.truncate(cut);
+            out.push_str("\n\n[output truncated; use offset/limit or a narrower glob]");
+        }
+
+        Ok(ToolOutput { content: out })
+    }
+
+    /// Read one regular file, choosing whole-file vs streaming by size.
+    fn read_one(
+        &self,
+        resolved: &Path,
+        display: &str,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<String, ToolError> {
+        let meta = std::fs::metadata(resolved).map_err(|e| ToolError::Io(e.to_string()))?;
         if meta.len() <= MAX_FULL_READ {
-            self.read_whole(&resolved, &path, offset, limit)
+            self.read_whole(resolved, display, offset, limit)
         } else {
-            self.read_streaming(&resolved, &path, offset, limit)
+            self.read_streaming(resolved, display, offset, limit)
         }
     }
 
@@ -123,14 +289,14 @@ impl ReadTool {
     fn read_whole(
         &self,
         resolved: &Path,
-        path: &str,
+        display: &str,
         offset: usize,
         limit: Option<usize>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<String, ToolError> {
         let content = match std::fs::read_to_string(resolved) {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::NotFound(path.to_string()));
+                return Err(ToolError::NotFound(display.to_string()));
             }
             Err(e) => return Err(ToolError::Io(e.to_string())),
         };
@@ -140,9 +306,7 @@ impl ReadTool {
         let start = offset - 1; // 0-based
 
         if total_lines == 0 {
-            return Ok(ToolOutput {
-                content: "(empty file)".to_string(),
-            });
+            return Ok("(empty file)".to_string());
         }
 
         if start >= total_lines {
@@ -165,16 +329,14 @@ impl ReadTool {
         // of an empty result.
         if kept.is_empty() {
             let line = selected[0];
-            return Ok(ToolOutput {
-                content: format!(
-                    "[Line {shown_start} is {} bytes, exceeds {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
-                    line.len(),
-                    self.max_output,
-                    shown_start,
-                    path,
-                    self.max_output
-                ),
-            });
+            return Ok(format!(
+                "[Line {shown_start} is {} bytes, exceeds {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
+                line.len(),
+                self.max_output,
+                shown_start,
+                display,
+                self.max_output
+            ));
         }
 
         let body = kept.join("\n");
@@ -192,7 +354,7 @@ impl ReadTool {
             );
         }
 
-        Ok(ToolOutput { content: out })
+        Ok(out)
     }
 
     /// Stream a large file, stopping at `limit`/`MAX_LINES`/`max_output`
@@ -201,10 +363,10 @@ impl ReadTool {
     fn read_streaming(
         &self,
         resolved: &Path,
-        path: &str,
+        display: &str,
         offset: usize,
         limit: Option<usize>,
-    ) -> Result<ToolOutput, ToolError> {
+    ) -> Result<String, ToolError> {
         let file = std::fs::File::open(resolved).map_err(|e| ToolError::Io(e.to_string()))?;
         let reader = std::io::BufReader::new(file);
         let max_lines = limit.unwrap_or(MAX_LINES).min(MAX_LINES);
@@ -227,16 +389,14 @@ impl ReadTool {
             let add = line.len() + usize::from(!kept.is_empty());
             if bytes + add > self.max_output {
                 if kept.is_empty() {
-                    return Ok(ToolOutput {
-                        content: format!(
-                            "[Line {line_no} is {} bytes, exceeds {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
-                            line.len(),
-                            self.max_output,
-                            line_no,
-                            path,
-                            self.max_output
-                        ),
-                    });
+                    return Ok(format!(
+                        "[Line {line_no} is {} bytes, exceeds {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
+                        line.len(),
+                        self.max_output,
+                        line_no,
+                        display,
+                        self.max_output
+                    ));
                 }
                 more = true;
                 break;
@@ -246,9 +406,7 @@ impl ReadTool {
         }
 
         if line_no == 0 {
-            return Ok(ToolOutput {
-                content: "(empty file)".to_string(),
-            });
+            return Ok("(empty file)".to_string());
         }
         if kept.is_empty() {
             return Err(ToolError::Argument(format!(
@@ -267,7 +425,7 @@ impl ReadTool {
         } else {
             body
         };
-        Ok(ToolOutput { content: out })
+        Ok(out)
     }
 }
 
@@ -450,5 +608,65 @@ mod tests {
             .unwrap();
         assert!(out.content.len() < 512, "bounded: {}", out.content.len());
         assert!(out.content.contains("Use offset="), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn reads_multiple_paths_with_headers() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        let ws = Workspace::new(root).unwrap();
+        let tool = ReadTool { max_output: 1000 };
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": ["a.txt", "b.txt"]}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "==> a.txt <==\none\n\n==> b.txt <==\ntwo");
+    }
+
+    #[tokio::test]
+    async fn reads_a_glob_of_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
+        std::fs::write(root.join("src/c.txt"), "ignore me\n").unwrap();
+        let ws = Workspace::new(root).unwrap();
+        let tool = ReadTool { max_output: 10_000 };
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "src", "glob": ["*.rs"]}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("==> src/a.rs <=="), "{}", out.content);
+        assert!(out.content.contains("fn a() {}"));
+        assert!(out.content.contains("fn b() {}"));
+        assert!(!out.content.contains("ignore me"));
+    }
+
+    #[tokio::test]
+    async fn directory_without_glob_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let tool = ReadTool { max_output: 1000 };
+        let err = tool
+            .run(
+                &ws,
+                &json!({"path": "src"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("is a directory"), "{err}");
     }
 }

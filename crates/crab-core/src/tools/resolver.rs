@@ -42,7 +42,7 @@ impl ToolSet {
         let mut set = Self { tools: Vec::new() };
         set.push(
             "read",
-            "Read a file (optionally a line range) in the workspace.",
+            "Read one or more files (a path, a list of paths, or a directory plus a glob), optionally a line range. Prefer this over `cat`/`head`.",
             Box::new(ReadTool { max_output }),
         );
         set.push(
