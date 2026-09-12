@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use crab_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEventKind,
-    KeyModifiers,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -107,6 +107,119 @@ pub fn parse_line(line: &str) -> LineAction {
     }
 }
 
+/// One-line, human-readable summary of a tool call's arguments, shown after
+/// the tool name in the transcript (CRAB-139). Returns `None` when there is no
+/// useful single-line summary, so the call line stays just `⚙ <name>`.
+pub fn tool_detail(name: &str, args: Option<&serde_json::Value>) -> Option<String> {
+    let args = args?;
+    let raw = match name {
+        "bash" => format!("$ {}", args.get("command")?.as_str()?),
+        "read" | "edit" | "write" => {
+            let path = args
+                .get("path")
+                .or_else(|| args.get("file_path"))?
+                .as_str()?;
+            format!("{name} {path}")
+        }
+        _ => return None,
+    };
+    Some(one_line(&raw))
+}
+
+/// Longest detail rendered after the tool name, to keep a heredoc or a `write`
+/// body from flooding the transcript.
+const TOOL_DETAIL_MAX: usize = 120;
+
+/// Collapse to a single line (the first line plus ` …` when more follow) and
+/// cap at [`TOOL_DETAIL_MAX`] characters, char-boundary safe.
+fn one_line(raw: &str) -> String {
+    let cleaned = raw.replace('\r', "");
+    let multi = cleaned.contains('\n');
+    let first = cleaned.lines().next().unwrap_or("");
+    let mut out = first.trim_end().to_string();
+    if multi {
+        out.push_str(" …");
+    }
+    if out.chars().count() > TOOL_DETAIL_MAX {
+        out = out.chars().take(TOOL_DETAIL_MAX - 1).collect();
+        out.push('…');
+    }
+    out
+}
+
+/// Transcript scrollback. `top` is the first visible wrapped row; `follow`
+/// keeps the view pinned to the newest content as it grows; `viewport` is the
+/// last rendered height, so key handling can page without knowing the terminal
+/// size. Pure state, unit-testable without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptScroll {
+    top: usize,
+    follow: bool,
+    viewport: usize,
+}
+
+impl Default for TranscriptScroll {
+    fn default() -> Self {
+        Self {
+            top: 0,
+            follow: true,
+            viewport: 0,
+        }
+    }
+}
+
+impl TranscriptScroll {
+    /// Clamp for the current content height and viewport, returning the first
+    /// row to render. Re-enables follow once the bottom is reached.
+    pub fn resolve(&mut self, total: usize, viewport: usize) -> usize {
+        self.viewport = viewport;
+        let max_top = total.saturating_sub(viewport);
+        if self.follow {
+            self.top = max_top;
+        } else {
+            self.top = self.top.min(max_top);
+            if self.top >= max_top {
+                self.follow = true;
+            }
+        }
+        self.top
+    }
+
+    /// Page up one viewport and stop following the tail.
+    pub fn page_up(&mut self) {
+        self.follow = false;
+        self.top = self.top.saturating_sub(self.viewport.max(1));
+    }
+
+    /// Page down one viewport; `resolve` re-enables follow at the bottom.
+    pub fn page_down(&mut self) {
+        self.top = self.top.saturating_add(self.viewport.max(1));
+        self.follow = false;
+    }
+
+    /// Scroll by `lines` (negative = up); scrolling up stops following.
+    pub fn scroll_by(&mut self, lines: isize) {
+        if lines < 0 {
+            self.follow = false;
+            self.top = self.top.saturating_sub(lines.unsigned_abs());
+        } else {
+            self.top = self.top.saturating_add(lines as usize);
+            self.follow = false;
+        }
+    }
+
+    /// Jump to the oldest content.
+    pub fn jump_to_top(&mut self) {
+        self.follow = false;
+        self.top = 0;
+    }
+
+    /// Resume following the newest content.
+    pub fn follow_tail(&mut self) {
+        self.follow = true;
+    }
+}
+
 /// A single line of the transcript (user or assistant content). Assistant
 /// text streams in via `text_delta` events and is appended to the current
 /// assistant line.
@@ -129,6 +242,8 @@ pub struct UiModel {
     pub iterations: usize,
     /// True when the last event was a turn end (used to reset stats display).
     pub settled: bool,
+    /// Transcript scrollback (follow the tail unless the user scrolled up).
+    pub scroll: TranscriptScroll,
 }
 
 impl UiModel {
@@ -140,6 +255,7 @@ impl UiModel {
             usage: None,
             iterations: 0,
             settled: false,
+            scroll: TranscriptScroll::default(),
         }
     }
 
@@ -156,10 +272,13 @@ impl UiModel {
                 self.assistant_buf.push_str(text);
             }
             Event::ThinkingDelta { .. } => {} // rendered inline by the shell if desired
-            Event::ToolStart { name, .. } => {
+            Event::ToolStart { name, args, .. } => {
                 self.flush_assistant();
-                self.transcript
-                    .push(TranscriptLine::Tool(format!("⚙ {name}")));
+                let line = match tool_detail(name, args.as_ref()) {
+                    Some(detail) => format!("⚙ {name} {detail}"),
+                    None => format!("⚙ {name}"),
+                };
+                self.transcript.push(TranscriptLine::Tool(line));
             }
             Event::ToolEnd { name, ok, .. } => {
                 let marker = if *ok { "✓" } else { "✗" };
@@ -187,9 +306,17 @@ impl UiModel {
                 interrupted: _,
             } => {
                 self.settled = true;
-                // The settled text may already be in assistant_buf (streamed);
-                // if not, show it as the final line.
-                if !text.is_empty() && !self.assistant_buf.contains(text) {
+                // `turn_end` already flushed streamed text, so `assistant_buf`
+                // is empty here even when the answer streamed — the previous
+                // `!assistant_buf.contains(text)` guard therefore re-appended
+                // it, duplicating the answer for every provider that streams.
+                // Only add `text` when it is not already the last line (i.e. a
+                // provider that did not stream it).
+                let already_shown = matches!(
+                    self.transcript.last(),
+                    Some(TranscriptLine::Assistant(t)) if t == text
+                );
+                if !text.is_empty() && !already_shown && !self.assistant_buf.contains(text) {
                     self.assistant_buf.push_str(text);
                 }
                 self.flush_assistant();
@@ -214,6 +341,8 @@ impl UiModel {
 
     /// Show a user message as a transcript line (called on submit).
     pub fn push_user(&mut self, text: &str) {
+        // A new message should be visible: resume following the tail.
+        self.scroll.follow_tail();
         self.transcript.push(TranscriptLine::User(text.to_string()));
     }
 
@@ -483,8 +612,13 @@ pub fn run_tui(
 ) -> Result<i32, String> {
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .map_err(|e| format!("cannot enter alt screen: {e}"))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+    .map_err(|e| format!("cannot enter alt screen: {e}"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
@@ -497,7 +631,7 @@ pub fn run_tui(
     let result = (|| -> Result<i32, String> {
         // One-time editing-key hint so the line editor is discoverable.
         model.push_notice(
-            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · /help commands",
+            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · PgUp/PgDn/↑↓ scroll · /help commands",
         );
         // Seed the transcript with the initial prompt, then start the turn.
         if !initial.trim().is_empty() {
@@ -531,7 +665,7 @@ pub fn run_tui(
                     .draw(|f| {
                         draw(
                             f,
-                            &model,
+                            &mut model,
                             &input,
                             &picker,
                             rt.is_busy(),
@@ -560,6 +694,12 @@ pub fn run_tui(
                     // caret (so Ctrl+Shift+V works for keys / long inputs);
                     // CR/LF is flattened because the editor is single-line.
                     TermEvent::Paste(text) => input.insert(&text),
+                    // Mouse wheel scrolls the transcript (3 rows per notch).
+                    TermEvent::Mouse(me) => match me.kind {
+                        MouseEventKind::ScrollUp => model.scroll.scroll_by(-3),
+                        MouseEventKind::ScrollDown => model.scroll.scroll_by(3),
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
@@ -571,7 +711,8 @@ pub fn run_tui(
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableMouseCapture
     )
     .ok();
     terminal.show_cursor().ok();
@@ -634,6 +775,37 @@ fn handle_key(
             _ => {}
         }
         return;
+    }
+
+    // Transcript scrollback: PageUp/PageDown page, Up/Down by one line, and
+    // Ctrl+Home/Ctrl+End jump to the oldest/newest content. Scrolling up pauses
+    // follow; returning to the bottom resumes it.
+    match code {
+        KeyCode::PageUp => {
+            model.scroll.page_up();
+            return;
+        }
+        KeyCode::PageDown => {
+            model.scroll.page_down();
+            return;
+        }
+        KeyCode::Up => {
+            model.scroll.scroll_by(-1);
+            return;
+        }
+        KeyCode::Down => {
+            model.scroll.scroll_by(1);
+            return;
+        }
+        KeyCode::Home if modifiers.contains(KeyModifiers::CONTROL) => {
+            model.scroll.jump_to_top();
+            return;
+        }
+        KeyCode::End if modifiers.contains(KeyModifiers::CONTROL) => {
+            model.scroll.follow_tail();
+            return;
+        }
+        _ => {}
     }
 
     match code {
@@ -830,7 +1002,7 @@ fn run_command(
 /// picker renders as a centered overlay sized to its choices (CRAB-127).
 fn draw(
     f: &mut Frame,
-    model: &UiModel,
+    model: &mut UiModel,
     input: &InputEditor,
     picker: &Option<Picker>,
     busy: bool,
@@ -874,12 +1046,16 @@ fn draw(
             )),
         })
         .collect();
-    let viewport = (chunks[0].height as usize).saturating_sub(2); // borders
-    let scrollback = lines.len().saturating_sub(viewport);
+    // `line_count` returns the wrapped height including the block's border
+    // rows, so the full chunk height is the matching viewport. Scrolling by the
+    // logical line count instead left the newest (wrapped) lines off-screen.
+    let inner_w = chunks[0].width.saturating_sub(2);
     let transcript = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" crab "))
-        .scroll((scrollback as u16, 0))
         .wrap(Wrap { trim: false });
+    let total = transcript.line_count(inner_w);
+    let top = model.scroll.resolve(total, chunks[0].height as usize);
+    let transcript = transcript.scroll(((top.min(u16::MAX as usize)) as u16, 0));
     f.render_widget(transcript, chunks[0]);
 
     // Input editor (or picker overlay).
@@ -1229,10 +1405,57 @@ mod tests {
         m.apply_event(&Event::ToolStart {
             name: "bash".into(),
             id: None,
+            args: None,
         });
         assert!(m.assistant_buf.is_empty());
         assert_eq!(m.transcript[0], TranscriptLine::Assistant("Hello".into()));
         assert_eq!(m.transcript[1], TranscriptLine::Tool("⚙ bash".into()));
+    }
+
+    #[test]
+    fn bash_tool_start_shows_the_command() {
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ToolStart {
+            name: "bash".into(),
+            id: None,
+            args: Some(serde_json::json!({ "command": "ls -la" })),
+        });
+        assert_eq!(
+            m.transcript[0],
+            TranscriptLine::Tool("⚙ bash $ ls -la".into())
+        );
+    }
+
+    #[test]
+    fn tool_detail_rules() {
+        use serde_json::json;
+        assert_eq!(
+            tool_detail("bash", Some(&json!({"command": "ls -la"}))).as_deref(),
+            Some("$ ls -la")
+        );
+        // Multi-line input keeps only the first line, with an ellipsis.
+        assert_eq!(
+            tool_detail("bash", Some(&json!({"command": "echo a\necho b"}))).as_deref(),
+            Some("$ echo a …")
+        );
+        // read/edit/write summarize the path.
+        assert_eq!(
+            tool_detail("read", Some(&json!({"path": "src/main.rs"}))).as_deref(),
+            Some("read src/main.rs")
+        );
+        assert_eq!(
+            tool_detail("write", Some(&json!({"file_path": "a.txt"}))).as_deref(),
+            Some("write a.txt")
+        );
+        // No summary: absent args, missing/non-string keys, unknown tools.
+        assert_eq!(tool_detail("bash", None), None);
+        assert_eq!(tool_detail("bash", Some(&json!({"timeout": 5}))), None);
+        assert_eq!(tool_detail("mcp__x", Some(&json!({"command": "ls"}))), None);
+        // Long input is capped at 120 chars, char-boundary safe.
+        let long = "é".repeat(200);
+        let detail = tool_detail("bash", Some(&json!({"command": long}))).unwrap();
+        assert_eq!(detail.chars().count(), 120);
+        assert!(detail.ends_with('…'));
     }
 
     #[test]
@@ -1264,6 +1487,69 @@ mod tests {
             m.transcript.last(),
             Some(&TranscriptLine::Assistant("answer".into()))
         );
+    }
+
+    #[test]
+    fn agent_settled_does_not_duplicate_streamed_text() {
+        // Real providers stream via text_delta, so turn_end flushes the answer
+        // before agent_settled arrives; it must not be appended again.
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::TurnStart {});
+        m.apply_event(&Event::TextDelta {
+            text: "answer".into(),
+        });
+        m.apply_event(&Event::TurnEnd {});
+        m.apply_event(&Event::AgentSettled {
+            text: "answer".into(),
+            interrupted: false,
+        });
+        let copies = m
+            .transcript
+            .iter()
+            .filter(|l| matches!(l, TranscriptLine::Assistant(t) if t == "answer"))
+            .count();
+        assert_eq!(copies, 1, "transcript: {:?}", m.transcript);
+    }
+
+    #[test]
+    fn agent_settled_adds_text_when_nothing_streamed() {
+        // Providers that do not stream deliver the answer only in agent_settled.
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::TurnStart {});
+        m.apply_event(&Event::TurnEnd {});
+        m.apply_event(&Event::AgentSettled {
+            text: "answer".into(),
+            interrupted: false,
+        });
+        assert_eq!(
+            m.transcript,
+            vec![TranscriptLine::Assistant("answer".into())]
+        );
+    }
+
+    #[test]
+    fn transcript_scroll_follows_and_pages() {
+        let mut s = TranscriptScroll::default();
+        // Following: resolve pins to the newest content.
+        assert_eq!(s.resolve(100, 10), 90);
+        // Paging up pauses follow and keeps the view put as content grows.
+        s.page_up();
+        assert_eq!(s.resolve(100, 10), 80);
+        assert_eq!(s.resolve(120, 10), 80);
+        // Paging down to the bottom resumes following: newer content then
+        // pins to the tail again.
+        s.page_down();
+        s.page_down();
+        s.page_down();
+        assert_eq!(s.resolve(120, 10), 110);
+        assert_eq!(s.resolve(200, 10), 190);
+        // Jump to the oldest, then resume the tail.
+        s.jump_to_top();
+        assert_eq!(s.resolve(120, 10), 0);
+        s.follow_tail();
+        assert_eq!(s.resolve(120, 10), 110);
+        // Content shorter than the viewport never scrolls.
+        assert_eq!(TranscriptScroll::default().resolve(3, 10), 0);
     }
 
     #[test]

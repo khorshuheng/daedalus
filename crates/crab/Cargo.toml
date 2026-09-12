@@ -24,7 +24,9 @@ futures = "0.3"
 clap = { version = "4.5.23", features = ["derive"] }
 anyhow = "1.0.95"
 # TUI (CRAB-121): ratatui 0.29 + crossterm 0.28.
-ratatui = "0.29.0"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, used to keep
+# the transcript pinned to the true bottom once lines wrap.
+ratatui = { version = "0.29.0", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28.1"
 # CRAB-126: display-width of input text so the caret column is correct for
 # wide (CJK) and zero-width chars. Already in the tree via ratatui 0.29.

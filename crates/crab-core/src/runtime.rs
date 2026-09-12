@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EffortStyle, ProviderInfo};
@@ -166,6 +167,11 @@ pub enum Event {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
+        /// Raw model-supplied tool arguments, so a frontend can show what the
+        /// call will do (e.g. the bash command). Optional and omitted on the
+        /// wire when absent, so older event consumers keep working (CRAB-139).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<Value>,
     },
     /// A tool call finished.
     ToolEnd {
@@ -1130,6 +1136,7 @@ impl AgentRuntime {
                                     self.emit(Event::ToolStart {
                                         name: call.name.clone(),
                                         id: Some(call.id.clone()),
+                                        args: Some(call.args.clone()),
                                     });
                                     let tools = Arc::clone(&self.inner.tools);
                                     let ws = ws.clone();
@@ -1617,9 +1624,13 @@ mod tests {
         rt.prompt("run a command");
         let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, Event::ToolStart { name, .. } if name == "bash")));
+        // CRAB-139: the event carries the call's arguments so a frontend can
+        // show the executed command.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ToolStart { name, args: Some(a), .. }
+                if name == "bash" && a.get("command").and_then(|v| v.as_str()) == Some("echo hi")
+        )));
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ToolEnd { name, ok: true, .. } if name == "bash")));
