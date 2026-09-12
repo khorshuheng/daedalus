@@ -198,6 +198,8 @@ pub enum Event {
     },
     /// The agent settled: a final answer (or empty when cancelled).
     AgentSettled { text: String, interrupted: bool },
+    /// The provider's available model ids, in reply to `list_models` (CRAB-141).
+    ModelsListed { models: Vec<String> },
     /// A non-fatal error surfaced by the runtime.
     Error { message: String },
 }
@@ -217,6 +219,7 @@ impl Event {
             Event::QueueUpdate { .. } => "queue_update",
             Event::StateChanged { .. } => "state_changed",
             Event::AgentSettled { .. } => "agent_settled",
+            Event::ModelsListed { .. } => "models_listed",
             Event::Error { .. } => "error",
         }
     }
@@ -256,6 +259,8 @@ pub enum CommandKind {
     Clear {},
     /// Ask the runtime to report its current state.
     GetState {},
+    /// Discover the configured provider's available models (CRAB-141).
+    ListModels {},
     /// Reload the previous saved session for the workspace. Handled by the
     /// adapter (the runtime does not own the session store).
     Resume,
@@ -406,6 +411,8 @@ struct Inner {
     commands_tx: tokio::sync::mpsc::UnboundedSender<Control>,
     commands_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Control>>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
+    /// Cached model ids discovered for the current provider (CRAB-141).
+    models: Mutex<Vec<String>>,
 }
 
 /// A cloneable handle to a running agent. Construct with `AgentRuntime::new`
@@ -455,6 +462,7 @@ impl AgentRuntime {
                 commands_tx,
                 commands_rx: tokio::sync::Mutex::new(commands_rx),
                 events,
+                models: Mutex::new(Vec::new()),
             }),
         };
         (runtime, rx)
@@ -588,6 +596,20 @@ impl AgentRuntime {
         self.inner.config.provider
     }
 
+    /// Cached model ids discovered for the current provider (CRAB-141).
+    pub fn models(&self) -> Vec<String> {
+        self.inner.models.lock().unwrap().clone()
+    }
+
+    /// Ask the worker to refresh the provider's model list; the result arrives
+    /// as `Event::ModelsListed` (or `Event::Error`).
+    pub fn refresh_models(&self) {
+        let _ = self
+            .inner
+            .commands_tx
+            .send(Control::Command(CommandKind::ListModels {}));
+    }
+
     /// Skills discovered for the current workspace (user + workspace levels,
     /// workspace wins on a name clash, CRAB-138). Re-read on every call so a
     /// file dropped into `<workspace>/.crab/skills/` is picked up on the next
@@ -656,6 +678,15 @@ impl AgentRuntime {
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
+                CommandKind::ListModels {} => match self.inner.provider.list_models().await {
+                    Ok(models) => {
+                        *self.inner.models.lock().unwrap() = models.clone();
+                        self.emit(Event::ModelsListed { models });
+                    }
+                    Err(e) => self.emit(Event::Error {
+                        message: format!("could not list models: {e}"),
+                    }),
+                },
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
                 | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
@@ -845,6 +876,15 @@ impl AgentRuntime {
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
+                CommandKind::ListModels {} => match self.inner.provider.list_models().await {
+                    Ok(models) => {
+                        *self.inner.models.lock().unwrap() = models.clone();
+                        self.emit(Event::ModelsListed { models });
+                    }
+                    Err(e) => self.emit(Event::Error {
+                        message: format!("could not list models: {e}"),
+                    }),
+                },
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
                 | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
@@ -1617,6 +1657,41 @@ mod tests {
             _ => None,
         });
         assert_eq!(settled_event, Some(("hello world".to_string(), false)));
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn default_list_models_reports_unsupported() {
+        // GateProvider implements only `complete`, so it inherits the default.
+        let g = GateProvider::new(vec![]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt.block_on(g.list_models()).unwrap_err();
+        assert!(matches!(err, ProviderError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn refresh_models_caches_and_emits() {
+        let provider = FakeProvider::new(vec![]).with_models(vec!["m2".into(), "m1".into()]);
+        let (rt, mut rx, handle, _ws) = runtime_with("models", Box::new(provider));
+        rt.refresh_models();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut listed: Option<Vec<String>> = None;
+        while listed.is_none() && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Event::ModelsListed { models }) => listed = Some(models),
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert_eq!(
+            listed.as_deref(),
+            Some(&["m2".to_string(), "m1".to_string()][..])
+        );
+        assert_eq!(rt.models(), vec!["m2".to_string(), "m1".to_string()]);
         rt.shutdown();
         handle.join().unwrap_or(());
     }

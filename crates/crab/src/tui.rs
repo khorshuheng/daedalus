@@ -76,6 +76,136 @@ pub enum SlashCommand {
     Exit,
 }
 
+/// Metadata for one slash command: the single source of truth for the parser,
+/// `/help`, and the completion dropdown (CRAB-141).
+pub struct CommandSpec {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    /// Argument hint shown after the name, e.g. `Some("<name>")`.
+    pub args: Option<&'static str>,
+    pub description: &'static str,
+    build: fn(String) -> SlashCommand,
+}
+
+/// Every slash command, in display order.
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "login",
+        aliases: &[],
+        args: None,
+        description: "Store a provider API key in the keyring",
+        build: |_| SlashCommand::Login,
+    },
+    CommandSpec {
+        name: "model",
+        aliases: &[],
+        args: Some("<name>"),
+        description: "Change the model (picker when omitted)",
+        build: SlashCommand::Model,
+    },
+    CommandSpec {
+        name: "effort",
+        aliases: &[],
+        args: Some("[level]"),
+        description: "Change thinking effort (picker when omitted)",
+        build: SlashCommand::Effort,
+    },
+    CommandSpec {
+        name: "workspace",
+        aliases: &[],
+        args: Some("<path>"),
+        description: "Change the workspace directory",
+        build: |a| SlashCommand::Workspace(PathBuf::from(a)),
+    },
+    CommandSpec {
+        name: "skills",
+        aliases: &[],
+        args: None,
+        description: "List discovered skills",
+        build: |_| SlashCommand::Skills,
+    },
+    CommandSpec {
+        name: "skill",
+        aliases: &[],
+        args: Some("<name>"),
+        description: "Load a skill's instructions",
+        build: SlashCommand::Skill,
+    },
+    CommandSpec {
+        name: "tools",
+        aliases: &[],
+        args: None,
+        description: "List registered tools",
+        build: |_| SlashCommand::Tools,
+    },
+    CommandSpec {
+        name: "resume",
+        aliases: &[],
+        args: None,
+        description: "Continue the previous session",
+        build: |_| SlashCommand::Resume,
+    },
+    CommandSpec {
+        name: "clear",
+        aliases: &[],
+        args: None,
+        description: "Reset the conversation",
+        build: |_| SlashCommand::Clear,
+    },
+    CommandSpec {
+        name: "help",
+        aliases: &[],
+        args: None,
+        description: "Show this list",
+        build: |_| SlashCommand::Help,
+    },
+    CommandSpec {
+        name: "exit",
+        aliases: &["quit", "q"],
+        args: None,
+        description: "Quit (saving the session)",
+        build: |_| SlashCommand::Exit,
+    },
+];
+
+/// Slash-command candidates for the input's leading `/token` (CRAB-141).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// Indexes into [`COMMANDS`].
+    pub matches: Vec<usize>,
+    pub selected: usize,
+}
+
+/// Live-filter slash commands by the input's leading `/token`. `None` unless
+/// the input is a bare command token with at least one match.
+pub fn slash_completions(input: &str) -> Option<Completion> {
+    let rest = input.strip_prefix('/')?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    let prefix = rest.to_ascii_lowercase();
+    let matches: Vec<usize> = COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.name.starts_with(&prefix))
+        .map(|(i, _)| i)
+        .collect();
+    if matches.is_empty() {
+        None
+    } else {
+        Some(Completion {
+            matches,
+            selected: 0,
+        })
+    }
+}
+
+/// The text inserted when accepting `spec`: `/name ` with a trailing space so
+/// an argument can follow.
+pub fn accept_completion(spec: &CommandSpec) -> String {
+    format!("/{} ", spec.name)
+}
+
 /// Classify a raw submitted line. Lines that do not start with `/` are user
 /// messages; `/name` is parsed as a command, with `/name value` carrying an
 /// argument.
@@ -86,22 +216,11 @@ pub fn parse_line(line: &str) -> LineAction {
             Some((n, a)) => (n, a.trim()),
             None => (rest, ""),
         };
-        let cmd = match name {
-            "login" => Some(SlashCommand::Login),
-            "model" => Some(SlashCommand::Model(arg.to_string())),
-            "effort" => Some(SlashCommand::Effort(arg.to_string())),
-            "workspace" => Some(SlashCommand::Workspace(PathBuf::from(arg))),
-            "skills" => Some(SlashCommand::Skills),
-            "skill" => Some(SlashCommand::Skill(arg.to_string())),
-            "tools" => Some(SlashCommand::Tools),
-            "resume" => Some(SlashCommand::Resume),
-            "clear" => Some(SlashCommand::Clear),
-            "help" => Some(SlashCommand::Help),
-            "exit" | "quit" | "q" => Some(SlashCommand::Exit),
-            _ => None,
-        };
-        match cmd {
-            Some(c) => LineAction::Command(c),
+        let spec = COMMANDS
+            .iter()
+            .find(|c| c.name == name || c.aliases.contains(&name));
+        match spec {
+            Some(c) => LineAction::Command((c.build)(arg.to_string())),
             None => LineAction::Command(SlashCommand::Help), // unknown -> help
         }
     } else {
@@ -259,6 +378,10 @@ pub struct UiModel {
     pub revision: u64,
     /// Cache of the rendered transcript, keyed by (revision, area width).
     pub md_cache: Option<(u64, u16, Vec<ratatui::text::Line<'static>>)>,
+    /// Active slash-command completion, if any (CRAB-141).
+    pub completion: Option<Completion>,
+    /// True while a `/model` model-list fetch is in flight (CRAB-141).
+    pub model_fetch_pending: bool,
 }
 
 impl UiModel {
@@ -274,6 +397,8 @@ impl UiModel {
             scroll: TranscriptScroll::default(),
             revision: 0,
             md_cache: None,
+            completion: None,
+            model_fetch_pending: false,
         }
     }
 
@@ -347,6 +472,7 @@ impl UiModel {
                 }
                 self.flush_assistant();
             }
+            Event::ModelsListed { .. } => {} // handled by the shell (CRAB-141)
             Event::Error { message } => {
                 self.flush_thinking();
                 self.flush_assistant();
@@ -440,6 +566,12 @@ impl InputEditor {
     pub fn take(&mut self) -> String {
         self.cursor = 0;
         std::mem::take(&mut self.text)
+    }
+
+    /// Replace the whole text; the cursor moves to the end (CRAB-141).
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.cursor = self.text.len();
     }
 
     /// Insert at the cursor. The editor is single-line, so pasted control
@@ -642,6 +774,28 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+/// Recompute the slash-command completion for the current input, preserving
+/// the highlighted row when the candidate set is unchanged (CRAB-141).
+fn refresh_completion(
+    model: &mut UiModel,
+    input: &InputEditor,
+    picker: &Option<Picker>,
+    login_pending: bool,
+) {
+    let next = if login_pending || picker.is_some() {
+        None
+    } else {
+        slash_completions(input.text())
+    };
+    model.completion = match (model.completion.take(), next) {
+        (Some(old), Some(mut new)) if old.matches == new.matches => {
+            new.selected = old.selected.min(new.matches.len().saturating_sub(1));
+            Some(new)
+        }
+        (_, next) => next,
+    };
+}
+
 /// Ratatui rendering + event loop shell. Owns the screen (crossterm raw
 /// mode + alternate screen); all *state* lives in the pure model above.
 /// Never prints to stdout directly — ratatui owns the terminal. On exit the
@@ -690,6 +844,28 @@ pub fn run_tui(
             }
             // Drain runtime events into the model.
             while let Ok(ev) = rx.try_recv() {
+                // A pending `/model` fetch resolves into the model picker, or a
+                // notice explaining why it failed (CRAB-141).
+                if model.model_fetch_pending {
+                    match &ev {
+                        Event::ModelsListed { models } if !models.is_empty() => {
+                            picker = Some(Picker::Model {
+                                selected: 0,
+                                models: models.clone(),
+                            });
+                            model.model_fetch_pending = false;
+                        }
+                        Event::ModelsListed { .. } => {
+                            model.push_notice("no models reported; use /model <name>");
+                            model.model_fetch_pending = false;
+                        }
+                        Event::Error { message } => {
+                            model.push_notice(&format!("{message}; use /model <name>"));
+                            model.model_fetch_pending = false;
+                        }
+                        _ => {}
+                    }
+                }
                 let state_changed = matches!(ev, Event::StateChanged { .. });
                 model.apply_event(&ev);
                 if state_changed {
@@ -723,21 +899,27 @@ pub fn run_tui(
             // Poll for a key (short timeout keeps the spinner/event drain live).
             if event::poll(Duration::from_millis(33)).map_err(|e| e.to_string())? {
                 match event::read().map_err(|e| e.to_string())? {
-                    TermEvent::Key(key) if key.kind == KeyEventKind::Press => handle_key(
-                        rt,
-                        &mut model,
-                        &mut input,
-                        &mut picker,
-                        &mut login_pending,
-                        &mut should_exit,
-                        session_root,
-                        key.code,
-                        key.modifiers,
-                    ),
+                    TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
+                        handle_key(
+                            rt,
+                            &mut model,
+                            &mut input,
+                            &mut picker,
+                            &mut login_pending,
+                            &mut should_exit,
+                            session_root,
+                            key.code,
+                            key.modifiers,
+                        );
+                        refresh_completion(&mut model, &input, &picker, login_pending);
+                    }
                     // Bracketed paste: insert the whole pasted text at the
                     // caret (so Ctrl+Shift+V works for keys / long inputs);
                     // CR/LF is flattened because the editor is single-line.
-                    TermEvent::Paste(text) => input.insert(&text),
+                    TermEvent::Paste(text) => {
+                        input.insert(&text);
+                        refresh_completion(&mut model, &input, &picker, login_pending);
+                    }
                     // Mouse wheel scrolls the transcript (3 rows per notch).
                     TermEvent::Mouse(me) => match me.kind {
                         MouseEventKind::ScrollUp => model.scroll.scroll_by(-3),
@@ -770,7 +952,14 @@ pub fn run_tui(
 
 /// A modal picker overlay (model / effort selection).
 enum Picker {
-    Effort { selected: usize },
+    Effort {
+        selected: usize,
+    },
+    /// Model choices fetched from the provider (CRAB-141).
+    Model {
+        selected: usize,
+        models: Vec<String>,
+    },
 }
 
 /// Route one key press. Pure decisions delegated to the model where possible;
@@ -792,6 +981,7 @@ fn handle_key(
         // we do not hold a borrow across the mutations below.
         let max = match p {
             Picker::Effort { .. } => EFFORT_CHOICES.len(),
+            Picker::Model { models, .. } => models.len(),
         };
         match code {
             // Ctrl-C cancels the overlay (like Esc); a second Ctrl-C at the
@@ -802,9 +992,15 @@ fn handle_key(
                 Picker::Effort { selected } => {
                     *selected = (*selected + 1).min(max - 1);
                 }
+                Picker::Model { selected, .. } => {
+                    *selected = (*selected + 1).min(max.saturating_sub(1));
+                }
             },
             KeyCode::Up | KeyCode::Char('k') => match p {
                 Picker::Effort { selected } => {
+                    *selected = selected.saturating_sub(1);
+                }
+                Picker::Model { selected, .. } => {
                     *selected = selected.saturating_sub(1);
                 }
             },
@@ -815,10 +1011,67 @@ fn handle_key(
                     model.state.effort = effort;
                     *picker = None;
                 }
+                Picker::Model { selected, models } => {
+                    if let Some(name) = models.get(*selected) {
+                        rt.set_model(name);
+                        model.state.model = name.clone();
+                    }
+                    *picker = None;
+                }
             },
             _ => {}
         }
         return;
+    }
+
+    // Slash-command completion (CRAB-141): only navigation/accept keys are
+    // intercepted, so typing still edits the input (which the shell then
+    // re-filters). Up/Down no longer scroll the transcript while it is open.
+    if model.completion.is_some() {
+        let (sel, len, idx) = {
+            let c = model.completion.as_ref().unwrap();
+            (
+                c.selected,
+                c.matches.len(),
+                c.matches.get(c.selected).copied(),
+            )
+        };
+        match code {
+            KeyCode::Up => {
+                model.completion.as_mut().unwrap().selected = sel.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                if sel + 1 < len {
+                    model.completion.as_mut().unwrap().selected = sel + 1;
+                }
+                return;
+            }
+            KeyCode::Tab => {
+                if let Some(i) = idx {
+                    let text = accept_completion(&COMMANDS[i]);
+                    input.set_text(text);
+                }
+                model.completion = None;
+                return;
+            }
+            KeyCode::Esc => {
+                model.completion = None;
+                return;
+            }
+            KeyCode::Enter => {
+                // Enter accepts a partial token, but submits an exact command.
+                if let Some(i) = idx {
+                    if input.text() != format!("/{}", COMMANDS[i].name) {
+                        let text = accept_completion(&COMMANDS[i]);
+                        input.set_text(text);
+                        model.completion = None;
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     // Transcript scrollback: PageUp/PageDown page, Up/Down by one line, and
@@ -947,9 +1200,10 @@ fn run_command(
 ) -> bool {
     match cmd {
         SlashCommand::Help => {
-            model.push_notice(
-                "/login /model /effort /workspace /resume /clear /skills /skill /tools /help /exit",
-            );
+            for c in COMMANDS {
+                let args = c.args.map(|a| format!(" {a}")).unwrap_or_default();
+                model.push_notice(&format!("/{}{} — {}", c.name, args, c.description));
+            }
         }
         SlashCommand::Clear => {
             rt.clear();
@@ -977,8 +1231,19 @@ fn run_command(
         }
         SlashCommand::Model(arg) => {
             if arg.is_empty() {
-                // CRAB-132: no static model lists — the user types the model.
-                model.push_notice("usage: /model <model>");
+                // CRAB-141: pick from the provider's live model list; fetch it
+                // on first use (the result arrives as `Event::ModelsListed`).
+                let models = rt.models();
+                if models.is_empty() {
+                    rt.refresh_models();
+                    model.push_notice("fetching models…");
+                    model.model_fetch_pending = true;
+                } else {
+                    *picker = Some(Picker::Model {
+                        selected: 0,
+                        models,
+                    });
+                }
             } else {
                 rt.set_model(&arg);
                 model.state.model = arg;
@@ -1157,10 +1422,16 @@ fn draw(
     use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
     let area = f.area();
+    let cmd_h = model
+        .completion
+        .as_ref()
+        .map(|c| (c.matches.len().min(6) + 2) as u16)
+        .unwrap_or(0);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
+            Constraint::Length(cmd_h),
             Constraint::Length(3),
             Constraint::Length(1),
         ])
@@ -1199,6 +1470,11 @@ fn draw(
     let transcript = transcript.scroll(((top.min(u16::MAX as usize)) as u16, 0));
     f.render_widget(transcript, chunks[0]);
 
+    // Slash-command completion dropdown (CRAB-141).
+    if let Some(c) = &model.completion {
+        draw_completions(f, chunks[1], c, theme);
+    }
+
     // Input editor (or picker overlay).
     match picker {
         Some(Picker::Effort { selected }) => {
@@ -1209,11 +1485,20 @@ fn draw(
                 .collect();
             draw_picker(f, &names, *selected, title, theme);
         }
+        Some(Picker::Model { selected, models }) => {
+            draw_picker(
+                f,
+                models,
+                *selected,
+                " model — ↑/↓ · Enter apply · Esc cancel ",
+                theme,
+            );
+        }
         None => {
             // Show the window of the text that contains the caret so long
             // lines stay editable (CRAB-126), and place the terminal cursor
             // on the caret so typing position is visible.
-            let inner_w = chunks[1].width.saturating_sub(2) as usize;
+            let inner_w = chunks[2].width.saturating_sub(2) as usize;
             let (window, cursor_col) = input.window(inner_w);
             let editor = Paragraph::new(window)
                 .style(style(theme.token(Token::Input)))
@@ -1224,11 +1509,11 @@ fn draw(
                         .title(" input ")
                         .title_style(style(theme.token(Token::Title))),
                 );
-            f.render_widget(editor, chunks[1]);
-            let x = chunks[1].x + 1 + cursor_col as u16;
+            f.render_widget(editor, chunks[2]);
+            let x = chunks[2].x + 1 + cursor_col as u16;
             f.set_cursor_position(Position {
-                x: x.min(chunks[1].x + chunks[1].width.saturating_sub(1)),
-                y: chunks[1].y + 1,
+                x: x.min(chunks[2].x + chunks[2].width.saturating_sub(1)),
+                y: chunks[2].y + 1,
             });
         }
     }
@@ -1249,7 +1534,47 @@ fn draw(
         Span::styled(spinner.to_string(), style(theme.token(Token::Spinner))),
         Span::styled(status, style(theme.token(Token::Text))),
     ]));
-    f.render_widget(footer, chunks[2]);
+    f.render_widget(footer, chunks[3]);
+}
+
+/// Render the slash-command completion dropdown: a bordered list directly above
+/// the input, scrolled to keep the selection visible (CRAB-141).
+fn draw_completions(f: &mut Frame, area: Rect, completion: &Completion, theme: &Theme) {
+    use ratatui::widgets::{Block, Borders, Paragraph};
+    if area.height == 0 {
+        return;
+    }
+    let viewport = area.height.saturating_sub(2) as usize;
+    let offset = picker_offset(completion.selected, viewport);
+    let lines: Vec<TLine> = completion
+        .matches
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(viewport)
+        .map(|(i, &ci)| {
+            let spec = &COMMANDS[ci];
+            let args = spec.args.map(|a| format!(" {a}")).unwrap_or_default();
+            let marker = if i == completion.selected {
+                "❯ "
+            } else {
+                "  "
+            };
+            let text = format!("{marker}/{}{} — {}", spec.name, args, spec.description);
+            let line = TLine::from(Span::raw(text));
+            if i == completion.selected {
+                line.style(style(theme.token(Token::Selection)))
+            } else {
+                line.style(style(theme.token(Token::Text)))
+            }
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(style(theme.token(Token::Border)))
+        .title(" commands ")
+        .title_style(style(theme.token(Token::Title)));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Render the picker overlay: a centered window sized to the choices (not the
@@ -1771,6 +2096,107 @@ mod tests {
         m.push_notice("resumed");
         assert_eq!(m.transcript[0], TranscriptLine::User("hello".into()));
         assert_eq!(m.transcript[1], TranscriptLine::Notice("resumed".into()));
+    }
+
+    // --- CRAB-141: slash-command dropdown + model picker ---
+
+    #[test]
+    fn completions_filter_by_prefix() {
+        assert_eq!(
+            slash_completions("/").unwrap().matches.len(),
+            COMMANDS.len()
+        );
+        let names: Vec<&str> = slash_completions("/sk")
+            .unwrap()
+            .matches
+            .iter()
+            .map(|&i| COMMANDS[i].name)
+            .collect();
+        assert_eq!(names, vec!["skills", "skill"]);
+        assert_eq!(slash_completions("/MO").unwrap().matches.len(), 1);
+        assert!(slash_completions("/model ").is_none());
+        assert!(slash_completions("/zzz").is_none());
+        assert!(slash_completions("hello").is_none());
+    }
+
+    #[test]
+    fn accept_completion_appends_a_space() {
+        let spec = COMMANDS.iter().find(|c| c.name == "skill").unwrap();
+        assert_eq!(accept_completion(spec), "/skill ");
+    }
+
+    #[test]
+    fn commands_table_and_parser_agree() {
+        for c in COMMANDS {
+            for name in std::iter::once(c.name).chain(c.aliases.iter().copied()) {
+                match parse_line(&format!("/{name}")) {
+                    LineAction::Command(cmd) => assert_eq!(cmd, (c.build)(String::new()), "{name}"),
+                    other => panic!("{name} parsed as {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropdown_navigates_and_accepts() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.completion = slash_completions("/sk");
+        let mut editor = InputEditor::new("/sk");
+        let mut picker = None;
+        let mut login_pending = false;
+        let mut should_exit = false;
+        handle_key(
+            &rt,
+            &mut model,
+            &mut editor,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(model.completion.as_ref().unwrap().selected, 1);
+        handle_key(
+            &rt,
+            &mut model,
+            &mut editor,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            KeyCode::Tab,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(editor.text(), "/skill ");
+        assert!(model.completion.is_none());
+    }
+
+    #[test]
+    fn model_picker_enter_applies_the_model() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut editor = InputEditor::default();
+        let mut picker = Some(Picker::Model {
+            selected: 1,
+            models: vec!["a".into(), "b".into()],
+        });
+        let mut login_pending = false;
+        let mut should_exit = false;
+        handle_key(
+            &rt,
+            &mut model,
+            &mut editor,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(picker.is_none());
+        assert_eq!(model.state.model, "b");
     }
 
     // --- CRAB-126: line-editing input editor ---

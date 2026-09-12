@@ -190,6 +190,10 @@ pub fn run_rpc(
                 rt.get_state();
                 drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
+            CommandKind::ListModels {} => {
+                rt.refresh_models();
+                drain_until(rx, out, |e| matches!(e, Event::ModelsListed { .. }))?;
+            }
             CommandKind::Resume => {
                 let history = crab_core::session::load_previous(root, &rt.workspace_root())
                     .map_err(|e| format!("could not load previous session: {e}"))?;

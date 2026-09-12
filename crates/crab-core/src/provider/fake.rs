@@ -17,6 +17,8 @@ pub struct FakeProvider {
     responses: Mutex<VecDeque<Response>>,
     /// Scripted reasoning fragments, one per `complete` call (CRAB-139).
     thinking: Mutex<VecDeque<String>>,
+    /// Model ids reported by `list_models` (CRAB-141).
+    models: Vec<String>,
     /// History of every `complete` call, in order, for assertions.
     histories: Mutex<Vec<Vec<Message>>>,
 }
@@ -28,8 +30,15 @@ impl FakeProvider {
         Self {
             responses: Mutex::new(responses.into()),
             thinking: Mutex::new(VecDeque::new()),
+            models: Vec::new(),
             histories: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Models reported by `list_models` (CRAB-141).
+    pub fn with_models(mut self, models: Vec<String>) -> Self {
+        self.models = models;
+        self
     }
 
     /// Script one reasoning fragment per `complete` call, streamed before the
@@ -102,6 +111,10 @@ impl Provider for FakeProvider {
                 aborted: false,
             })
         })
+    }
+
+    fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>, ProviderError>> {
+        Box::pin(async move { Ok(self.models.clone()) })
     }
 }
 

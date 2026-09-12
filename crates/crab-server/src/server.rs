@@ -229,6 +229,7 @@ async fn dispatch(
         CommandKind::SwitchWorkspace { path } => rt.switch_workspace(&path),
         CommandKind::Clear {} => rt.clear(),
         CommandKind::GetState {} => rt.get_state(),
+        CommandKind::ListModels {} => rt.refresh_models(),
         CommandKind::Resume => match session::load_previous(session_root, &rt.workspace_root()) {
             Ok(Some(history)) => rt.replace_history(history),
             Ok(None) => {}

@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use futures::StreamExt;
-use rig_core::client::CompletionClient;
+use rig_core::client::{CompletionClient, ModelListingClient};
 use rig_core::completion::message::ToolCall as RigToolCall;
 use rig_core::completion::message::{
     AssistantContent, Reasoning, ReasoningContent, Text, ToolCallId, ToolFunction, ToolResult,
@@ -62,6 +62,8 @@ pub struct RigProvider {
     provider: &'static crate::config::ProviderInfo,
     /// Resolved API key (empty when none was configured).
     api_key: String,
+    /// Resolved base URL (for model listing; the backend is prebuilt).
+    base_url: String,
 }
 
 impl RigProvider {
@@ -77,13 +79,13 @@ impl RigProvider {
                 // These presets are API roots: rig expects the `/v1` prefix
                 // on the base, so append it unless the user already did.
                 let base = if base.ends_with("/v1") {
-                    base
+                    base.clone()
                 } else {
                     format!("{base}/v1")
                 };
                 let client = openai::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid OpenAI-compatible client");
                 Backend::OpenAiCompatible(
@@ -95,7 +97,7 @@ impl RigProvider {
             "anthropic" => {
                 let client = anthropic::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid Anthropic client");
                 Backend::Anthropic(client.completion_model(config.model.clone()))
@@ -103,7 +105,7 @@ impl RigProvider {
             "gemini" => {
                 let client = gemini::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid Gemini client");
                 Backend::Gemini(client.completion_model(config.model.clone()))
@@ -111,7 +113,7 @@ impl RigProvider {
             "mistral" => {
                 let client = mistral::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid Mistral client");
                 Backend::Mistral(client.completion_model(config.model.clone()))
@@ -119,7 +121,7 @@ impl RigProvider {
             "groq" => {
                 let client = groq::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid Groq client");
                 Backend::Groq(client.completion_model(config.model.clone()))
@@ -127,7 +129,7 @@ impl RigProvider {
             "xai" => {
                 let client = xai::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid xAI client");
                 Backend::Xai(client.completion_model(config.model.clone()))
@@ -135,7 +137,7 @@ impl RigProvider {
             "openrouter" => {
                 let client = openrouter::Client::builder()
                     .api_key(key.clone())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid OpenRouter client");
                 Backend::OpenRouter(client.completion_model(config.model.clone()))
@@ -144,7 +146,7 @@ impl RigProvider {
                 // Ollama needs no key; an empty key means "no auth header".
                 let client = ollama::Client::builder()
                     .api_key(String::new())
-                    .base_url(base)
+                    .base_url(base.clone())
                     .build()
                     .expect("valid Ollama client");
                 Backend::Ollama(client.completion_model(config.model.clone()))
@@ -158,6 +160,7 @@ impl RigProvider {
             model: config.model.clone(),
             provider: config.provider,
             api_key: key,
+            base_url: base,
         }
     }
 
@@ -470,6 +473,90 @@ impl Provider for RigProvider {
                 prompt_tokens,
                 aborted,
             })
+        })
+    }
+
+    /// Discover model ids via rig's `ModelListingClient`. Providers without a
+    /// listing client return `Unsupported` (CRAB-141).
+    fn list_models<'a>(
+        &'a self,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<String>, ProviderError>> {
+        Box::pin(async move {
+            let key = self.api_key.clone();
+            let base = self.base_url.trim_end_matches('/').to_string();
+            let list = match self.provider.name {
+                "openai" | "deepseek" | "lmstudio" => {
+                    let base = if base.ends_with("/v1") {
+                        base.clone()
+                    } else {
+                        format!("{base}/v1")
+                    };
+                    let client = openai::Client::builder()
+                        .api_key(key)
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                "anthropic" => {
+                    let client = anthropic::Client::builder()
+                        .api_key(key)
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                "gemini" => {
+                    let client = gemini::Client::builder()
+                        .api_key(key)
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                "mistral" => {
+                    let client = mistral::Client::builder()
+                        .api_key(key)
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                "groq" => {
+                    let client = groq::Client::builder()
+                        .api_key(key)
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                "openrouter" => {
+                    let client = openrouter::Client::builder()
+                        .api_key(key)
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                "ollama" => {
+                    let client = ollama::Client::builder()
+                        .api_key(String::new())
+                        .base_url(base)
+                        .build()
+                        .map_err(|e| ProviderError::Http(e.to_string()))?;
+                    client.list_models().await
+                }
+                other => {
+                    return Err(ProviderError::Unsupported(format!(
+                        "model listing is not supported for provider '{other}'"
+                    )))
+                }
+            };
+            let list = list.map_err(|e| ProviderError::Http(e.to_string()))?;
+            let mut ids: Vec<String> = list.data.into_iter().map(|m| m.id).collect();
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
         })
     }
 }

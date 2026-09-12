@@ -74,6 +74,9 @@ pub enum ProviderError {
     Malformed(String),
     #[error("http error: {0}")]
     Http(String),
+    /// The provider does not support the requested capability.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// A chat + tool-calling backend. Implementations must be `Send + Sync` so the
@@ -96,6 +99,17 @@ pub trait Provider: Send + Sync {
         cancel: CancellationToken,
         on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
     ) -> BoxFuture<'a, Result<Completion, ProviderError>>;
+
+    /// Discover the provider's available model ids. The default reports the
+    /// capability as unsupported, so only providers that can list need to
+    /// implement it (CRAB-141).
+    fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>, ProviderError>> {
+        Box::pin(async {
+            Err(ProviderError::Unsupported(
+                "provider does not support model listing".into(),
+            ))
+        })
+    }
 }
 
 /// A streamed fragment of a completion: assistant `Text` or model `Thinking`
