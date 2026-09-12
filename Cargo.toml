@@ -7,12 +7,14 @@
 #                      runtime, workspace).
 #   crates/crab     — the CLI binary (main + stdio modes + TUI frontend; the
 #                     interactive REPL was removed in CRAB-135).
+#   crates/crab-server — the headless WebSocket server (CRAB-124), a frontend
+#                     over the same AgentRuntime protocol.
 #
 # CRAB-122 adds crates/crab-server (axum/tokio/tungstenite) later.
 
 [workspace]
 resolver = "2"
-members = ["crates/crab-core", "crates/crab"]
+members = ["crates/crab-core", "crates/crab", "crates/crab-server"]
 
 [workspace.package]
 version = "0.1.0"
