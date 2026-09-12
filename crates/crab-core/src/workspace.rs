@@ -14,9 +14,10 @@ pub struct Workspace {
 }
 
 /// Normalize common path confusables that models sometimes emit — Unicode
-/// spaces and a leading `@` — so e.g. `foo\u{00A0}bar` resolves to `foo bar`
-/// (mirrors pi's `normalizeToolPath`).
-fn normalize_path(rel: &Path) -> PathBuf {
+/// spaces, a leading `@`, and a leading `~` — so e.g. `foo\u{00A0}bar`
+/// resolves to `foo bar` and `~/notes.md` resolves under the home directory
+/// (mirrors pi's `normalizePath`/`resolveToCwd`). `~user` is not expanded.
+fn normalize_path(rel: &Path, home: Option<&Path>) -> PathBuf {
     let mut s = rel.to_string_lossy().to_string();
     if let Some(stripped) = s.strip_prefix('@') {
         s = stripped.to_string();
@@ -28,7 +29,31 @@ fn normalize_path(rel: &Path) -> PathBuf {
             other => other,
         })
         .collect();
-    PathBuf::from(normalized)
+    PathBuf::from(expand_tilde(&normalized, home))
+}
+
+/// Expand a leading `~` or `~/…` to `home` (CRAB-148). `~user` and interior
+/// `~` are left untouched; when no home directory is known the path is returned
+/// unchanged, so a missing home never turns a relative path absolute.
+fn expand_tilde(s: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else {
+        return s.to_string();
+    };
+    if s == "~" || s == "~/" {
+        return home.to_string_lossy().to_string();
+    }
+    match s.strip_prefix("~/") {
+        Some(rest) => home.join(rest).to_string_lossy().to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// The user's home directory, if it can be determined (CRAB-148). `BaseDirs`
+/// handles the platform conventions; `$HOME` is the Unix fallback.
+fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|d| d.home_dir().to_path_buf())
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
 }
 
 impl Workspace {
@@ -59,7 +84,14 @@ impl Workspace {
     /// existing ancestor is canonicalized (resolving symlinks) and the
     /// non-existing remainder is re-appended.
     pub fn resolve(&self, rel: &Path) -> Result<PathBuf, String> {
-        let normalized = normalize_path(rel);
+        self.resolve_with_home(rel, home_dir().as_deref())
+    }
+
+    /// Like [`resolve`](Self::resolve) but with an explicit home directory, so
+    /// the `~` expansion is testable without touching the process `$HOME`
+    /// (CRAB-148).
+    fn resolve_with_home(&self, rel: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+        let normalized = normalize_path(rel, home);
         let joined = if normalized.is_absolute() {
             normalized
         } else {
@@ -163,5 +195,44 @@ mod tests {
         // A non-breaking space in the filename is treated as a regular space.
         let p = ws.resolve(Path::new("a\u{00A0}b.txt")).unwrap();
         assert_eq!(p, dir.join("a b.txt"));
+    }
+
+    /// CRAB-148: a leading `~`/`~/` expands to the home directory; `~user` and
+    /// interior `~` are left alone, and an unknown home leaves the path as-is.
+    #[test]
+    fn expands_leading_tilde_only() {
+        let home = Path::new("/home/u");
+        assert_eq!(expand_tilde("~", Some(home)), "/home/u");
+        assert_eq!(expand_tilde("~/", Some(home)), "/home/u");
+        assert_eq!(expand_tilde("~/a/b", Some(home)), "/home/u/a/b");
+        assert_eq!(expand_tilde("~user/x", Some(home)), "~user/x");
+        assert_eq!(expand_tilde("a/~/b", Some(home)), "a/~/b");
+        assert_eq!(expand_tilde("~/a", None), "~/a");
+    }
+
+    /// CRAB-148: resolution honors the expanded home and canonicalizes it.
+    #[test]
+    fn expands_tilde_to_home_when_resolving() {
+        let (_guard, dir) = tempdir("tilde");
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("a.txt"), "x").unwrap();
+        let ws = Workspace::new(dir.clone()).unwrap();
+        let canon_home = home.canonicalize().unwrap();
+
+        assert_eq!(
+            ws.resolve_with_home(Path::new("~/a.txt"), Some(&home))
+                .unwrap(),
+            canon_home.join("a.txt")
+        );
+        assert_eq!(
+            ws.resolve_with_home(Path::new("~"), Some(&home)).unwrap(),
+            canon_home
+        );
+        // Without a known home, `~` stays a literal component under the root.
+        assert_eq!(
+            ws.resolve_with_home(Path::new("~/a.txt"), None).unwrap(),
+            dir.canonicalize().unwrap().join("~").join("a.txt")
+        );
     }
 }
