@@ -164,9 +164,41 @@ impl McpTool {
     }
 }
 
-/// `mcp:<server>:<tool>` — the qualified name used everywhere downstream.
+/// `mcp__<server>__<tool>` — the qualified name used everywhere downstream.
+/// Provider tool/function names are restricted to `[A-Za-z0-9_-]` (OpenAI and
+/// Anthropic both enforce `^[a-zA-Z0-9_-]{1,64}$`), so a colon separator (as
+/// the original spec suggested) would be rejected on the wire. Each segment
+/// is sanitized and the whole name is capped at 64 chars.
 pub fn qualified_name(server: &str, tool: &str) -> String {
-    format!("mcp:{server}:{tool}")
+    let mut name = format!(
+        "mcp__{}__{}",
+        sanitize_segment(server),
+        sanitize_segment(tool)
+    );
+    if name.len() > MAX_TOOL_NAME {
+        name.truncate(MAX_TOOL_NAME);
+        while !name.is_char_boundary(name.len()) {
+            name.pop();
+        }
+    }
+    name
+}
+
+/// Provider tool-name limit (`^[a-zA-Z0-9_-]{1,64}$`).
+const MAX_TOOL_NAME: usize = 64;
+
+/// Replace any character outside `[A-Za-z0-9_-]` with `_` so a server/tool
+/// name is a legal provider function name segment.
+fn sanitize_segment(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 impl Tool for McpTool {
@@ -412,8 +444,32 @@ mod tests {
     }
 
     #[test]
-    fn qualified_name_matches_the_event_contract() {
-        assert_eq!(qualified_name("fs", "read_file"), "mcp:fs:read_file");
+    fn connect_all_skips_disabled_and_missing_servers_without_spawning() {
+        let (tools, warnings) = connect_all(&[], 1000);
+        assert!(tools.is_empty());
+        assert!(warnings.is_empty());
+        let disabled = McpServerConfig {
+            name: "x".into(),
+            enabled: false,
+            command: Some("definitely-not-spawned".into()),
+            ..Default::default()
+        };
+        let (tools, warnings) = connect_all(&[disabled], 1000);
+        assert!(tools.is_empty());
+        assert!(warnings.is_empty(), "disabled servers are skipped silently");
+    }
+
+    #[test]
+    fn qualified_name_is_provider_safe() {
+        assert_eq!(qualified_name("fs", "read_file"), "mcp__fs__read_file");
+        // Dots/spaces/colons are not legal in provider function names.
+        assert_eq!(
+            qualified_name("my.server", "read file:v2"),
+            "mcp__my_server__read_file_v2"
+        );
+        // Long names are capped at the provider limit.
+        let long = qualified_name(&"s".repeat(80), &"t".repeat(80));
+        assert!(long.len() <= 64);
     }
 
     #[test]
@@ -483,7 +539,7 @@ mod tests {
         let (_dir, ws) = workspace();
         let client: Arc<dyn McpClient> = Arc::new(StubClient::new(&[("echo", Ok("hello"))]));
         let tool = McpTool::new("srv", descriptor("echo"), client, 1000);
-        assert_eq!(tool.name(), "mcp:srv:echo");
+        assert_eq!(tool.name(), "mcp__srv__echo");
         assert_eq!(tool.description(), "does a thing");
         let out = tool
             .run(

@@ -16,6 +16,10 @@ struct ToolEntry {
     name: String,
     description: String,
     tool: Box<dyn Tool>,
+    /// External (MCP) tools carry server-authored JSON Schema, which is not
+    /// the subset [`super::validate_args`] understands, so argument validation
+    /// is delegated to the server (CRAB-133).
+    external: bool,
 }
 
 /// The four built-in tools plus any configured MCP tools, sharing one output
@@ -62,6 +66,7 @@ impl ToolSet {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 tool: Box::new(tool),
+                external: true,
             };
             set.tools.push(entry);
         }
@@ -73,6 +78,7 @@ impl ToolSet {
             name: name.to_string(),
             description: description.to_string(),
             tool,
+            external: false,
         });
     }
 
@@ -106,11 +112,11 @@ impl ToolSet {
             .collect()
     }
 
-    /// Route `name`+`args` to the matching executor, or a clear error. Args
-    /// are validated against the tool's declared JSON Schema first (CRAB-107
-    /// #9), so malformed model calls never reach an executor. MCP tools carry
-    /// server-authored JSON Schema, which `validate_args` handles as a
-    /// superset of the subset the built-ins use.
+    /// Route `name`+`args` to the matching executor, or a clear error. Built-in
+    /// args are validated against the tool's declared JSON Schema first
+    /// (CRAB-107 #9) so malformed model calls never reach an executor; external
+    /// (MCP) tools are exempt because their server-authored schemas are not the
+    /// subset `validate_args` understands (CRAB-133) — the server validates.
     pub async fn execute(
         &self,
         workspace: &Workspace,
@@ -118,10 +124,12 @@ impl ToolSet {
         args: &Value,
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        match self.tool(name) {
-            Some(tool) => {
-                super::validate_args(&tool.schema(), args)?;
-                tool.run(workspace, args, cancel).await
+        match self.tools.iter().find(|e| e.name == name) {
+            Some(entry) => {
+                if !entry.external {
+                    super::validate_args(&entry.tool.schema(), args)?;
+                }
+                entry.tool.run(workspace, args, cancel).await
             }
             None => {
                 let names: Vec<&str> = self.tools.iter().map(|e| e.name.as_str()).collect();
@@ -238,21 +246,21 @@ mod tests {
         let (_dir, ws) = workspace("dynamic");
         let mut ts = ToolSet::new(1000);
         ts.push(
-            "mcp:echo:echo",
+            "mcp__echo__echo",
             "remote echo",
             Box::new(EchoTool {
-                name: "mcp:echo:echo".into(),
+                name: "mcp__echo__echo".into(),
             }),
         );
         assert_eq!(ts.tool_schemas().len(), 5);
         assert!(ts
             .listing()
             .iter()
-            .any(|(n, d)| n == "mcp:echo:echo" && d == "remote echo"));
+            .any(|(n, d)| n == "mcp__echo__echo" && d == "remote echo"));
         let out = ts
             .execute(
                 &ws,
-                "mcp:echo:echo",
+                "mcp__echo__echo",
                 &json!({"x": "remote!"}),
                 CancellationToken::new(),
             )
@@ -264,6 +272,78 @@ mod tests {
             .execute(&ws, "nope", &json!({}), CancellationToken::new())
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("mcp:echo:echo"));
+        assert!(err.to_string().contains("mcp__echo__echo"));
+    }
+
+    /// A tool whose schema is not crab's subset (e.g. no `"type": "object"`,
+    /// which real MCP servers may omit) must bypass the built-in validator
+    /// when registered as external, or every call would be rejected.
+    struct NoTypeSchemaTool;
+
+    impl Tool for NoTypeSchemaTool {
+        fn name(&self) -> &str {
+            "mcp__x__y"
+        }
+        fn schema(&self) -> Value {
+            json!({"properties": {"q": {"type": "string"}}})
+        }
+        fn run<'a>(
+            &'a self,
+            _workspace: &'a Workspace,
+            _args: &'a Value,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+            Box::pin(async move {
+                Ok(ToolOutput {
+                    content: "ok".into(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tools_skip_builtin_schema_validation() {
+        let (_dir, ws) = workspace("external");
+        let mut ts = ToolSet::new(1000);
+        ts.tools.push(ToolEntry {
+            name: "mcp__x__y".into(),
+            description: "external".into(),
+            tool: Box::new(NoTypeSchemaTool),
+            external: true,
+        });
+        let out = ts
+            .execute(
+                &ws,
+                "mcp__x__y",
+                &json!({"q": "hi"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.content, "ok");
+
+        // The same schema registered as a *built-in* is rejected, proving the
+        // exemption is scoped to external tools.
+        let mut strict = ToolSet::new(1000);
+        strict.tools.push(ToolEntry {
+            name: "mcp__x__y".into(),
+            description: "external".into(),
+            tool: Box::new(NoTypeSchemaTool),
+            external: false,
+        });
+        let err = strict
+            .execute(&ws, "mcp__x__y", &json!({}), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("schema must describe an object"));
+    }
+
+    #[test]
+    fn from_config_without_mcp_keeps_the_four_builtins() {
+        let (_dir, ws) = workspace("fromconfig");
+        let cfg = crate::config::Config::defaults(ws.root().to_path_buf());
+        let (ts, warnings) = ToolSet::from_config(&cfg, 1000);
+        assert!(warnings.is_empty());
+        assert_eq!(ts.tool_schemas().len(), 4);
     }
 }

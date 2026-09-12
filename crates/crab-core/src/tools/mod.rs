@@ -1,4 +1,5 @@
-//! The tool layer (CRAB-102): a fixed, closed set of four tools.
+//! The tool layer (CRAB-102): the four built-in tools, plus external MCP
+//! tools (CRAB-133) registered at runtime.
 //!
 //! A shared `Tool` trait with `name()`, `schema()` (JSON Schema for arguments)
 //! and `run(&self, workspace, args) -> Result<ToolOutput, ToolError>`. The
