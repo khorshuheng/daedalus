@@ -225,6 +225,7 @@ async fn dispatch(
         CommandKind::FollowUp { text } => rt.follow_up(&text),
         CommandKind::Abort {} => rt.abort(),
         CommandKind::SetModel { model } => rt.set_model(&model),
+        CommandKind::SetProvider { provider } => rt.set_provider(&provider),
         CommandKind::SetEffort { effort } => rt.set_effort(effort),
         CommandKind::SwitchWorkspace { path } => rt.switch_workspace(&path),
         CommandKind::Clear {} => rt.clear(),

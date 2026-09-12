@@ -195,6 +195,9 @@ pub enum Event {
         model: String,
         effort: Effort,
         workspace: String,
+        /// Active provider name; defaults for older clients (CRAB-142).
+        #[serde(default)]
+        provider: String,
     },
     /// The agent settled: a final answer (or empty when cancelled).
     AgentSettled { text: String, interrupted: bool },
@@ -251,6 +254,8 @@ pub enum CommandKind {
     Abort {},
     /// Change the model used for subsequent completions.
     SetModel { model: String },
+    /// Switch the active provider at runtime (CRAB-142).
+    SetProvider { provider: String },
     /// Change the thinking level.
     SetEffort { effort: Effort },
     /// Change the workspace (and re-seed the system prompt).
@@ -304,6 +309,8 @@ impl RuntimeError {
 #[serde(rename_all = "snake_case")]
 pub struct RuntimeState {
     pub model: String,
+    /// Active provider name (CRAB-142).
+    pub provider: String,
     pub effort: Effort,
     pub workspace: String,
     pub busy: bool,
@@ -382,7 +389,10 @@ fn trim_history(
 /// adapters can snapshot it (session save) while a turn runs.
 struct Inner {
     config: Config,
-    provider: Arc<dyn Provider>,
+    /// The active provider; swappable at runtime (CRAB-142).
+    provider: Mutex<Arc<dyn Provider>>,
+    /// Registry row of the active provider.
+    provider_info: Mutex<&'static ProviderInfo>,
     tools: Arc<ToolSet>,
     /// Canonical workspace; `switch_workspace` replaces it (re-seeding the
     /// system prompt). Read by adapters (session keying).
@@ -439,16 +449,20 @@ impl AgentRuntime {
         let schemas = tools.tool_schemas();
         let tools = Arc::new(tools);
         let model = config.model.clone();
+        let provider_name = config.provider.name.to_string();
+        let provider_info = config.provider;
         let effort = Effort::Medium;
         let ws_path = workspace.root().to_string_lossy().into_owned();
         let runtime = AgentRuntime {
             inner: Arc::new(Inner {
                 config,
-                provider: Arc::from(provider),
+                provider: Mutex::new(Arc::from(provider)),
+                provider_info: Mutex::new(provider_info),
                 tools,
                 workspace: Mutex::new(workspace),
                 state: Mutex::new(RuntimeState {
                     model,
+                    provider: provider_name,
                     effort,
                     workspace: ws_path,
                     busy: false,
@@ -587,13 +601,13 @@ impl AgentRuntime {
 
     /// The provider backing this runtime.
     pub fn provider(&self) -> Arc<dyn Provider> {
-        Arc::clone(&self.inner.provider)
+        Arc::clone(&self.inner.provider.lock().unwrap())
     }
 
     /// The provider kind this runtime was built with (for /login and the
     /// model picker, CRAB-121).
     pub fn provider_kind(&self) -> &'static ProviderInfo {
-        self.inner.config.provider
+        *self.inner.provider_info.lock().unwrap()
     }
 
     /// Cached model ids discovered for the current provider (CRAB-141).
@@ -608,6 +622,66 @@ impl AgentRuntime {
             .inner
             .commands_tx
             .send(Control::Command(CommandKind::ListModels {}));
+    }
+
+    /// Switch the active provider at runtime (CRAB-142). The worker rebuilds
+    /// the provider and emits `StateChanged` (or `Error` when it refuses).
+    pub fn set_provider(&self, provider: &str) {
+        let _ = self
+            .inner
+            .commands_tx
+            .send(Control::Command(CommandKind::SetProvider {
+                provider: provider.to_string(),
+            }));
+    }
+
+    /// Rebuild the active provider for `name`: resolve the registry row and
+    /// key, refuse a keyless hosted provider, swap the provider (keeping the
+    /// conversation), then refresh the model list (CRAB-142).
+    async fn switch_provider(&self, name: &str) {
+        let info = match crate::config::provider_by_name(name) {
+            Ok(i) => i,
+            Err(e) => {
+                self.emit(Event::Error { message: e });
+                return;
+            }
+        };
+        let key = crate::credential::resolve_api_key(info, None);
+        if info.requires_key() && key.as_deref().unwrap_or("").is_empty() {
+            let env = info.api_key_env.unwrap_or("<PROVIDER>_API_KEY");
+            self.emit(Event::Error {
+                message: format!(
+                    "no API key for provider '{}': set {env} or pass --api-key; note /login stores for the current provider",
+                    info.name
+                ),
+            });
+            return;
+        }
+        let mut new_config = self.inner.config.clone();
+        new_config.provider = info;
+        new_config.base_url = info.preset_base_url.to_string();
+        new_config.api_key = key;
+        new_config.model = self.inner.state.lock().unwrap().model.clone();
+        let provider = crate::provider::from_config(&new_config);
+        *self.inner.provider.lock().unwrap() = Arc::from(provider);
+        *self.inner.provider_info.lock().unwrap() = info;
+        {
+            let mut st = self.inner.state.lock().unwrap();
+            st.provider = info.name.to_string();
+        }
+        // A different provider has a different model catalog.
+        *self.inner.models.lock().unwrap() = Vec::new();
+        self.emit_state_changed();
+        let provider = Arc::clone(&self.inner.provider.lock().unwrap());
+        match provider.list_models().await {
+            Ok(models) => {
+                *self.inner.models.lock().unwrap() = models.clone();
+                self.emit(Event::ModelsListed { models });
+            }
+            Err(e) => self.emit(Event::Error {
+                message: format!("could not list models: {e}"),
+            }),
+        }
     }
 
     /// Skills discovered for the current workspace (user + workspace levels,
@@ -678,15 +752,19 @@ impl AgentRuntime {
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
-                CommandKind::ListModels {} => match self.inner.provider.list_models().await {
-                    Ok(models) => {
-                        *self.inner.models.lock().unwrap() = models.clone();
-                        self.emit(Event::ModelsListed { models });
+                CommandKind::ListModels {} => {
+                    let provider = Arc::clone(&self.inner.provider.lock().unwrap());
+                    match provider.list_models().await {
+                        Ok(models) => {
+                            *self.inner.models.lock().unwrap() = models.clone();
+                            self.emit(Event::ModelsListed { models });
+                        }
+                        Err(e) => self.emit(Event::Error {
+                            message: format!("could not list models: {e}"),
+                        }),
                     }
-                    Err(e) => self.emit(Event::Error {
-                        message: format!("could not list models: {e}"),
-                    }),
-                },
+                }
+                CommandKind::SetProvider { provider } => self.switch_provider(&provider).await,
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
                 | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
@@ -766,6 +844,7 @@ impl AgentRuntime {
             model: st.model,
             effort: st.effort,
             workspace,
+            provider: st.provider,
         });
     }
 
@@ -876,15 +955,19 @@ impl AgentRuntime {
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
-                CommandKind::ListModels {} => match self.inner.provider.list_models().await {
-                    Ok(models) => {
-                        *self.inner.models.lock().unwrap() = models.clone();
-                        self.emit(Event::ModelsListed { models });
+                CommandKind::ListModels {} => {
+                    let provider = Arc::clone(&self.inner.provider.lock().unwrap());
+                    match provider.list_models().await {
+                        Ok(models) => {
+                            *self.inner.models.lock().unwrap() = models.clone();
+                            self.emit(Event::ModelsListed { models });
+                        }
+                        Err(e) => self.emit(Event::Error {
+                            message: format!("could not list models: {e}"),
+                        }),
                     }
-                    Err(e) => self.emit(Event::Error {
-                        message: format!("could not list models: {e}"),
-                    }),
-                },
+                }
+                CommandKind::SetProvider { provider } => self.switch_provider(&provider).await,
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
                 | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
@@ -1013,9 +1096,8 @@ impl AgentRuntime {
         static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
         let empty = EMPTY.get_or_init(|| serde_json::Value::Object(Default::default()));
         let mut on_delta = |_: StreamDelta| {}; // do not stream a compaction into the UI
-        match self
-            .inner
-            .provider
+        let provider = Arc::clone(&self.inner.provider.lock().unwrap());
+        match provider
             .complete(&history, &[], empty, self.cancel_token(), &mut on_delta)
             .await
         {
@@ -1102,7 +1184,7 @@ impl AgentRuntime {
                 let h = self.inner.history.lock().unwrap().clone();
                 let effort_params = {
                     let st = self.inner.state.lock().unwrap();
-                    provider_effort(self.inner.config.provider, st.effort)
+                    provider_effort(*self.inner.provider_info.lock().unwrap(), st.effort)
                 };
                 let cancel = self.cancel_token();
                 let emit = self.inner.events.clone();
@@ -1114,8 +1196,8 @@ impl AgentRuntime {
                         let _ = emit.send(Event::ThinkingDelta { text });
                     }
                 };
-                self.inner
-                    .provider
+                let provider = Arc::clone(&self.inner.provider.lock().unwrap());
+                provider
                     .complete(
                         &h,
                         &self.inner.schemas,
@@ -1131,15 +1213,14 @@ impl AgentRuntime {
                     // revoked or incorrect key is actionable rather than a bare
                     // provider status (CRAB-143).
                     let message = match &e {
-                        crate::provider::ProviderError::Auth(_) => format!(
-                            "authentication failed for provider '{}': check the API key ({}, --api-key, or /login) — {e}",
-                            self.inner.config.provider.name,
-                            self.inner
-                                .config
-                                .provider
-                                .api_key_env
-                                .unwrap_or("<PROVIDER>_API_KEY"),
-                        ),
+                        crate::provider::ProviderError::Auth(_) => {
+                            let info = *self.inner.provider_info.lock().unwrap();
+                            format!(
+                                "authentication failed for provider '{}': check the API key ({}, --api-key, or /login) — {e}",
+                                info.name,
+                                info.api_key_env.unwrap_or("<PROVIDER>_API_KEY"),
+                            )
+                        }
                         _ => format!("provider error: {e}"),
                     };
                     self.emit(Event::Error { message });
@@ -1657,6 +1738,56 @@ mod tests {
             _ => None,
         });
         assert_eq!(settled_event, Some(("hello world".to_string(), false)));
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn switch_provider_updates_state_and_keeps_history() {
+        let (rt, mut rx, handle, _ws) = runtime_with(
+            "switch",
+            Box::new(GateProvider::new(vec![Response::Text(text("answer"))])),
+        );
+        // Have a conversation first.
+        rt.prompt("hi");
+        let _ = collect_until_settled(&mut rx);
+        let before = rt.history().len();
+        // Ollama needs no key, so the switch is allowed.
+        rt.set_provider("ollama");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut switched = false;
+        while !switched && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Event::StateChanged { provider, .. }) if provider == "ollama" => switched = true,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(switched, "expected a state change for the new provider");
+        assert_eq!(rt.provider_kind().name, "ollama");
+        // The conversation is kept across a provider switch.
+        assert_eq!(rt.history().len(), before);
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn switch_provider_refuses_without_a_key() {
+        std::env::remove_var("GEMINI_API_KEY");
+        let (rt, mut rx, handle, _ws) = runtime_with("refuse", Box::new(GateProvider::new(vec![])));
+        rt.set_provider("gemini");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut err = None;
+        while err.is_none() && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Event::Error { message }) => err = Some(message),
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        let msg = err.expect("expected a refusal");
+        assert!(msg.contains("no API key for provider 'gemini'"), "{msg}");
+        assert_eq!(rt.provider_kind().name, "openai");
         rt.shutdown();
         handle.join().unwrap_or(());
     }

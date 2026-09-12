@@ -19,6 +19,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crab_core::config::PROVIDERS;
 use crab_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
 use crab_core::theme::{Modifiers, StyleSpec, Theme, ThemeColor, Token};
 use crossterm::event::{
@@ -56,6 +57,8 @@ pub enum SlashCommand {
     Login,
     /// Change the model (opens the model picker when no argument).
     Model(String),
+    /// Change the provider (opens the provider picker when no argument).
+    Provider(String),
     /// Change the thinking effort (opens the effort picker when no argument).
     Effort(String),
     /// Change the workspace.
@@ -102,6 +105,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: Some("<name>"),
         description: "Change the model (picker when omitted)",
         build: SlashCommand::Model,
+    },
+    CommandSpec {
+        name: "provider",
+        aliases: &[],
+        args: Some("<name>"),
+        description: "Change the provider (picker when omitted)",
+        build: SlashCommand::Provider,
     },
     CommandSpec {
         name: "effort",
@@ -446,10 +456,12 @@ impl UiModel {
                 model,
                 effort,
                 workspace,
+                provider,
             } => {
                 self.state.model = model.clone();
                 self.state.effort = *effort;
                 self.state.workspace = workspace.clone();
+                self.state.provider = provider.clone();
             }
             Event::AgentSettled {
                 text,
@@ -960,6 +972,10 @@ enum Picker {
         selected: usize,
         models: Vec<String>,
     },
+    /// Provider choices from the registry (CRAB-142).
+    Provider {
+        selected: usize,
+    },
 }
 
 /// Route one key press. Pure decisions delegated to the model where possible;
@@ -982,6 +998,7 @@ fn handle_key(
         let max = match p {
             Picker::Effort { .. } => EFFORT_CHOICES.len(),
             Picker::Model { models, .. } => models.len(),
+            Picker::Provider { .. } => PROVIDERS.len(),
         };
         match code {
             // Ctrl-C cancels the overlay (like Esc); a second Ctrl-C at the
@@ -995,12 +1012,18 @@ fn handle_key(
                 Picker::Model { selected, .. } => {
                     *selected = (*selected + 1).min(max.saturating_sub(1));
                 }
+                Picker::Provider { selected } => {
+                    *selected = (*selected + 1).min(max.saturating_sub(1));
+                }
             },
             KeyCode::Up | KeyCode::Char('k') => match p {
                 Picker::Effort { selected } => {
                     *selected = selected.saturating_sub(1);
                 }
                 Picker::Model { selected, .. } => {
+                    *selected = selected.saturating_sub(1);
+                }
+                Picker::Provider { selected } => {
                     *selected = selected.saturating_sub(1);
                 }
             },
@@ -1015,6 +1038,14 @@ fn handle_key(
                     if let Some(name) = models.get(*selected) {
                         rt.set_model(name);
                         model.state.model = name.clone();
+                    }
+                    *picker = None;
+                }
+                Picker::Provider { selected } => {
+                    if let Some(info) = PROVIDERS.get(*selected) {
+                        rt.set_provider(info.name);
+                        // The new provider lists its models; prompt for one.
+                        model.model_fetch_pending = true;
                     }
                     *picker = None;
                 }
@@ -1247,6 +1278,16 @@ fn run_command(
             } else {
                 rt.set_model(&arg);
                 model.state.model = arg;
+            }
+        }
+        SlashCommand::Provider(arg) => {
+            if arg.is_empty() {
+                *picker = Some(Picker::Provider { selected: 0 });
+            } else {
+                rt.set_provider(&arg);
+                // The new provider lists its models; open the picker when they
+                // arrive (CRAB-142).
+                model.model_fetch_pending = true;
             }
         }
         SlashCommand::Effort(arg) => {
@@ -1491,6 +1532,16 @@ fn draw(
                 models,
                 *selected,
                 " model — ↑/↓ · Enter apply · Esc cancel ",
+                theme,
+            );
+        }
+        Some(Picker::Provider { selected }) => {
+            let names: Vec<String> = PROVIDERS.iter().map(|p| p.name.to_string()).collect();
+            draw_picker(
+                f,
+                &names,
+                *selected,
+                " provider — ↑/↓ · Enter apply · Esc cancel ",
                 theme,
             );
         }
@@ -1868,6 +1919,7 @@ mod tests {
     fn state() -> RuntimeState {
         RuntimeState {
             model: "gpt-4o".into(),
+            provider: "openai".into(),
             effort: Effort::Medium,
             workspace: "/ws".into(),
             busy: false,
@@ -1945,10 +1997,12 @@ mod tests {
             model: "claude-x".into(),
             effort: Effort::High,
             workspace: "/other".into(),
+            provider: "anthropic".into(),
         });
         assert_eq!(m.state.model, "claude-x");
         assert_eq!(m.state.effort, Effort::High);
         assert_eq!(m.state.workspace, "/other");
+        assert_eq!(m.state.provider, "anthropic");
     }
 
     #[test]
@@ -2197,6 +2251,30 @@ mod tests {
         );
         assert!(picker.is_none());
         assert_eq!(model.state.model, "b");
+    }
+
+    #[test]
+    fn provider_picker_enter_switches() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut editor = InputEditor::default();
+        let mut picker = Some(Picker::Provider { selected: 0 });
+        let mut login_pending = false;
+        let mut should_exit = false;
+        handle_key(
+            &rt,
+            &mut model,
+            &mut editor,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(picker.is_none());
+        // The switch triggers a model fetch so the picker opens on results.
+        assert!(model.model_fetch_pending);
     }
 
     // --- CRAB-126: line-editing input editor ---

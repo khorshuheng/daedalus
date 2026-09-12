@@ -174,6 +174,10 @@ pub fn run_rpc(
                 rt.set_model(model);
                 drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
+            CommandKind::SetProvider { provider } => {
+                rt.set_provider(provider);
+                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+            }
             CommandKind::SetEffort { effort } => {
                 rt.set_effort(*effort);
                 drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
