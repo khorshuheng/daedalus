@@ -20,4 +20,4 @@ edition = "2021"
 # Minimum supported Rust version (first 2025 release). Cargo's MSRV-aware
 # resolver keeps dependencies compatible with this floor, so the project stays
 # buildable on older rust even as Arch keeps updating the installed toolchain.
-rust-version = "1.90"
+rust-version = "1.94"

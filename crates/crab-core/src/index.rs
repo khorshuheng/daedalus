@@ -1,4 +1,4 @@
-//! Memory indexing & retrieval (CRAB-114).
+//! Memory indexing & retrieval (CRAB-114), on sqlx (CRAB-136).
 //!
 //! A SQLite FTS5 index over the lessons log (CRAB-113), derived the way pi's
 //! `session-backends/sqlite-node` derives a search index from its JSONL:
@@ -9,15 +9,32 @@
 //! to `lessons.jsonl`. The schema keeps one content table (`lessons`) with
 //! the full record and an FTS5 virtual table (`lessons_fts`) over
 //! text/kind/tags with aligned rowids; a `meta` row stores a signature of
-//! the log file so `sync` rebuilds only when the log actually changed.
+//! the log file so `sync` rebuilds only when the log actually changed. The
+//! schema lives in `migrations/0001_lessons_index.sql` (applied idempotently;
+//! IF NOT EXISTS throughout, so pre-CRAB-136 databases open unchanged).
 //!
 //! Retrieval ranks lessons by lexical relevance (FTS5 MATCH + `bm25`) and
 //! returns top-k within a token budget; `injection_block` formats the
 //! winners for the system prompt (CRAB-114's injection half, wired into
-//! `Agent::session_system_prompt`).
+//! `AgentRuntime::system_prompt`).
+//!
+//! # CRAB-136: sqlx
+//!
+//! - The database layer is async (`sqlx` 0.9, `runtime-tokio`); the runtime
+//!   awaits `injection_block` directly, and callers outside an async context
+//!   (tests, CLI-side code) `block_on`.
+//! - Queries use `sqlx::query!` macros, checked at compile time against the
+//!   schema. The check data lives in the workspace root `.sqlx/` directory:
+//!   refresh with `cargo sqlx prepare` (needs `DATABASE_URL`), then commit;
+//!   plain `cargo build` works offline against it (SQLX_OFFLINE semantics).
+//! - One `SqlitePool` per database file is cached process-wide (keyed by
+//!   path; entries are invalidated when the file is gone — the rebuild test
+//!   deletes the file and expects a fresh index).
 
-use rusqlite::{params, Connection};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
 use crate::memory::Lesson;
@@ -28,7 +45,9 @@ pub enum IndexError {
     #[error("index I/O error: {0}")]
     Io(std::io::Error),
     #[error("index sqlite error: {0}")]
-    Sqlite(rusqlite::Error),
+    Sqlite(#[from] sqlx::Error),
+    #[error("index migration error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("index memory error: {0}")]
     Memory(crate::memory::MemoryError),
     /// A lesson row stored in the index could not be deserialized (internal
@@ -37,28 +56,65 @@ pub enum IndexError {
     Corrupt(String),
 }
 
+/// Process-wide pool cache: one pool per database file, created lazily on
+/// first use and reused afterwards (CRAB-136 replaces per-call opens).
+static POOLS: OnceLock<Mutex<HashMap<PathBuf, SqlitePool>>> = OnceLock::new();
+
+fn pools() -> &'static Mutex<HashMap<PathBuf, SqlitePool>> {
+    POOLS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The pool for `db`, creating (and migrating) it on first use. A cache entry
+/// whose file has disappeared (deleted index) is discarded and recreated —
+/// an open sqlite handle to an unlinked inode must never be reused.
+async fn pool(db: &Path) -> Result<SqlitePool, IndexError> {
+    {
+        let map = pools().lock().unwrap();
+        if let Some(pool) = map.get(db) {
+            if db.is_file() {
+                return Ok(pool.clone());
+            }
+        }
+    }
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let options = SqliteConnectOptions::new()
+        .filename(db)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(4)
+        .connect_with(options)
+        .await?;
+    sqlx::migrate!().run(&pool).await?;
+    pools()
+        .lock()
+        .unwrap()
+        .insert(db.to_path_buf(), pool.clone());
+    Ok(pool)
+}
+
 /// Bring the index up to date with the lesson log for `cwd` under `root`:
 /// rebuilds from JSONL when the index is missing or the log changed since
 /// the last sync (the log is the source of truth). Returns the number of
 /// lessons indexed; 0 when there is no memory yet (and creates nothing).
-pub fn sync(root: &Path, cwd: &Path) -> Result<usize, IndexError> {
+pub async fn sync(root: &Path, cwd: &Path) -> Result<usize, IndexError> {
     let log = crate::memory::lessons_file(root, cwd);
     if !log.is_file() {
         return Ok(0); // no memory yet; nothing to index, nothing to create
     }
     let db = db_path(root, cwd);
-    if let Some(parent) = db.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let signature = log_signature(&log)?;
-    let needs_rebuild = !db.is_file() || stored_signature(&db)? != signature;
+    let needs_rebuild = !db.is_file() || stored_signature(&db).await? != signature;
     if !needs_rebuild {
         // Index is current; report the lesson count without touching it.
-        let conn = Connection::open(&db)?;
-        return lesson_count(&conn);
+        let pool = pool(&db).await?;
+        return lesson_count(&pool).await;
     }
     let lessons = crate::memory::list_lessons(root, cwd)?;
-    rebuild_from_lessons(&db, &lessons, &signature)?;
+    rebuild_from_lessons(&db, &lessons, &signature).await?;
     Ok(lessons.len())
 }
 
@@ -66,13 +122,13 @@ pub fn sync(root: &Path, cwd: &Path) -> Result<usize, IndexError> {
 /// `top_k`. The index is synced first (lazily built when missing), so a
 /// caller never has to remember to sync. Returns an empty vec when there is
 /// no memory yet or nothing matches.
-pub fn search(
+pub async fn search(
     root: &Path,
     cwd: &Path,
     task: &str,
     top_k: usize,
 ) -> Result<Vec<crate::memory::Lesson>, IndexError> {
-    let _n = sync(root, cwd)?;
+    sync(root, cwd).await?;
     let db = db_path(root, cwd);
     if !db.is_file() {
         return Ok(Vec::new());
@@ -80,19 +136,21 @@ pub fn search(
     let Some(query) = fts_query(task) else {
         return Ok(Vec::new());
     };
-    let conn = Connection::open(&db)?;
-    let mut stmt = conn.prepare(
-        "SELECT l.json FROM lessons_fts f JOIN lessons l ON l.rowid = f.rowid \
-         WHERE lessons_fts MATCH ?1 ORDER BY bm25(lessons_fts) LIMIT ?2",
-    )?;
+    let pool = pool(&db).await?;
     // SQLite treats a negative LIMIT as "no limit"; injection requests an
     // effectively unbounded k and trims to its token budget itself.
     let limit: i64 = top_k.try_into().unwrap_or(-1);
-    let rows = stmt.query_map(params![query, limit], |row| row.get::<_, String>(0))?;
+    let rows = sqlx::query!(
+        "SELECT l.json AS json FROM lessons_fts f JOIN lessons l ON l.rowid = f.rowid \
+         WHERE lessons_fts MATCH ?1 ORDER BY bm25(lessons_fts) LIMIT ?2",
+        query,
+        limit
+    )
+    .fetch_all(&pool)
+    .await?;
     let mut lessons = Vec::new();
     for row in rows {
-        let json = row?;
-        let lesson: crate::memory::Lesson = serde_json::from_str(&json)
+        let lesson: crate::memory::Lesson = serde_json::from_str(&row.json)
             .map_err(|e| IndexError::Corrupt(format!("invalid lesson row: {e}")))?;
         lessons.push(lesson);
     }
@@ -103,7 +161,7 @@ pub fn search(
 /// the system prompt, e.g. "Project lessons:\n- [rule] ...". Returns ""
 /// when there is no memory or nothing matches. Never injects more than
 /// `token_budget` tokens (greedy top-k by rank, budget in chars/4).
-pub fn injection_block(
+pub async fn injection_block(
     root: &Path,
     cwd: &Path,
     task: &str,
@@ -116,7 +174,7 @@ pub fn injection_block(
     let mut block = String::from("Project lessons learned in this workspace:\n");
     let mut used = estimate_tokens(&block);
     // Search without a hard k and trim here, so budget logic lives in one place.
-    let mut rank = search(root, cwd, task, usize::MAX)?;
+    let mut rank = search(root, cwd, task, usize::MAX).await?;
     // search() can only bound results after ranking; cap defensively.
     rank.truncate(50);
     for lesson in rank {
@@ -137,12 +195,6 @@ pub fn injection_block(
 impl From<std::io::Error> for IndexError {
     fn from(e: std::io::Error) -> Self {
         IndexError::Io(e)
-    }
-}
-
-impl From<rusqlite::Error> for IndexError {
-    fn from(e: rusqlite::Error) -> Self {
-        IndexError::Sqlite(e)
     }
 }
 
@@ -221,28 +273,33 @@ fn log_signature(log: &Path) -> Result<String, IndexError> {
 
 /// The signature stored in the index's `meta` table, or an empty string
 /// when the db has not been indexed yet (fresh file, no meta row).
-fn stored_signature(db: &Path) -> Result<String, IndexError> {
-    let conn = Connection::open(db)?;
-    let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = 'log_sig'")?;
-    let mut rows = stmt.query([])?;
-    match rows.next()? {
-        Some(row) => Ok(row.get(0)?),
-        None => Ok(String::new()),
-    }
+async fn stored_signature(db: &Path) -> Result<String, IndexError> {
+    let pool = pool(db).await?;
+    let row = sqlx::query!("SELECT value FROM meta WHERE key = 'log_sig'")
+        .fetch_optional(&pool)
+        .await?;
+    Ok(row.map(|r| r.value).unwrap_or_default())
 }
 
 /// Number of rows currently in the index.
-fn lesson_count(conn: &Connection) -> Result<usize, IndexError> {
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM lessons")?;
-    let count: i64 = stmt.query_row([], |r| r.get(0))?;
-    Ok(count as usize)
+async fn lesson_count(pool: &SqlitePool) -> Result<usize, IndexError> {
+    let row = sqlx::query!("SELECT COUNT(*) AS n FROM lessons")
+        .fetch_one(pool)
+        .await?;
+    Ok(row.n as usize)
 }
 
 /// Drop and recreate the schema, then insert every `lesson` (from the JSONL
-/// log — the source of truth) and record `signature` in `meta`.
-fn rebuild_from_lessons(db: &Path, lessons: &[Lesson], signature: &str) -> Result<(), IndexError> {
-    let conn = Connection::open(db)?;
-    conn.execute_batch(
+/// log — the source of truth) and record `signature` in `meta`. One
+/// transaction: a failed rebuild cannot leave a half-populated index.
+async fn rebuild_from_lessons(
+    db: &Path,
+    lessons: &[Lesson],
+    signature: &str,
+) -> Result<(), IndexError> {
+    let pool = pool(db).await?;
+    let mut tx = pool.begin().await?;
+    sqlx::raw_sql(
         "DROP TABLE IF EXISTS lessons_fts;
          DROP TABLE IF EXISTS lessons;
          DROP TABLE IF EXISTS meta;
@@ -251,32 +308,42 @@ fn rebuild_from_lessons(db: &Path, lessons: &[Lesson], signature: &str) -> Resul
              id TEXT NOT NULL,
              json TEXT NOT NULL
          );
-         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-    )?;
-    // FTS5 needs its own rowids aligned with `lessons.rowid`; insert into the
-    // content table first, then into the index with the same rowid.
-    conn.execute_batch("CREATE VIRTUAL TABLE lessons_fts USING fts5(id, text, kind, tags);")?;
+         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+         CREATE VIRTUAL TABLE lessons_fts USING fts5(id, text, kind, tags);",
+    )
+    .execute(&mut *tx)
+    .await?;
     for lesson in lessons {
-        let json = serde_json::to_string(lesson).map_err(|e| {
-            IndexError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-        })?;
-        conn.execute(
-            "INSERT INTO lessons (id, json) VALUES (?1, ?2)",
-            params![lesson.id, json],
-        )?;
-        let rowid = conn.last_insert_rowid();
-        let text = lesson.text.clone();
-        let kind = lesson.kind.clone();
+        let json = serde_json::to_string(lesson)
+            .map_err(|e| IndexError::Corrupt(format!("cannot serialize lesson: {e}")))?;
+        // FTS5 needs its own rowids aligned with `lessons.rowid`; RETURNING
+        // gives us the autoassigned rowid of the content row we just made.
+        let row = sqlx::query!(
+            "INSERT INTO lessons (id, json) VALUES (?1, ?2) RETURNING rowid",
+            lesson.id,
+            json
+        )
+        .fetch_one(&mut *tx)
+        .await?;
         let tags = lesson.tags.join(" ");
-        conn.execute(
+        sqlx::query!(
             "INSERT INTO lessons_fts (rowid, id, text, kind, tags) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![rowid, lesson.id, text, kind, tags],
-        )?;
+            row.rowid,
+            lesson.id,
+            lesson.text,
+            lesson.kind,
+            tags
+        )
+        .execute(&mut *tx)
+        .await?;
     }
-    conn.execute(
+    sqlx::query!(
         "INSERT INTO meta (key, value) VALUES ('log_sig', ?1)",
-        params![signature],
-    )?;
+        signature
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -360,25 +427,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sync_builds_index_from_the_log() {
+    #[tokio::test]
+    async fn sync_builds_index_from_the_log() {
         let (_guard, root) = temp_mem("sync-build");
         seed(&root, &cwd(), &[("build with make", "rule", "build")]);
-        let n = sync(&root, &cwd()).unwrap();
+        let n = sync(&root, &cwd()).await.unwrap();
         assert_eq!(n, 1);
         let db = db_path(&root, &cwd());
         assert!(db.is_file(), "index file created at {}", db.display());
     }
 
-    #[test]
-    fn sync_with_no_memory_is_a_no_op() {
+    #[tokio::test]
+    async fn sync_with_no_memory_is_a_no_op() {
         let (_guard, root) = temp_mem("sync-empty");
-        assert_eq!(sync(&root, &cwd()).unwrap(), 0);
+        assert_eq!(sync(&root, &cwd()).await.unwrap(), 0);
         assert!(!db_path(&root, &cwd()).exists());
     }
 
-    #[test]
-    fn search_ranks_relevant_lessons_first() {
+    #[tokio::test]
+    async fn search_ranks_relevant_lessons_first() {
         let (_guard, root) = temp_mem("search-rank");
         seed(
             &root,
@@ -389,11 +456,13 @@ mod tests {
                 ("deploy to prod on friday", "warning", "deploy"),
             ],
         );
-        sync(&root, &cwd()).unwrap();
+        sync(&root, &cwd()).await.unwrap();
 
         // The task mentions both build and make; the first lesson matches
         // both terms, so it must rank above the one matching only "build".
-        let results = search(&root, &cwd(), "how do i build with make", 5).unwrap();
+        let results = search(&root, &cwd(), "how do i build with make", 5)
+            .await
+            .unwrap();
         assert_eq!(
             results.len(),
             2,
@@ -402,24 +471,26 @@ mod tests {
         assert_eq!(results[0].text, "always build with make");
         assert_eq!(results[1].text, "build the docs with mdbook");
         // A deploy-only query returns only the deploy lesson.
-        let deploy = search(&root, &cwd(), "deploy to production", 5).unwrap();
+        let deploy = search(&root, &cwd(), "deploy to production", 5)
+            .await
+            .unwrap();
         assert_eq!(deploy.len(), 1);
         assert!(deploy[0].text.contains("deploy"));
     }
 
-    #[test]
-    fn search_auto_builds_when_no_index_yet() {
+    #[tokio::test]
+    async fn search_auto_builds_when_no_index_yet() {
         // A fresh memory dir with lessons but no explicit sync: search must
         // build the index lazily rather than return nothing.
         let (_guard, root) = temp_mem("search-lazy");
         seed(&root, &cwd(), &[("build with make", "rule", "build")]);
-        let results = search(&root, &cwd(), "build", 5).unwrap();
+        let results = search(&root, &cwd(), "build", 5).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].text.contains("make"));
     }
 
-    #[test]
-    fn search_respects_top_k() {
+    #[tokio::test]
+    async fn search_respects_top_k() {
         let (_guard, root) = temp_mem("search-k");
         seed(
             &root,
@@ -430,28 +501,28 @@ mod tests {
                 ("build script is slow", "tip", "build"),
             ],
         );
-        assert_eq!(search(&root, &cwd(), "build", 2).unwrap().len(), 2);
+        assert_eq!(search(&root, &cwd(), "build", 2).await.unwrap().len(), 2);
     }
 
-    #[test]
-    fn sync_rebuilds_after_the_log_changes() {
+    #[tokio::test]
+    async fn sync_rebuilds_after_the_log_changes() {
         let (_guard, root) = temp_mem("sync-change");
         seed(&root, &cwd(), &[("build with make", "rule", "build")]);
-        sync(&root, &cwd()).unwrap();
+        sync(&root, &cwd()).await.unwrap();
         // Append another lesson; sync must pick it up (log changed).
         seed(
             &root,
             &cwd(),
             &[("never deploy on friday", "warning", "deploy")],
         );
-        let n = sync(&root, &cwd()).unwrap();
+        let n = sync(&root, &cwd()).await.unwrap();
         assert_eq!(n, 2);
-        let results = search(&root, &cwd(), "deploy", 5).unwrap();
+        let results = search(&root, &cwd(), "deploy", 5).await.unwrap();
         assert!(results.iter().any(|l| l.text.contains("deploy")));
     }
 
-    #[test]
-    fn deleting_the_db_and_rebuilding_yields_identical_results() {
+    #[tokio::test]
+    async fn deleting_the_db_and_rebuilding_yields_identical_results() {
         let (_guard, root) = temp_mem("rebuild");
         seed(
             &root,
@@ -461,27 +532,70 @@ mod tests {
                 ("deploy carefully", "tip", "deploy"),
             ],
         );
-        sync(&root, &cwd()).unwrap();
-        let before = search(&root, &cwd(), "build deploy", 5).unwrap();
+        sync(&root, &cwd()).await.unwrap();
+        let before = search(&root, &cwd(), "build deploy", 5).await.unwrap();
 
-        // Simulate a lost index: delete the sqlite file, sync again.
+        // Simulate a lost index: delete the sqlite file, sync again. The
+        // cached pool for the old (unlinked) inode must be invalidated.
         std::fs::remove_file(db_path(&root, &cwd())).unwrap();
-        sync(&root, &cwd()).unwrap();
-        let after = search(&root, &cwd(), "build deploy", 5).unwrap();
+        sync(&root, &cwd()).await.unwrap();
+        let after = search(&root, &cwd(), "build deploy", 5).await.unwrap();
 
         assert_eq!(before, after, "rebuild from JSONL must be identical");
     }
 
-    #[test]
-    fn injection_block_is_empty_without_memory_or_matches() {
-        let (_guard, root) = temp_mem("inj-empty");
-        assert_eq!(injection_block(&root, &cwd(), "build", 100).unwrap(), "");
-        seed(&root, &cwd(), &[("deploy carefully", "tip", "deploy")]);
-        assert_eq!(injection_block(&root, &cwd(), "build", 100).unwrap(), "");
+    #[tokio::test]
+    async fn legacy_pre_crab136_database_still_opens_and_searches() {
+        // A database created by the old rusqlite code has the same objects
+        // but no `_sqlx_migrations` table. The migration (IF NOT EXISTS
+        // throughout) must apply cleanly and the index must be usable
+        // without a rebuild.
+        let (_guard, root) = temp_mem("legacy");
+        seed(&root, &cwd(), &[("build with make", "rule", "build")]);
+        let db = db_path(&root, &cwd());
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+
+        let options = SqliteConnectOptions::new()
+            .filename(&db)
+            .create_if_missing(true);
+        let conn = SqlitePool::connect_with(options).await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE IF NOT EXISTS lessons (
+                 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+                 id TEXT NOT NULL,
+                 json TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE VIRTUAL TABLE IF NOT EXISTS lessons_fts USING fts5(id, text, kind, tags);",
+        )
+        .execute(&conn)
+        .await
+        .unwrap();
+        conn.close().await;
+
+        // Stale signature forces a rebuild through the migration path; then
+        // search works normally.
+        let results = search(&root, &cwd(), "build", 5).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].text.contains("make"));
     }
 
-    #[test]
-    fn injection_block_lists_relevant_lessons() {
+    #[tokio::test]
+    async fn injection_block_is_empty_without_memory_or_matches() {
+        let (_guard, root) = temp_mem("inj-empty");
+        assert_eq!(
+            injection_block(&root, &cwd(), "build", 100).await.unwrap(),
+            ""
+        );
+        seed(&root, &cwd(), &[("deploy carefully", "tip", "deploy")]);
+        assert_eq!(
+            injection_block(&root, &cwd(), "build", 100).await.unwrap(),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn injection_block_lists_relevant_lessons() {
         let (_guard, root) = temp_mem("inj-list");
         seed(
             &root,
@@ -491,7 +605,9 @@ mod tests {
                 ("deploy to prod on friday", "warning", "deploy"),
             ],
         );
-        let block = injection_block(&root, &cwd(), "how do i build", 200).unwrap();
+        let block = injection_block(&root, &cwd(), "how do i build", 200)
+            .await
+            .unwrap();
         assert!(block.contains("make"), "{block}");
         assert!(
             !block.contains("deploy"),
@@ -500,8 +616,8 @@ mod tests {
         assert!(block.starts_with("Project lessons"), "{block}");
     }
 
-    #[test]
-    fn injection_block_respects_the_token_budget() {
+    #[tokio::test]
+    async fn injection_block_respects_the_token_budget() {
         let (_guard, root) = temp_mem("inj-budget");
         seed(
             &root,
@@ -514,7 +630,9 @@ mod tests {
         // Query matches lesson A on both build+make; A ranks first. Budget is
         // enough for the header + A (~22 tokens) but not A + B (~30), so only
         // the top-ranked lesson may be injected.
-        let block = injection_block(&root, &cwd(), "build with make", 25).unwrap();
+        let block = injection_block(&root, &cwd(), "build with make", 25)
+            .await
+            .unwrap();
         assert!(!block.is_empty());
         assert!(
             block.contains("make"),
@@ -527,11 +645,11 @@ mod tests {
         assert!(estimate_tokens(&block) <= 25, "budget respected: {block}");
     }
 
-    #[test]
-    fn injection_block_round_trips_lesson_text() {
+    #[tokio::test]
+    async fn injection_block_round_trips_lesson_text() {
         let (_guard, root) = temp_mem("inj-roundtrip");
         seed(&root, &cwd(), &[("build with make", "rule", "build")]);
-        let block = injection_block(&root, &cwd(), "build", 200).unwrap();
+        let block = injection_block(&root, &cwd(), "build", 200).await.unwrap();
         assert!(block.contains("build with make"));
     }
 }

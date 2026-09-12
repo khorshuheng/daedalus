@@ -737,14 +737,9 @@ impl AgentRuntime {
         };
         let ws = self.workspace_path();
         let budget = (self.inner.config.max_context_tokens / 20).max(64);
-        let task = task.to_string();
-        // SQLite stays synchronous; move it to the blocking pool (CRAB-130).
-        let block = tokio::task::spawn_blocking(move || {
-            crate::index::injection_block(&root, &ws, &task, budget)
-        })
-        .await
-        .unwrap_or_else(|_| Ok(String::new()));
-        match block {
+        // CRAB-136: the index layer is natively async (sqlx) — awaited
+        // directly, no blocking-pool hop.
+        match crate::index::injection_block(&root, &ws, task, budget).await {
             Ok(block) if !block.is_empty() => format!("{base}\n\n{block}"),
             _ => base,
         }

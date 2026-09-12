@@ -341,9 +341,23 @@ fn memory_pipeline_reflect_store_index_inject() {
     assert_eq!(stored[0].source_session_id.as_deref(), Some("sess-mem"));
 
     // 3. Build the SQLite index from the log and confirm retrieval.
-    let synced = crab_core::index::sync(&root, ws.root()).unwrap();
+    // CRAB-136: the index layer is async; block_on from this sync test.
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+    let synced = block_on(crab_core::index::sync(&root, ws.root())).unwrap();
     assert_eq!(synced, 1);
-    let hits = crab_core::index::search(&root, ws.root(), "how do i build", 5).unwrap();
+    let hits = block_on(crab_core::index::search(
+        &root,
+        ws.root(),
+        "how do i build",
+        5,
+    ))
+    .unwrap();
     assert!(
         hits.iter().any(|l| l.text.contains("make")),
         "index should return the lesson for a build query: {hits:?}"
