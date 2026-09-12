@@ -23,6 +23,9 @@ use crate::workspace::Workspace;
 
 pub struct BashTool {
     pub max_output: usize,
+    /// Applied when the model omits `timeout`, so no command can run forever.
+    /// `None` disables the default (tests, or `bash_timeout_secs = 0`).
+    pub default_timeout_secs: Option<u64>,
 }
 
 /// Run `sh -c <command>` capturing stdout/stderr, with an optional timeout in
@@ -157,7 +160,7 @@ impl Tool for BashTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": "Shell command to run in the workspace." },
-                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (optional, no default)." }
+                "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (optional; a server default applies otherwise)." }
             },
             "required": ["command"]
         })
@@ -170,11 +173,16 @@ impl Tool for BashTool {
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         let max_output = self.max_output;
+        let default_timeout_secs = self.default_timeout_secs;
         Box::pin(async move {
             let ws = workspace.clone();
             let args = args.clone();
             tokio::task::spawn_blocking(move || {
-                BashTool { max_output }.run_sync(&ws, &args, cancel)
+                BashTool {
+                    max_output,
+                    default_timeout_secs,
+                }
+                .run_sync(&ws, &args, cancel)
             })
             .await
             .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
@@ -194,7 +202,7 @@ impl BashTool {
         let timeout = match arg_usize(args, "timeout")? {
             Some(0) => return Err(ToolError::Argument("'timeout' must be >= 1".into())),
             Some(s) => Some(s as u64),
-            None => None,
+            None => self.default_timeout_secs,
         };
 
         let output = run_command(&command, workspace.root(), timeout, &cancel)?;
@@ -267,7 +275,10 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_and_exit_code() {
         let (ws, _dir) = setup("out");
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         let out = tool
             .run(&ws, &json!({"command": "echo hello"}), token())
             .await
@@ -279,7 +290,10 @@ mod tests {
     #[tokio::test]
     async fn nonzero_exit_is_a_tool_error() {
         let (ws, _dir) = setup("err");
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         let err = tool
             .run(&ws, &json!({"command": "echo boo 1>&2; exit 3"}), token())
             .await
@@ -294,7 +308,10 @@ mod tests {
     async fn runs_in_workspace_dir() {
         let (ws, dir) = setup("pwd");
         std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         let out = tool
             .run(&ws, &json!({"command": "ls"}), token())
             .await
@@ -305,7 +322,10 @@ mod tests {
     #[tokio::test]
     async fn caps_output_from_the_tail() {
         let (ws, _dir) = setup("cap");
-        let tool = BashTool { max_output: 64 };
+        let tool = BashTool {
+            max_output: 64,
+            default_timeout_secs: None,
+        };
         // 10000 '1's: the tail (last bytes) is kept, the head is dropped.
         let out = tool
             .run(
@@ -319,10 +339,29 @@ mod tests {
         assert!(out.content.contains("[full output:"));
     }
 
+    /// The configured default timeout applies when the model omits `timeout`,
+    /// so an unbounded command cannot run forever (CRAB-139 review).
+    #[tokio::test]
+    async fn default_timeout_applies_when_omitted() {
+        let (ws, _dir) = setup("default-timeout");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: Some(1),
+        };
+        let err = tool
+            .run(&ws, &json!({"command": "sleep 5"}), token())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
     #[tokio::test]
     async fn timeout_kills_command() {
         let (ws, _dir) = setup("timeout");
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         let err = tool
             .run(&ws, &json!({"command": "sleep 5", "timeout": 1}), token())
             .await
@@ -333,7 +372,10 @@ mod tests {
     #[tokio::test]
     async fn timeout_returns_promptly_when_command_forks() {
         let (ws, _dir) = setup("timeout-fork");
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         let start = std::time::Instant::now();
         let err = tool
             .run(
@@ -350,7 +392,10 @@ mod tests {
     #[test]
     fn cancel_kills_running_command() {
         let (ws, _dir) = setup("cancel");
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         let cancel = CancellationToken::new();
         let cancel2 = cancel.clone();
         let handle = std::thread::spawn(move || {
@@ -366,7 +411,10 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_grandchild_processes() {
         let (ws, dir) = setup("grandchild");
-        let tool = BashTool { max_output: 1000 };
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
         // Start a backgrounded grandchild that writes its PID and sleeps; the
         // direct `sh` exits immediately but the grandchild must not survive
         // the group kill.

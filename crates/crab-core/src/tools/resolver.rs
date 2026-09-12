@@ -29,8 +29,15 @@ pub struct ToolSet {
 }
 
 impl ToolSet {
-    /// The four built-ins, in a stable order.
+    /// The four built-ins, in a stable order (no default bash timeout).
     pub fn new(max_output: usize) -> Self {
+        Self::with_bash_timeout(max_output, None)
+    }
+
+    /// Like [`new`](Self::new), but applies `bash_timeout_secs` as the `bash`
+    /// default when the model omits `timeout` (CRAB-139 review), so an
+    /// unbounded command cannot run forever.
+    pub fn with_bash_timeout(max_output: usize, bash_timeout_secs: Option<u64>) -> Self {
         let mut set = Self { tools: Vec::new() };
         set.push(
             "read",
@@ -40,7 +47,10 @@ impl ToolSet {
         set.push(
             "bash",
             "Run a shell command in the workspace directory.",
-            Box::new(BashTool { max_output }),
+            Box::new(BashTool {
+                max_output,
+                default_timeout_secs: bash_timeout_secs,
+            }),
         );
         set.push(
             "edit",
@@ -59,7 +69,7 @@ impl ToolSet {
     /// MCP server (CRAB-133). Returns the set and non-fatal warnings for
     /// servers that failed to start — the agent runs with the tools that did.
     pub fn from_config(config: &crate::config::Config, max_output: usize) -> (Self, Vec<String>) {
-        let mut set = Self::new(max_output);
+        let mut set = Self::with_bash_timeout(max_output, config.bash_default_timeout());
         let (mcp_tools, warnings) = crate::mcp::connect_all(&config.mcp_servers, max_output);
         for tool in mcp_tools {
             let entry = ToolEntry {

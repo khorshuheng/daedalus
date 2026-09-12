@@ -752,6 +752,9 @@ impl AgentRuntime {
              - All file paths are relative to the workspace and must stay inside it.\n\
              - Read before editing; verify changes with bash.\n\
              - Make the smallest change that satisfies the request.\n\
+             - Keep searches inside the workspace and prefer `rg` (it respects\n\
+               .gitignore, so `target/` is skipped); never recursively scan the\n\
+               home directory or caches (e.g. `grep -r … ~`).\n\
              - When finished, give a concise final answer.",
             self.workspace_path().display()
         );

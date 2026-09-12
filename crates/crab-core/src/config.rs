@@ -172,6 +172,9 @@ pub struct Config {
     pub max_tokens: usize,
     /// Per-request timeout, in seconds.
     pub timeout_secs: u64,
+    /// Default timeout for `bash` when the model omits one, in seconds.
+    /// `0` disables the default (commands may then run indefinitely).
+    pub bash_timeout_secs: u64,
     /// Number of retries for transient failures (timeouts, 429, 5xx).
     pub max_retries: usize,
     /// Rough token budget for the conversation history. The oldest tool turns
@@ -207,6 +210,7 @@ impl Config {
             max_output_bytes: 32_000,
             max_tokens: 2048,
             timeout_secs: 60,
+            bash_timeout_secs: 120,
             max_retries: 2,
             // Leave headroom for the completion output (max_tokens).
             max_context_tokens: DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096),
@@ -214,6 +218,11 @@ impl Config {
             mcp_servers: Vec::new(),
             identity_workspaces: BTreeMap::new(),
         }
+    }
+
+    /// The `bash` default timeout, or `None` when disabled (`0`).
+    pub fn bash_default_timeout(&self) -> Option<u64> {
+        (self.bash_timeout_secs > 0).then_some(self.bash_timeout_secs)
     }
 }
 
@@ -232,6 +241,7 @@ pub struct PartialConfig {
     pub max_output_bytes: Option<usize>,
     pub max_tokens: Option<usize>,
     pub timeout_secs: Option<u64>,
+    pub bash_timeout_secs: Option<u64>,
     pub max_retries: Option<usize>,
     pub max_context_tokens: Option<usize>,
     pub workspace: Option<PathBuf>,
@@ -262,6 +272,7 @@ impl PartialConfig {
         take!(max_output_bytes);
         take!(max_tokens);
         take!(timeout_secs);
+        take!(bash_timeout_secs);
         take!(max_retries);
         take!(max_context_tokens);
         take!(workspace);
@@ -318,6 +329,7 @@ impl PartialConfig {
         if max_context_tokens == 0 {
             return Err("max_context_tokens must be >= 1".into());
         }
+        let bash_timeout_secs = self.bash_timeout_secs.unwrap_or(120);
         let mcp_servers = self.mcp_servers.unwrap_or_default();
         validate_servers(&mcp_servers)?;
         let identity_workspaces = self.identity_workspaces.unwrap_or_default();
@@ -342,6 +354,7 @@ impl PartialConfig {
             max_output_bytes: self.max_output_bytes.unwrap_or(32_000),
             max_tokens: self.max_tokens.unwrap_or(2048),
             timeout_secs: self.timeout_secs.unwrap_or(60),
+            bash_timeout_secs,
             max_retries: self.max_retries.unwrap_or(2),
             max_context_tokens,
             workspace,
@@ -433,6 +446,22 @@ mod tests {
         let err = load(ws(), None, PartialConfig::default()).unwrap_err();
         assert!(err.contains("no model configured"), "{err}");
         assert!(err.contains("openai"), "{err}");
+    }
+
+    #[test]
+    fn bash_timeout_defaults_and_can_be_disabled() {
+        let mut c = Config::defaults(ws());
+        assert_eq!(c.bash_timeout_secs, 120);
+        assert_eq!(c.bash_default_timeout(), Some(120));
+        c.bash_timeout_secs = 0;
+        assert_eq!(c.bash_default_timeout(), None);
+        // A config-file/flag value resolves through.
+        let flags = PartialConfig {
+            model: Some("m".into()),
+            bash_timeout_secs: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(load(ws(), None, flags).unwrap().bash_timeout_secs, 7);
     }
 
     #[test]
