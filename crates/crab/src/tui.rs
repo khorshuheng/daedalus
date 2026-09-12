@@ -6,7 +6,8 @@
 //! stream. Layout: transcript on top, a line-editing input with a visible
 //! caret at the bottom (CRAB-126), a centered picker overlay for /model and
 //! /effort (CRAB-127), and a footer/status line (provider, model, effort,
-//! animated spinner while busy, CRAB-128).
+//! animated spinner while busy, CRAB-128). CRAB-138 adds `/skills` (list) and
+//! `/skill <name>` (load an instruction file as a user message).
 //!
 //! This module is split so the behavior is testable without a terminal:
 //! the pure model (`parse_slash`, `LineAction` routing, `apply_event`
@@ -57,6 +58,10 @@ pub enum SlashCommand {
     Effort(String),
     /// Change the workspace.
     Workspace(PathBuf),
+    /// List the discovered skills (user + workspace).
+    Skills,
+    /// Load a skill's content into the conversation as a user message.
+    Skill(String),
     /// Continue the previous session for this workspace.
     Resume,
     /// Reset the conversation to a fresh context.
@@ -82,6 +87,8 @@ pub fn parse_line(line: &str) -> LineAction {
             "model" => Some(SlashCommand::Model(arg.to_string())),
             "effort" => Some(SlashCommand::Effort(arg.to_string())),
             "workspace" => Some(SlashCommand::Workspace(PathBuf::from(arg))),
+            "skills" => Some(SlashCommand::Skills),
+            "skill" => Some(SlashCommand::Skill(arg.to_string())),
             "resume" => Some(SlashCommand::Resume),
             "clear" => Some(SlashCommand::Clear),
             "help" => Some(SlashCommand::Help),
@@ -716,7 +723,9 @@ fn run_command(
 ) -> bool {
     match cmd {
         SlashCommand::Help => {
-            model.push_notice("/login /model /effort /workspace /resume /clear /help /exit");
+            model.push_notice(
+                "/login /model /effort /workspace /resume /clear /skills /skill /help /exit",
+            );
         }
         SlashCommand::Clear => {
             rt.clear();
@@ -766,6 +775,42 @@ fn run_command(
         SlashCommand::Workspace(path) => {
             rt.switch_workspace(&path.to_string_lossy());
             model.state.workspace = path.to_string_lossy().into_owned();
+        }
+        SlashCommand::Skills => {
+            let skills = rt.skills();
+            if skills.is_empty() {
+                model.push_notice(
+                    "no skills found (add <workspace>/.crab/skills/<name>.md or \
+                     ~/.config/crab/skills/<name>.md)",
+                );
+            } else {
+                for s in &skills {
+                    model.push_notice(&format!(
+                        "{} — {} ({})",
+                        s.name,
+                        s.description,
+                        s.path.display()
+                    ));
+                }
+            }
+        }
+        SlashCommand::Skill(name) => {
+            if name.is_empty() {
+                model.push_notice("usage: /skill <name> (see /skills)");
+            } else {
+                match rt.skills().into_iter().find(|s| s.name == name) {
+                    Some(skill) => {
+                        model.push_user(&format!("/skill {}", skill.name));
+                        if rt.is_busy() {
+                            rt.steer(&skill.prompt());
+                            model.push_notice("(skill queued as steer)");
+                        } else {
+                            rt.prompt(&skill.prompt());
+                        }
+                    }
+                    None => model.push_notice(&format!("unknown skill '{name}' (see /skills)")),
+                }
+            }
         }
     }
     false
@@ -1024,6 +1069,87 @@ mod tests {
             parse_line("/workspace /tmp/proj"),
             LineAction::Command(SlashCommand::Workspace(PathBuf::from("/tmp/proj")))
         );
+    }
+
+    #[test]
+    fn skill_commands_parse() {
+        assert_eq!(
+            parse_line("/skills"),
+            LineAction::Command(SlashCommand::Skills)
+        );
+        assert_eq!(
+            parse_line("/skill review"),
+            LineAction::Command(SlashCommand::Skill("review".to_string()))
+        );
+        // A bare `/skill` still routes to the command; run_command prints usage.
+        assert_eq!(
+            parse_line("/skill"),
+            LineAction::Command(SlashCommand::Skill(String::new()))
+        );
+    }
+
+    /// CRAB-138: `/skills` lists discovered skills and `/skill <name>` loads
+    /// one as a user message (unknown names get a notice instead).
+    #[test]
+    fn skill_command_loads_body_and_lists_catalog() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let skills_dir = dir.path().join(".crab").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("demo.md"), "Demo skill.\n\nDo the demo.").unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::new(
+            cfg,
+            Box::new(FakeProvider::new(vec![])),
+            ToolSet::new(1000),
+            ws,
+        );
+        let mut model = UiModel::new(rt.state());
+        let mut picker = None;
+        let mut login_pending = false;
+        let session_root = Path::new("/tmp");
+
+        run_command(
+            &rt,
+            &mut model,
+            &mut picker,
+            session_root,
+            &mut login_pending,
+            SlashCommand::Skills,
+        );
+        assert!(model
+            .transcript
+            .iter()
+            .any(|l| matches!(l, TranscriptLine::Notice(n) if n.contains("demo") && n.contains("Demo skill."))));
+
+        run_command(
+            &rt,
+            &mut model,
+            &mut picker,
+            session_root,
+            &mut login_pending,
+            SlashCommand::Skill("demo".to_string()),
+        );
+        assert!(model
+            .transcript
+            .iter()
+            .any(|l| matches!(l, TranscriptLine::User(u) if u == "/skill demo")));
+
+        run_command(
+            &rt,
+            &mut model,
+            &mut picker,
+            session_root,
+            &mut login_pending,
+            SlashCommand::Skill("nope".to_string()),
+        );
+        assert!(model
+            .transcript
+            .iter()
+            .any(|l| matches!(l, TranscriptLine::Notice(n) if n.contains("unknown skill"))));
     }
 
     #[test]

@@ -50,6 +50,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EffortStyle, ProviderInfo};
 use crate::provider::{Message, Provider, Response};
+use crate::skills::{self, Skill};
 use crate::tools::resolver::ToolSet;
 use crate::workspace::Workspace;
 
@@ -581,6 +582,14 @@ impl AgentRuntime {
         self.inner.config.provider
     }
 
+    /// Skills discovered for the current workspace (user + workspace levels,
+    /// workspace wins on a name clash, CRAB-138). Re-read on every call so a
+    /// file dropped into `<workspace>/.crab/skills/` is picked up on the next
+    /// turn.
+    pub fn skills(&self) -> Vec<Skill> {
+        skills::discover(&self.workspace_path())
+    }
+
     /// Current runtime state snapshot.
     pub fn state(&self) -> RuntimeState {
         self.inner.state.lock().unwrap().clone()
@@ -708,7 +717,8 @@ impl AgentRuntime {
         });
     }
 
-    /// The seed system prompt for the current workspace.
+    /// The seed system prompt for the current workspace, including the skills
+    /// catalog when any skills are installed (CRAB-138).
     fn system_prompt(&self) -> String {
         let base = format!(
             "You are crab, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
@@ -724,7 +734,7 @@ impl AgentRuntime {
              - When finished, give a concise final answer.",
             self.workspace_path().display()
         );
-        base
+        skills::with_catalog(&base, &self.skills())
     }
 
     /// Reset the conversation to a fresh seed: system prompt only, ranked
@@ -1271,6 +1281,41 @@ mod tests {
         let root = dir.path().to_path_buf();
         let ws = Workspace::new(root).unwrap();
         (dir, ws)
+    }
+
+    /// CRAB-138: a skill in `<workspace>/.crab/skills/` shows up in the
+    /// system-prompt catalog. The user-level dir is not injected here, so a
+    /// real `~/.config/crab/skills` can only add entries, never remove the
+    /// workspace one this asserts on.
+    #[test]
+    fn system_prompt_lists_workspace_skills() {
+        let (dir, ws) = workspace("skills");
+        let skills_dir = dir.path().join(".crab").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(
+            skills_dir.join("demo.md"),
+            "Demo skill.\n\nDo the demo thing.",
+        )
+        .unwrap();
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::new(
+            cfg,
+            Box::new(GateProvider::new(vec![])),
+            ToolSet::new(1000),
+            ws,
+        );
+        let prompt = rt.system_prompt();
+        assert!(prompt.contains("Available skills"), "catalog block missing");
+        assert!(prompt.contains("demo — Demo skill."));
+        assert!(prompt.contains("demo.md"));
+        // The model can self-serve with the existing read tool rather than a
+        // new skill tool.
+        let skills = rt.skills();
+        assert_eq!(skills.len(), 1);
+        assert!(skills[0].prompt().contains("Do the demo thing."));
     }
 
     fn runtime_with(

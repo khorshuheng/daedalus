@@ -7,6 +7,7 @@
 //! - `provider` (CRAB-103): LLM providers behind an extensible `Provider` trait.
 //! - `session` (CRAB-109): on-disk conversation persistence for `/resume`.
 //! - `runtime` (CRAB-116): stateful AgentRuntime engine + Event/Command surface.
+//! - `skills` (CRAB-138): load-on-demand instruction files (user + workspace).
 //! - `paths` (CRAB-119): XDG config/data base directories.
 //!
 //! The frontends (`crab` binary: main/modes/term) live in the sibling crate so
@@ -19,5 +20,6 @@ pub mod paths;
 pub mod provider;
 pub mod runtime;
 pub mod session;
+pub mod skills;
 pub mod tools;
 pub mod workspace;
