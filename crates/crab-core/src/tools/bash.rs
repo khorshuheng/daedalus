@@ -37,10 +37,11 @@ pub struct BashTool {
 /// pipe write end open must not hold the tool hostage.
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(150);
 
-/// State shared between `run_command` and its reader threads.
+/// State shared between `run_command` and its reader threads. stdout and
+/// stderr append to one buffer in arrival order (CRAB-155), matching pi's
+/// single `OutputAccumulator`.
 struct StreamCapture {
-    stdout: Mutex<Vec<u8>>,
-    stderr: Mutex<Vec<u8>>,
+    buf: Mutex<Vec<u8>>,
     /// Set once the parent has stopped caring; readers then stop appending, so
     /// a chatty descendant cannot grow the buffer after the result is read.
     stop: AtomicBool,
@@ -51,18 +52,18 @@ struct StreamCapture {
 impl StreamCapture {
     fn new() -> Self {
         Self {
-            stdout: Mutex::new(Vec::new()),
-            stderr: Mutex::new(Vec::new()),
+            buf: Mutex::new(Vec::new()),
             stop: AtomicBool::new(false),
             done: AtomicUsize::new(0),
         }
     }
 }
 
-/// Drain `pipe` into `capture` until EOF or the `stop` flag is set (CRAB-147).
-/// The thread exits on EOF; a descendant that keeps the pipe open can leave it
-/// blocked in `read`, which is deliberate — the parent never joins it.
-fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCapture>, stderr: bool) {
+/// Drain `pipe` into the shared buffer until EOF or the `stop` flag is set
+/// (CRAB-147/155). The thread exits on EOF; a descendant that keeps the pipe
+/// open can leave it blocked in `read`, which is deliberate — the parent never
+/// joins it.
+fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCapture>) {
     std::thread::spawn(move || {
         let mut chunk = [0u8; 8192];
         loop {
@@ -72,12 +73,9 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCaptu
                     if capture.stop.load(Ordering::Relaxed) {
                         break;
                     }
-                    let slot = if stderr {
-                        &capture.stderr
-                    } else {
-                        &capture.stdout
-                    };
-                    slot.lock()
+                    capture
+                        .buf
+                        .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .extend_from_slice(&chunk[..n]);
                 }
@@ -119,10 +117,10 @@ fn run_command(
 
     let capture = Arc::new(StreamCapture::new());
     if let Some(stdout) = child.stdout.take() {
-        drain(stdout, Arc::clone(&capture), false);
+        drain(stdout, Arc::clone(&capture));
     }
     if let Some(stderr) = child.stderr.take() {
-        drain(stderr, Arc::clone(&capture), true);
+        drain(stderr, Arc::clone(&capture));
     }
 
     // `checked_add` so an absurd timeout is a bad argument, not a panic
@@ -168,13 +166,12 @@ fn run_command(
         std::thread::sleep(Duration::from_millis(5));
     }
     capture.stop.store(true, Ordering::SeqCst);
-    let stdout = std::mem::take(&mut *capture.stdout.lock().unwrap_or_else(|e| e.into_inner()));
-    let stderr = std::mem::take(&mut *capture.stderr.lock().unwrap_or_else(|e| e.into_inner()));
+    let merged = std::mem::take(&mut *capture.buf.lock().unwrap_or_else(|e| e.into_inner()));
 
     Ok(Output {
         status,
-        stdout,
-        stderr,
+        stdout: merged,
+        stderr: Vec::new(),
     })
 }
 
@@ -268,17 +265,9 @@ impl BashTool {
 
         let output = run_command(&command, workspace.root(), timeout, &cancel)?;
 
-        let mut text = String::new();
-        if !output.stdout.is_empty() {
-            text.push_str("stdout:\n");
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            text.push('\n');
-        }
-        if !output.stderr.is_empty() {
-            text.push_str("stderr:\n");
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            text.push('\n');
-        }
+        // stdout and stderr are merged in arrival order (CRAB-155); no stream
+        // labels, matching pi's single accumulator.
+        let text = String::from_utf8_lossy(&output.stdout).to_string();
 
         let (truncated, was_truncated) = truncate_tail(&text, self.max_output);
         let mut result = truncated;
@@ -360,9 +349,36 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("stderr:"));
         assert!(msg.contains("boo"));
+        assert!(!msg.contains("stderr:"));
         assert!(msg.contains("Command exited with code 3"));
+    }
+
+    /// CRAB-155: stdout and stderr share one buffer, so their relative order is
+    /// preserved and no `stdout:`/`stderr:` labels are emitted.
+    #[tokio::test]
+    async fn interleaves_stdout_and_stderr_in_arrival_order() {
+        let (ws, _dir) = setup("interleave");
+        let tool = BashTool {
+            max_output: 10_000,
+            default_timeout_secs: None,
+        };
+        let cmd = "echo o1; sleep 0.05; echo e1 1>&2; sleep 0.05; \
+                   echo o2; sleep 0.05; echo e2 1>&2";
+        let out = tool
+            .run(&ws, &json!({"command": cmd}), token())
+            .await
+            .unwrap();
+        let idx = |needle: &str| {
+            out.content
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {:?}", out.content))
+        };
+        assert!(idx("o1") < idx("e1"), "{}", out.content);
+        assert!(idx("e1") < idx("o2"), "{}", out.content);
+        assert!(idx("o2") < idx("e2"), "{}", out.content);
+        assert!(!out.content.contains("stdout:"), "{}", out.content);
+        assert!(!out.content.contains("stderr:"), "{}", out.content);
     }
 
     #[tokio::test]
