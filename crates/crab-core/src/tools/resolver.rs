@@ -46,17 +46,17 @@ impl ToolSet {
             Box::new(ReadTool { max_output }),
         );
         set.push(
+            "search",
+            "Search file contents with a regex. Use this instead of `grep`/`rg` in bash: it respects .gitignore, skips hidden/binary files, and is bounded.",
+            Box::new(SearchTool { max_output }),
+        );
+        set.push(
             "bash",
             "Run a shell command in the workspace directory.",
             Box::new(BashTool {
                 max_output,
                 default_timeout_secs: bash_timeout_secs,
             }),
-        );
-        set.push(
-            "search",
-            "Search file contents with a regex (ripgrep-style: respects .gitignore, skips hidden and binary files).",
-            Box::new(SearchTool { max_output }),
         );
         set.push(
             "edit",
