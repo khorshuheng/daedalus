@@ -9,19 +9,19 @@
 //!
 //! # Threading model
 //!
-//! The turn loop stays synchronous and single-threaded, running on a worker
-//! thread owned by the runtime. Adapters hold a cheap cloneable handle and an
-//! event `Receiver`:
+//! The turn loop is async (CRAB-130) and single-threaded, driven by a tokio
+//! current-thread runtime owned by the worker thread. Adapters hold a cheap
+//! cloneable handle and an event `Receiver`:
 //!
 //! ```text
-//!   adapter ── Command (queue + notify) ──▶ AgentRuntime worker (turn loop)
-//!   adapter ◀───── Event (unbounded channel) ── AgentRuntime
+//!   adapter ── Command (tokio unbounded channel) ──▶ AgentRuntime worker (async turn loop)
+//!   adapter ◀───── Event (tokio unbounded channel) ── AgentRuntime
 //! ```
 //!
 //! Commands sent while a turn is running are queued and delivered at the pi
 //! boundaries: `steer` after the current assistant message finishes its tool
 //! calls, `followUp` when the agent stops, `abort` immediately (partial text
-//! is kept). Cancellation is per-session (`Arc<AtomicBool>` threaded into
+//! is kept). Cancellation is per-session (a `CancellationToken` threaded into
 //! providers and tools), so one client's abort never affects another session.
 //!
 //! # Wire format
@@ -43,10 +43,10 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ProviderKind};
 use crate::provider::{Message, Provider, Response};
@@ -379,8 +379,11 @@ struct Inner {
     /// Mutable runtime state (model/effort), guarded for adapter `get_state`.
     state: Mutex<RuntimeState>,
     /// Per-session cancel, threaded into providers and tools (replaces the
-    /// process-global `term::cancel_flag`).
-    cancel: AtomicBool,
+    /// process-global `term::cancel_flag`; CRAB-130). Guarded so the worker
+    /// can swap in a fresh token when a turn settles (abort is one-shot:
+    /// `tokio_util::sync::CancellationToken` has no reset). Callers snapshot
+    /// the current token with [`AgentRuntime::cancel_token`].
+    cancel: Mutex<CancellationToken>,
     /// Interactive adapters (REPL/TUI) set this: a human is present and can
     /// abort with Ctrl+C, so the iteration cap is not enforced and long
     /// exploration (many tool steps before a final answer) is allowed.
@@ -390,11 +393,13 @@ struct Inner {
     anchor: Mutex<(usize, usize)>,
     /// Tool argument schemas for the provider `tools` field (built once).
     schemas: Vec<serde_json::Value>,
-    /// Incoming commands; the worker blocks on `cond` when idle and drains
-    /// the queue at turn boundaries while busy. `Shutdown` stops the worker.
-    queue: Mutex<VecDeque<Control>>,
-    cond: Condvar,
-    events: Sender<Event>,
+    /// Incoming commands; the worker awaits the receiver when idle and drains
+    /// it at turn boundaries while busy. `Shutdown` stops the worker. Only the
+    /// worker touches the receiver, so it sits behind a plain mutex to keep
+    /// `Inner` `Sync` (the lock is never held across an `await`).
+    commands_tx: tokio::sync::mpsc::UnboundedSender<Control>,
+    commands_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Control>>,
+    events: tokio::sync::mpsc::UnboundedSender<Event>,
 }
 
 /// A cloneable handle to a running agent. Construct with `AgentRuntime::new`
@@ -416,8 +421,9 @@ impl AgentRuntime {
         tools: ToolSet,
         workspace: Workspace,
         memory_root: Option<PathBuf>,
-    ) -> (AgentRuntime, Receiver<Event>) {
-        let (events, rx) = mpsc::channel();
+    ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
         let schemas = tools.tool_schemas();
         let tools = Arc::new(tools);
         let model = config.model.clone();
@@ -436,14 +442,14 @@ impl AgentRuntime {
                     workspace: ws_path,
                     busy: false,
                 }),
-                cancel: AtomicBool::new(false),
+                cancel: Mutex::new(CancellationToken::new()),
                 interactive: AtomicBool::new(false),
                 busy: AtomicBool::new(false),
                 history: Mutex::new(Vec::new()),
                 anchor: Mutex::new((0, 0)),
                 schemas,
-                queue: Mutex::new(VecDeque::new()),
-                cond: Condvar::new(),
+                commands_tx,
+                commands_rx: tokio::sync::Mutex::new(commands_rx),
                 events,
             }),
         };
@@ -453,9 +459,7 @@ impl AgentRuntime {
     // --- command surface (thread-safe, non-blocking) ---
 
     fn push(&self, kind: CommandKind) {
-        let mut q = self.inner.queue.lock().unwrap();
-        q.push_back(Control::Command(kind));
-        self.inner.cond.notify_all();
+        let _ = self.inner.commands_tx.send(Control::Command(kind));
     }
 
     /// Start a turn with `text` as the user message (queued if busy, then
@@ -492,8 +496,19 @@ impl AgentRuntime {
     /// Abort the in-flight turn immediately, keeping partial text. Safe to
     /// call from any thread while a turn runs.
     pub fn abort(&self) {
-        self.inner.cancel.store(true, Ordering::SeqCst);
+        self.cancel_current();
         self.push(CommandKind::Abort {});
+    }
+
+    /// Snapshot the current cancellation token (providers and tools hold
+    /// their clone for the duration of one call).
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.inner.cancel.lock().unwrap().clone()
+    }
+
+    /// Cancel the current token (worker-side drain of an `Abort`).
+    fn cancel_current(&self) {
+        self.inner.cancel.lock().unwrap().cancel();
     }
 
     /// Change the model for subsequent completions.
@@ -524,7 +539,11 @@ impl AgentRuntime {
     /// handlers that run while the worker is idle (e.g. the REPL `/clear`);
     /// adapters driving through the queue use `clear()`.
     pub fn reset_sync(&self) {
-        self.reset_to_seed();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reset_sync tokio runtime");
+        rt.block_on(self.reset_to_seed());
     }
 
     /// Ask the runtime to emit a `state_changed` event with current state.
@@ -535,9 +554,7 @@ impl AgentRuntime {
     /// Signal the worker to exit its `run_forever` loop after any in-flight
     /// turn settles.
     pub fn shutdown(&self) {
-        let mut q = self.inner.queue.lock().unwrap();
-        q.push_back(Control::Shutdown);
-        self.inner.cond.notify_all();
+        let _ = self.inner.commands_tx.send(Control::Shutdown);
     }
 
     // --- adapter accessors ---
@@ -586,9 +603,19 @@ impl AgentRuntime {
     // ------------------------------------------------------------------
 
     /// Drive the worker loop forever (until `shutdown`). Blocks the calling
-    /// thread; adapters spawn this on a thread of their choosing (the REPL
-    /// spawns one, CRAB-122 gives each connected session its own).
+    /// thread; adapters spawn this on a thread of their choosing (the TUI
+    /// spawns one, CRAB-122 gives each connected session its own). The thread
+    /// owns a tokio current-thread runtime that drives the async turn engine.
     pub fn run_forever(&self) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("worker tokio runtime");
+        rt.block_on(self.run_forever_async());
+    }
+
+    /// The async body of the worker loop (CRAB-130).
+    async fn run_forever_async(&self) {
         {
             let st = self.inner.state.lock().unwrap();
             let agent_start = Event::AgentStart {
@@ -599,23 +626,23 @@ impl AgentRuntime {
             drop(st);
             self.emit(agent_start);
         }
-        while let Some(kind) = self.wait_for_command() {
+        while let Some(kind) = self.wait_for_command().await {
             match kind {
-                CommandKind::Prompt { text } => self.drive_until_settled(&text),
+                CommandKind::Prompt { text } => self.drive_until_settled(&text).await,
                 // While idle a steer/follow-up is simply a new turn.
                 CommandKind::Steer { text } | CommandKind::FollowUp { text } => {
-                    self.drive_until_settled(&text)
+                    self.drive_until_settled(&text).await
                 }
                 CommandKind::Abort {} => self.cancel_clear(),
                 CommandKind::GetState {} => self.emit_state_changed(),
                 CommandKind::Clear {} => {
-                    self.reset_to_seed();
+                    self.reset_to_seed().await;
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
-                | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind),
+                | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
             }
         }
     }
@@ -625,10 +652,19 @@ impl AgentRuntime {
     /// tests. Errors (iteration cap, provider failure) are returned as
     /// `Err(RuntimeError)`.
     pub fn run_once(&self, prompt: &str) -> Result<String, RuntimeError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("run_once tokio runtime");
+        rt.block_on(self.run_once_async(prompt))
+    }
+
+    /// The async body of `run_once` (CRAB-130).
+    async fn run_once_async(&self, prompt: &str) -> Result<String, RuntimeError> {
         self.set_busy(true);
         self.cancel_clear();
         let mut saved = VecDeque::new();
-        let (text, _interrupted, error) = self.run_one_user_message(prompt, &mut saved);
+        let (text, _interrupted, error) = self.run_one_user_message(prompt, &mut saved).await;
         self.emit(Event::AgentSettled {
             text: text.clone(),
             interrupted: false,
@@ -681,7 +717,7 @@ impl AgentRuntime {
 
     /// The seed system prompt for the current workspace. Memory injection
     /// (CRAB-114) appends the top lessons ranked against `task`.
-    fn system_prompt(&self, task: &str) -> String {
+    async fn system_prompt(&self, task: &str) -> String {
         let base = format!(
             "You are crab, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
              You have exactly four tools and no others: read, bash, edit, write.\n\
@@ -696,12 +732,19 @@ impl AgentRuntime {
              - When finished, give a concise final answer.",
             self.workspace_path().display()
         );
-        let Some(root) = &self.inner.memory_root else {
+        let Some(root) = self.inner.memory_root.clone() else {
             return base;
         };
         let ws = self.workspace_path();
         let budget = (self.inner.config.max_context_tokens / 20).max(64);
-        match crate::index::injection_block(root, &ws, task, budget) {
+        let task = task.to_string();
+        // SQLite stays synchronous; move it to the blocking pool (CRAB-130).
+        let block = tokio::task::spawn_blocking(move || {
+            crate::index::injection_block(&root, &ws, &task, budget)
+        })
+        .await
+        .unwrap_or_else(|_| Ok(String::new()));
+        match block {
             Ok(block) if !block.is_empty() => format!("{base}\n\n{block}"),
             _ => base,
         }
@@ -710,19 +753,20 @@ impl AgentRuntime {
     /// Reset the conversation to a fresh seed: system prompt only, ranked
     /// against nothing yet (the first user message re-seeds via the turn
     /// engine).
-    fn reset_to_seed(&self) {
+    async fn reset_to_seed(&self) {
+        let seed = self.system_prompt("").await;
         let mut h = self.inner.history.lock().unwrap();
         h.clear();
-        h.push(Message::System(self.system_prompt("")));
+        h.push(Message::System(seed));
         *self.inner.anchor.lock().unwrap() = (0, 0);
     }
 
     fn cancel_clear(&self) {
-        self.inner.cancel.store(false, Ordering::SeqCst);
+        *self.inner.cancel.lock().unwrap() = CancellationToken::new();
     }
 
     /// Apply a set_model/set_effort/switch_workspace command to shared state.
-    fn apply_state_command(&self, kind: CommandKind) {
+    async fn apply_state_command(&self, kind: CommandKind) {
         match kind {
             CommandKind::SetModel { model } => {
                 self.inner.state.lock().unwrap().model = model;
@@ -735,7 +779,7 @@ impl AgentRuntime {
             CommandKind::SwitchWorkspace { path } => match Workspace::new(PathBuf::from(&path)) {
                 Ok(ws) => {
                     *self.inner.workspace.lock().unwrap() = ws;
-                    self.reset_to_seed();
+                    self.reset_to_seed().await;
                     self.emit_state_changed();
                 }
                 Err(e) => self.emit(Event::Error {
@@ -748,24 +792,21 @@ impl AgentRuntime {
 
     /// Pop the oldest queued command without blocking, or `None` (also when
     /// the next item is a shutdown request).
-    fn pop_queued(&self) -> Option<CommandKind> {
-        let mut q = self.inner.queue.lock().unwrap();
-        match q.pop_front() {
-            Some(Control::Command(kind)) => Some(kind),
-            Some(Control::Shutdown) | None => None,
+    async fn pop_queued(&self) -> Option<CommandKind> {
+        let mut rx = self.inner.commands_rx.lock().await;
+        match rx.try_recv() {
+            Ok(Control::Command(kind)) => Some(kind),
+            Ok(Control::Shutdown) | Err(_) => None,
         }
     }
 
     /// Block until the queue has a command, then pop it. Returns `None` on a
     /// shutdown request so the worker loop can exit.
-    fn wait_for_command(&self) -> Option<CommandKind> {
-        let mut q = self.inner.queue.lock().unwrap();
-        loop {
-            match q.pop_front() {
-                Some(Control::Command(kind)) => return Some(kind),
-                Some(Control::Shutdown) => return None,
-                None => q = self.inner.cond.wait(q).unwrap(),
-            }
+    async fn wait_for_command(&self) -> Option<CommandKind> {
+        let mut rx = self.inner.commands_rx.lock().await;
+        match rx.recv().await {
+            Some(Control::Command(kind)) => Some(kind),
+            Some(Control::Shutdown) | None => None,
         }
     }
 
@@ -776,26 +817,26 @@ impl AgentRuntime {
     /// - `FollowUp` is delivered when the agent stops;
     /// - `Abort` cancels immediately;
     /// - set_*/get_state/clear apply immediately where safe.
-    fn drain_queue(&self) -> (Vec<String>, Vec<String>) {
+    async fn drain_queue(&self) -> (Vec<String>, Vec<String>) {
         let mut steers = Vec::new();
         let mut follow_ups = Vec::new();
-        while let Some(kind) = self.pop_queued() {
+        while let Some(kind) = self.pop_queued().await {
             match kind {
                 CommandKind::Steer { text } => steers.push(text),
                 CommandKind::FollowUp { text } => follow_ups.push(text),
                 CommandKind::Prompt { text } => follow_ups.push(text), // busy prompt = follow-up
                 CommandKind::Abort {} => {
-                    self.inner.cancel.store(true, Ordering::SeqCst);
+                    self.cancel_current();
                 }
                 CommandKind::GetState {} => self.emit_state_changed(),
                 CommandKind::Clear {} => {
-                    self.reset_to_seed();
+                    self.reset_to_seed().await;
                     self.emit_state_changed();
                 }
                 CommandKind::Resume => {}
                 CommandKind::SetModel { .. }
                 | CommandKind::SetEffort { .. }
-                | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind),
+                | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
             }
         }
         (steers, follow_ups)
@@ -803,13 +844,14 @@ impl AgentRuntime {
 
     /// Append `text` as the next user message, replacing the seed system
     /// prompt with one ranked against it when memory is enabled.
-    fn push_user(&self, text: &str) {
+    async fn push_user(&self, text: &str) {
+        let seed = self.system_prompt(text).await;
         let mut h = self.inner.history.lock().unwrap();
         // Refresh the seed system prompt (history[0]) for this task.
         if h.is_empty() {
-            h.push(Message::System(self.system_prompt(text)));
+            h.push(Message::System(seed));
         } else if let Some(Message::System(first)) = h.first_mut() {
-            *first = self.system_prompt(text);
+            *first = seed;
         }
         h.push(Message::User(text.to_string()));
     }
@@ -826,7 +868,7 @@ impl AgentRuntime {
     /// compaction is unavailable (e.g. the provider is fake) or fails, falls
     /// back to dropping the oldest blocks (trim), which always keeps the
     /// session under budget.
-    fn manage_context(
+    async fn manage_context(
         &self,
         history: &mut Vec<Message>,
         seed_len: usize,
@@ -836,7 +878,7 @@ impl AgentRuntime {
     ) {
         // Try compaction first when over budget.
         if anchored_total(history, *anchor_tokens, *anchor_len) > budget {
-            self.compact_history(history, seed_len, budget);
+            self.compact_history(history, seed_len, budget).await;
         }
         // Whatever remains over budget is trimmed (compaction is best-effort:
         // a summary may itself be long, or the provider may be unavailable).
@@ -848,7 +890,7 @@ impl AgentRuntime {
     /// nothing more can be removed. Best-effort: returns without changing
     /// anything when there is nothing summarizable or the provider call
     /// fails (the caller then trims).
-    fn compact_history(&self, history: &mut Vec<Message>, seed_len: usize, budget: usize) {
+    async fn compact_history(&self, history: &mut Vec<Message>, seed_len: usize, budget: usize) {
         // Find the oldest removable turn block (an Assistant message and its
         // following ToolResults). Compaction summarizes from the seed onward.
         loop {
@@ -878,7 +920,7 @@ impl AgentRuntime {
             if to_compact.len() <= 1 {
                 return; // nothing meaningful to compress
             }
-            let summary = match self.request_summary(&to_compact) {
+            let summary = match self.request_summary(&to_compact).await {
                 Some(s) if !s.is_empty() => s,
                 _ => return, // compaction unavailable/failed; caller trims
             };
@@ -898,7 +940,7 @@ impl AgentRuntime {
     /// `None` when the provider cannot (fake provider has no scripted
     /// response) or the call fails. The request is fire-and-forget: no events
     /// are emitted for it.
-    fn request_summary(&self, messages: &[Message]) -> Option<String> {
+    async fn request_summary(&self, messages: &[Message]) -> Option<String> {
         let prompt = format!(
             "Compress the following conversation into a concise summary that preserves \
              the key instructions, decisions, and constraints, so a follow-up turn \
@@ -917,12 +959,15 @@ impl AgentRuntime {
                 .join("\n")
         );
         let history = vec![Message::User(prompt)];
-        match self.inner.provider.complete(
-            &history,
-            &[],
-            &self.inner.cancel,
-            &mut |_| {}, // do not stream a compaction into the UI
-        ) {
+        static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+        let empty = EMPTY.get_or_init(|| serde_json::Value::Object(Default::default()));
+        let mut on_text = |_: &str| {}; // do not stream a compaction into the UI
+        match self
+            .inner
+            .provider
+            .complete(&history, &[], empty, self.cancel_token(), &mut on_text)
+            .await
+        {
             Ok(completion) => match completion.response {
                 Response::Text(t) => Some(t),
                 _ => None,
@@ -934,13 +979,13 @@ impl AgentRuntime {
     /// Returns the terminal text, whether the turn was interrupted, and an
     /// error description when the turn ended on an error (iteration cap or
     /// provider failure — also emitted as `Event::Error`).
-    fn run_one_user_message(
+    async fn run_one_user_message(
         &self,
         user_text: &str,
         saved: &mut VecDeque<String>,
     ) -> (String, bool, Option<String>) {
         self.emit(Event::TurnStart {});
-        self.push_user(user_text);
+        self.push_user(user_text).await;
         let seed_len = 2; // [System, first User] are never trimmed.
         let mut iterations = 0usize;
         let mut final_text = String::new();
@@ -950,18 +995,18 @@ impl AgentRuntime {
             // Drain anything queued between LLM calls: abort cancels, steer is
             // delivered only after an assistant tool phase (handled below),
             // follow-ups wait for settle (kept in `saved`).
-            let (steers, followups) = self.drain_queue();
+            let (steers, followups) = self.drain_queue().await;
             saved.extend(followups);
             if !steers.is_empty() {
                 // A steer arrived after the assistant's tool phase: append it
                 // as a user message and keep looping (no settle).
                 for steer in steers {
-                    self.push_user(&steer);
+                    self.push_user(&steer).await;
                     iterations = 0; // fresh turn budget for the steer
                 }
             }
 
-            if self.inner.cancel.load(Ordering::SeqCst) {
+            if self.inner.cancel.lock().unwrap().is_cancelled() {
                 interrupted = true;
                 break 'steps;
             }
@@ -980,29 +1025,51 @@ impl AgentRuntime {
                 break 'steps;
             }
 
+            let (mut h, (mut a0, mut a1)) = {
+                let h = self.inner.history.lock().unwrap().clone();
+                let anchor = *self.inner.anchor.lock().unwrap();
+                (h, anchor)
+            };
+            self.manage_context(
+                &mut h,
+                seed_len,
+                self.inner.config.max_context_tokens,
+                &mut a0,
+                &mut a1,
+            )
+            .await;
             {
-                let mut h = self.inner.history.lock().unwrap();
-                let (mut a0, mut a1) = *self.inner.anchor.lock().unwrap();
-                self.manage_context(
-                    &mut h,
-                    seed_len,
-                    self.inner.config.max_context_tokens,
-                    &mut a0,
-                    &mut a1,
-                );
+                // Write the compacted/trimmed history back wholesale.
+                let mut hh = self.inner.history.lock().unwrap();
+                *hh = h;
                 *self.inner.anchor.lock().unwrap() = (a0, a1);
             }
 
             let completion = {
-                let h = self.inner.history.lock().unwrap();
-                let schemas = &self.inner.schemas;
-                let cancel = &self.inner.cancel;
-                let emit = &self.inner.events;
-                self.inner.provider.complete(&h, schemas, cancel, &mut |t| {
+                // Clone the history so the lock is not held across the await
+                // (the vector is small and this is the only mutation window).
+                let h = self.inner.history.lock().unwrap().clone();
+                let effort_params = {
+                    let st = self.inner.state.lock().unwrap();
+                    provider_effort(self.inner.config.provider, st.effort)
+                };
+                let cancel = self.cancel_token();
+                let emit = self.inner.events.clone();
+                let mut on_text = |t: &str| {
                     let _ = emit.send(Event::TextDelta {
                         text: t.to_string(),
                     });
-                })
+                };
+                self.inner
+                    .provider
+                    .complete(
+                        &h,
+                        &self.inner.schemas,
+                        &effort_params,
+                        cancel,
+                        &mut on_text,
+                    )
+                    .await
             };
             match completion {
                 Err(e) => {
@@ -1046,57 +1113,37 @@ impl AgentRuntime {
                             break 'steps;
                         }
                         Response::ToolCalls(calls) => {
-                            let mut h = self.inner.history.lock().unwrap();
-                            h.push(Message::Assistant {
+                            self.inner.history.lock().unwrap().push(Message::Assistant {
                                 text: None,
                                 tool_calls: calls.clone(),
                             });
-                            drop(h);
                             // Run tool calls in parallel (CRAB-107 #11), like
                             // pi. Each thread locks the workspace and checks
                             // the shared cancel flag; results are collected in
                             // call order so history stays deterministic.
                             let mut cancelled = false;
+                            let ws = self.inner.workspace.lock().unwrap().clone();
                             let results: Vec<(String, Result<String, crate::tools::ToolError>)> =
-                                std::thread::scope(|scope| {
-                                    let handles: Vec<_> = calls
-                                        .iter()
-                                        .map(|call| {
-                                            self.emit(Event::ToolStart {
-                                                name: call.name.clone(),
-                                                id: Some(call.id.clone()),
-                                            });
-                                            scope.spawn(move || {
-                                                // Clone the (immutable) workspace so the
-                                                // lock is not held across the whole tool
-                                                // run — otherwise parallel calls would
-                                                // serialize on the workspace mutex.
-                                                let ws =
-                                                    self.inner.workspace.lock().unwrap().clone();
-                                                let cancel = &self.inner.cancel;
-                                                let result = self
-                                                    .inner
-                                                    .tools
-                                                    .execute(&ws, &call.name, &call.args, cancel)
-                                                    .map(|out| out.content);
-                                                (call.id.clone(), result)
-                                            })
-                                        })
-                                        .collect();
-                                    handles
-                                        .into_iter()
-                                        .map(|h| {
-                                            h.join().unwrap_or_else(|_| {
-                                                (
-                                                    String::new(),
-                                                    Err(crate::tools::ToolError::Io(
-                                                        "tool thread panicked".into(),
-                                                    )),
-                                                )
-                                            })
-                                        })
-                                        .collect()
-                                });
+                                futures::future::join_all(calls.iter().map(|call| {
+                                    self.emit(Event::ToolStart {
+                                        name: call.name.clone(),
+                                        id: Some(call.id.clone()),
+                                    });
+                                    let tools = Arc::clone(&self.inner.tools);
+                                    let ws = ws.clone();
+                                    let cancel = self.cancel_token();
+                                    let name = call.name.clone();
+                                    let args = call.args.clone();
+                                    let id = call.id.clone();
+                                    async move {
+                                        let result = tools
+                                            .execute(&ws, &name, &args, cancel)
+                                            .await
+                                            .map(|out| out.content);
+                                        (id, result)
+                                    }
+                                }))
+                                .await;
                             for (call, (_id, result)) in calls.iter().zip(&results) {
                                 let result_str = match result {
                                     Ok(content) => content.clone(),
@@ -1161,23 +1208,24 @@ impl AgentRuntime {
     /// Drive a full conversation from a first user message until the agent
     /// settles: emit events, honor queued steers/follow-ups at the pi
     /// boundaries, honor abort, and loop into follow-ups automatically.
-    fn drive_until_settled(&self, first: &str) {
+    async fn drive_until_settled(&self, first: &str) {
         self.set_busy(true);
         self.cancel_clear();
         let mut saved = VecDeque::new();
         // First message runs immediately.
-        let (mut final_text, mut interrupted, _) = self.run_one_user_message(first, &mut saved);
+        let (mut final_text, mut interrupted, _) =
+            self.run_one_user_message(first, &mut saved).await;
         // Follow-ups queued while busy are delivered when the agent stops.
         loop {
             if interrupted {
                 // Cancelled mid-turn: stop delivering queued messages.
                 break;
             }
-            let (steers, followups) = self.drain_queue();
+            let (steers, followups) = self.drain_queue().await;
             saved.extend(followups);
             saved.extend(steers);
             let Some(next) = saved.pop_front() else { break };
-            let (text, was_interrupted, _) = self.run_one_user_message(&next, &mut saved);
+            let (text, was_interrupted, _) = self.run_one_user_message(&next, &mut saved).await;
             final_text = text;
             interrupted = was_interrupted;
         }
@@ -1195,7 +1243,9 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::provider::{Completion, ProviderError, ToolCall};
+    use std::sync::mpsc;
     use std::sync::Mutex;
+    use tokio_util::sync::CancellationToken;
 
     /// A provider whose responses are a scripted queue of `Completion`s.
     struct GateProvider {
@@ -1220,19 +1270,22 @@ mod tests {
     }
 
     impl Provider for GateProvider {
-        fn complete(
-            &self,
-            _history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<Completion, ProviderError> {
-            let mut q = self.completions.lock().unwrap();
-            Ok(q.pop_front().unwrap_or(Completion {
-                response: Response::Text("done".into()),
-                prompt_tokens: None,
-                aborted: false,
-            }))
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                let mut q = self.completions.lock().unwrap();
+                Ok(q.pop_front().unwrap_or(Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                }))
+            })
         }
     }
 
@@ -1248,7 +1301,7 @@ mod tests {
         provider: Box<dyn Provider>,
     ) -> (
         AgentRuntime,
-        Receiver<Event>,
+        tokio::sync::mpsc::UnboundedReceiver<Event>,
         std::thread::JoinHandle<()>,
         Workspace,
     ) {
@@ -1268,11 +1321,13 @@ mod tests {
 
     /// Collect events until `agent_settled` (or a short timeout) and return
     /// them plus whether the run settled.
-    fn collect_until_settled(rx: &Receiver<Event>) -> (Vec<Event>, bool) {
+    fn collect_until_settled(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> (Vec<Event>, bool) {
         let mut events = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match rx.try_recv() {
                 Ok(e) => {
                     let settled = matches!(e, Event::AgentSettled { .. });
                     events.push(e);
@@ -1281,7 +1336,7 @@ mod tests {
                     }
                 }
                 Err(_) if std::time::Instant::now() > deadline => return (events, false),
-                Err(_) => continue,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
     }
@@ -1317,11 +1372,11 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("keep going");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
         assert!(events.iter().any(|e| matches!(e, Event::Error { .. })));
         let settled_event = events.iter().find_map(|e| match e {
@@ -1365,12 +1420,12 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         rt.set_interactive(true);
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("keep going");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
         assert!(
             !events.iter().any(|e| matches!(e, Event::Error { .. })),
@@ -1393,7 +1448,7 @@ mod tests {
 
     #[test]
     fn clear_resets_conversation_and_set_effort_emits_state() {
-        let (rt, rx, handle, _ws) = runtime_with(
+        let (rt, mut rx, handle, _ws) = runtime_with(
             "clear",
             Box::new(GateProvider::new(vec![
                 Response::Text(text("a")),
@@ -1401,11 +1456,11 @@ mod tests {
             ])),
         );
         rt.prompt("first");
-        collect_until_settled(&rx);
+        collect_until_settled(&mut rx);
         rt.clear();
         rt.set_effort(Effort::High);
         rt.prompt("second");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
         // After /clear the first exchange is gone from history: only the
         // seed, the second user message, and its answer remain.
@@ -1432,21 +1487,21 @@ mod tests {
 
     #[test]
     fn queued_clear_acknowledges_with_state_changed() {
-        let (rt, rx, handle, _ws) = runtime_with(
+        let (rt, mut rx, handle, _ws) = runtime_with(
             "clear-ack",
             Box::new(GateProvider::new(vec![Response::Text(text("a"))])),
         );
         rt.prompt("first");
-        collect_until_settled(&rx);
+        collect_until_settled(&mut rx);
         // A queued /clear must emit state_changed so an rpc adapter has a
         // deterministic ack boundary (CRAB-120).
         rt.clear();
         let mut seen_state = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while !seen_state && std::time::Instant::now() < deadline {
-            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            match rx.try_recv() {
                 Ok(e) => seen_state = matches!(e, Event::StateChanged { .. }),
-                Err(_) => continue,
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
             }
         }
         assert!(seen_state, "clear must ack with state_changed");
@@ -1458,13 +1513,13 @@ mod tests {
     fn two_runtimes_are_isolated() {
         // A cancel on one runtime must not affect the other.
         let (rt_a, rx_a, handle_a, _ws_a) = runtime_with("iso-a", Box::new(AbortProvider));
-        let (rt_b, rx_b, handle_b, _ws_b) = runtime_with(
+        let (rt_b, mut rx_b, handle_b, _ws_b) = runtime_with(
             "iso-b",
             Box::new(GateProvider::new(vec![Response::Text(text("b ok"))])),
         );
         rt_a.abort(); // cancels a's in-flight turn only
         rt_b.prompt("hi");
-        let (events_b, settled_b) = collect_until_settled(&rx_b);
+        let (events_b, settled_b) = collect_until_settled(&mut rx_b);
         assert!(settled_b, "runtime b must be unaffected by a's abort");
         assert!(events_b.iter().any(|e| matches!(
             e,
@@ -1482,12 +1537,12 @@ mod tests {
 
     #[test]
     fn prompt_runs_to_settled_and_emits_events() {
-        let (rt, rx, handle, _ws) = runtime_with(
+        let (rt, mut rx, handle, _ws) = runtime_with(
             "basic",
             Box::new(GateProvider::new(vec![Response::Text(text("hello world"))])),
         );
         rt.prompt("greet me");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled, "must settle: {events:?}");
         assert!(events.iter().any(|e| matches!(e, Event::AgentStart { .. })));
         assert!(events.iter().any(|e| matches!(e, Event::TurnStart {})));
@@ -1517,11 +1572,11 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, rx) = AgentRuntime::new(cfg, Box::new(builder), tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(builder), tools, ws.clone(), None);
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("run a command");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
         assert!(events
             .iter()
@@ -1542,9 +1597,9 @@ mod tests {
     fn abort_keeps_partial_text_and_settles_interrupted() {
         // A scripted abort: the provider reports an aborted completion with
         // partial text, so the runtime keeps it and settles interrupted.
-        let (rt, rx, handle, _ws) = runtime_with("abort", Box::new(AbortProvider));
+        let (rt, mut rx, handle, _ws) = runtime_with("abort", Box::new(AbortProvider));
         rt.prompt("tell me a story");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
         let settled_event = events.iter().find_map(|e| match e {
             Event::AgentSettled { text, interrupted } => Some((text.clone(), *interrupted)),
@@ -1565,31 +1620,34 @@ mod tests {
     struct PausableProvider {
         completions: Mutex<VecDeque<Completion>>,
         /// Receives one "release" signal per provider call from the test.
-        release_rx: Mutex<Receiver<()>>,
+        release_rx: Mutex<mpsc::Receiver<()>>,
         /// Sent to the test each time a call starts (flow control).
-        started_tx: Sender<()>,
+        started_tx: mpsc::Sender<()>,
     }
 
     impl Provider for PausableProvider {
-        fn complete(
-            &self,
-            _history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<Completion, ProviderError> {
-            let _ = self.started_tx.send(());
-            let _ = self
-                .release_rx
-                .lock()
-                .unwrap()
-                .recv_timeout(std::time::Duration::from_secs(5));
-            let mut q = self.completions.lock().unwrap();
-            Ok(q.pop_front().unwrap_or(Completion {
-                response: Response::Text("done".into()),
-                prompt_tokens: None,
-                aborted: false,
-            }))
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                let _ = self.started_tx.send(());
+                let _ = self
+                    .release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                let mut q = self.completions.lock().unwrap();
+                Ok(q.pop_front().unwrap_or(Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                }))
+            })
         }
     }
 
@@ -1624,7 +1682,7 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone(), None);
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
 
@@ -1637,7 +1695,7 @@ mod tests {
         // Release call 2 (produces the final text after the steer).
         let _ = started_rx.recv_timeout(std::time::Duration::from_secs(5));
         let _ = release_tx.send(());
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled, "steer must eventually settle: {events:?}");
         let settled_event = events.iter().find_map(|e| match e {
             Event::AgentSettled { text, .. } => Some(text.clone()),
@@ -1666,13 +1724,13 @@ mod tests {
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let (rt, rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
+        let (rt, mut rx) = AgentRuntime::new(cfg, provider, tools, ws.clone(), None);
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         rt.prompt("first question");
         // Queue the follow-up while the first turn is still running.
         rt.follow_up("second question");
-        let (events, settled) = collect_until_settled(&rx);
+        let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled, "must settle after follow-up: {events:?}");
         let settled_text = events
             .iter()
@@ -1743,18 +1801,21 @@ mod tests {
     }
 
     impl Provider for RecordingProvider {
-        fn complete(
-            &self,
-            history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<Completion, ProviderError> {
-            self.histories.lock().unwrap().push(history.to_vec());
-            Ok(Completion {
-                response: Response::Text("done".into()),
-                prompt_tokens: None,
-                aborted: false,
+        fn complete<'a>(
+            &'a self,
+            history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                self.histories.lock().unwrap().push(history.to_vec());
+                Ok(Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                })
             })
         }
     }
@@ -1762,17 +1823,20 @@ mod tests {
     /// A provider that always reports an aborted stream with partial text.
     struct AbortProvider;
     impl Provider for AbortProvider {
-        fn complete(
-            &self,
-            _history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<Completion, ProviderError> {
-            Ok(Completion {
-                response: Response::Text("partial story".into()),
-                prompt_tokens: None,
-                aborted: true,
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                Ok(Completion {
+                    response: Response::Text("partial story".into()),
+                    prompt_tokens: None,
+                    aborted: true,
+                })
             })
         }
     }
@@ -1811,36 +1875,43 @@ mod parallel_tests {
     /// a final answer.
     struct ParallelCallProvider;
     impl crate::provider::Provider for ParallelCallProvider {
-        fn complete(
-            &self,
-            _history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<crate::provider::Completion, crate::provider::ProviderError> {
-            use std::sync::atomic::Ordering as O;
-            static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let n = CALLS.fetch_add(1, O::SeqCst);
-            let response = if n == 0 {
-                Response::ToolCalls(vec![
-                    ToolCall {
-                        id: "p1".into(),
-                        name: "bash".into(),
-                        args: serde_json::json!({"command": "sleep 0.4"}),
-                    },
-                    ToolCall {
-                        id: "p2".into(),
-                        name: "bash".into(),
-                        args: serde_json::json!({"command": "sleep 0.4"}),
-                    },
-                ])
-            } else {
-                Response::Text("done".into())
-            };
-            Ok(crate::provider::Completion {
-                response,
-                prompt_tokens: None,
-                aborted: false,
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<
+            'a,
+            Result<crate::provider::Completion, crate::provider::ProviderError>,
+        > {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering as O;
+                static CALLS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let n = CALLS.fetch_add(1, O::SeqCst);
+                let response = if n == 0 {
+                    Response::ToolCalls(vec![
+                        ToolCall {
+                            id: "p1".into(),
+                            name: "bash".into(),
+                            args: serde_json::json!({"command": "sleep 0.4"}),
+                        },
+                        ToolCall {
+                            id: "p2".into(),
+                            name: "bash".into(),
+                            args: serde_json::json!({"command": "sleep 0.4"}),
+                        },
+                    ])
+                } else {
+                    Response::Text("done".into())
+                };
+                Ok(crate::provider::Completion {
+                    response,
+                    prompt_tokens: None,
+                    aborted: false,
+                })
             })
         }
     }
@@ -1850,6 +1921,15 @@ mod parallel_tests {
 mod compaction_tests {
     use super::*;
     use crate::provider::fake::FakeProvider;
+
+    /// Block on an async runtime method (tests are sync; CRAB-130).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
 
     fn runtime_with_summarizer(summary: Option<String>) -> AgentRuntime {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1881,7 +1961,7 @@ mod compaction_tests {
         ];
         let mut a0 = 0usize;
         let mut a1 = 0usize;
-        rt.manage_context(&mut history, 2, 120, &mut a0, &mut a1);
+        block_on(rt.manage_context(&mut history, 2, 120, &mut a0, &mut a1));
         // The old assistant text was replaced by the summary.
         assert!(
             history
@@ -1913,7 +1993,7 @@ mod compaction_tests {
         ];
         let mut a0 = 0usize;
         let mut a1 = 0usize;
-        rt.manage_context(&mut history, 2, 50, &mut a0, &mut a1);
+        block_on(rt.manage_context(&mut history, 2, 50, &mut a0, &mut a1));
         // History is now within budget (trimming happened).
         assert!(crate::runtime::anchored_total(&history, a0, a1) <= 50);
     }
@@ -1942,5 +2022,83 @@ mod accessor_tests {
             None,
         );
         assert_eq!(rt.provider_kind(), ProviderKind::Anthropic);
+    }
+}
+#[cfg(test)]
+mod effort_tests {
+    use super::*;
+    use crate::provider::{Completion, ProviderError};
+    use std::sync::Mutex as StdMutex;
+
+    /// CRAB-130: the runtime computes the provider-flavored effort parameters
+    /// (`provider_effort`, CRAB-116) and hands them to every completion call.
+    #[test]
+    fn effort_params_flow_into_provider_calls() {
+        struct EffortRecorder {
+            seen: StdMutex<Vec<serde_json::Value>>,
+        }
+        impl Provider for EffortRecorder {
+            fn complete<'a>(
+                &'a self,
+                _history: &'a [Message],
+                _tools: &'a [serde_json::Value],
+                effort_params: &'a serde_json::Value,
+                _cancel: tokio_util::sync::CancellationToken,
+                _on_text: &'a mut (dyn FnMut(&str) + Send),
+            ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+                Box::pin(async move {
+                    self.seen.lock().unwrap().push(effort_params.clone());
+                    Ok(Completion {
+                        response: Response::Text("done".into()),
+                        prompt_tokens: None,
+                        aborted: false,
+                    })
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            provider: ProviderKind::Openai,
+            max_iterations: 5,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let recorder = Arc::new(EffortRecorder {
+            seen: StdMutex::new(Vec::new()),
+        });
+        let recorder_for_runtime = Arc::clone(&recorder);
+        struct SharedRecorder(Arc<EffortRecorder>);
+        impl Provider for SharedRecorder {
+            fn complete<'a>(
+                &'a self,
+                history: &'a [Message],
+                tools: &'a [serde_json::Value],
+                effort_params: &'a serde_json::Value,
+                cancel: tokio_util::sync::CancellationToken,
+                on_text: &'a mut (dyn FnMut(&str) + Send),
+            ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+                self.0
+                    .complete(history, tools, effort_params, cancel, on_text)
+            }
+        }
+        let (rt, _rx) = AgentRuntime::new(
+            cfg,
+            Box::new(SharedRecorder(recorder_for_runtime)),
+            tools,
+            ws,
+            None,
+        );
+        rt.set_effort(Effort::High);
+        rt.run_once("task").unwrap();
+        let seen = recorder.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one completion call expected");
+        assert_eq!(
+            seen[0],
+            serde_json::json!({ "reasoning_effort": "high" }),
+            "openai effort mapping must reach the provider"
+        );
     }
 }

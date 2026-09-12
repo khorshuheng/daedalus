@@ -16,7 +16,6 @@
 //! never uses `println!`/`print!` — ratatui owns the screen.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use crab_core::config::ProviderKind;
@@ -485,7 +484,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// (REPL parity, CRAB-135); `memory_root` is where lessons are stored.
 pub fn run_tui(
     rt: &AgentRuntime,
-    rx: &Receiver<Event>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     initial: &str,
     session_root: &Path,
     memory_root: &Path,

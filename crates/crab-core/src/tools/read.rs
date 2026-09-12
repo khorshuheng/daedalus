@@ -1,9 +1,9 @@
 //! The `read` tool: read a file, optionally a line range.
 
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
-
+use futures::future::BoxFuture;
 use serde_json::{json, Value};
+use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 use super::{arg_string, arg_usize, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
@@ -58,12 +58,26 @@ impl Tool for ReadTool {
         })
     }
 
-    fn run(
-        &self,
-        workspace: &Workspace,
-        args: &Value,
-        _cancel: &AtomicBool,
-    ) -> Result<ToolOutput, ToolError> {
+    fn run<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        args: &'a Value,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        let max_output = self.max_output;
+        Box::pin(async move {
+            let ws = workspace.clone();
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || ReadTool { max_output }.run_sync(&ws, &args))
+                .await
+                .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
+        })
+    }
+}
+
+impl ReadTool {
+    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let offset = arg_usize(args, "offset")?.unwrap_or(1);
         if offset == 0 {
@@ -147,6 +161,15 @@ impl Tool for ReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Block on a tool future (tests are sync; CRAB-130).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
     use crate::workspace::Workspace;
 
     fn setup(_name: &str, contents: &str) -> (Workspace, tempfile::TempDir) {
@@ -156,22 +179,23 @@ mod tests {
         (Workspace::new(root).unwrap(), dir)
     }
 
-    #[test]
-    fn reads_full_file() {
+    #[tokio::test]
+    async fn reads_full_file() {
         let (ws, _dir) = setup("full", "line1\nline2\nline3\n");
         let tool = ReadTool { max_output: 1000 };
         let out = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert_eq!(out.content, "line1\nline2\nline3");
     }
 
-    #[test]
-    fn respects_one_based_offset_and_limit() {
+    #[tokio::test]
+    async fn respects_one_based_offset_and_limit() {
         let (ws, _dir) = setup("range", "l0\nl1\nl2\nl3\nl4\n");
         let tool = ReadTool { max_output: 1000 };
         // offset=4 starts at "l3"; limit=2 reaches the end of the file.
@@ -179,8 +203,9 @@ mod tests {
             .run(
                 &ws,
                 &json!({"path": "a.txt", "offset": 4, "limit": 2}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert_eq!(out.content, "l3\nl4");
     }
@@ -190,40 +215,42 @@ mod tests {
         let (ws, _dir) = setup("missing", "x\n");
         let tool = ReadTool { max_output: 1000 };
         assert!(matches!(
-            tool.run(
+            block_on(tool.run(
                 &ws,
                 &json!({"path": "nope.txt"}),
-                &std::sync::atomic::AtomicBool::new(false)
-            ),
+                tokio_util::sync::CancellationToken::new()
+            )),
             Err(ToolError::NotFound(_))
         ));
     }
 
-    #[test]
-    fn caps_output_and_reports_continuation_offset() {
+    #[tokio::test]
+    async fn caps_output_and_reports_continuation_offset() {
         let (ws, _dir) = setup("cap", &"y\n".repeat(5000));
         let tool = ReadTool { max_output: 64 };
         let out = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert!(out.content.contains("[Showing lines 1-"));
         assert!(out.content.contains("Use offset="));
     }
 
-    #[test]
-    fn reports_remaining_lines_after_limit() {
+    #[tokio::test]
+    async fn reports_remaining_lines_after_limit() {
         let (ws, _dir) = setup("limit", "l0\nl1\nl2\nl3\nl4\n");
         let tool = ReadTool { max_output: 1000 };
         let out = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt", "offset": 1, "limit": 2}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert_eq!(
             out.content,
@@ -231,30 +258,32 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reads_empty_file() {
+    #[tokio::test]
+    async fn reads_empty_file() {
         let (ws, _dir) = setup("empty", "");
         let tool = ReadTool { max_output: 1000 };
         let out = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert_eq!(out.content, "(empty file)");
     }
 
-    #[test]
-    fn huge_single_line_gets_targeted_hint() {
+    #[tokio::test]
+    async fn huge_single_line_gets_targeted_hint() {
         let (ws, _dir) = setup("hugeline", &"z".repeat(5000));
         let tool = ReadTool { max_output: 64 };
         let out = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert!(out.content.contains("exceeds 64 limit"));
         assert!(out.content.contains("sed -n '1p'"));

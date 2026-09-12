@@ -298,7 +298,6 @@ fn cli_unknown_mode_fails() {
 fn memory_pipeline_reflect_store_index_inject() {
     use crab_core::reflect;
     use crab_core::runtime::AgentRuntime;
-    use std::sync::atomic::AtomicBool;
 
     let tmp = tempdir("memory-pipeline");
     let root = tmp.path().join("memory");
@@ -319,16 +318,20 @@ fn memory_pipeline_reflect_store_index_inject() {
     let fake = FakeProvider::new(vec![Response::Text(
         r#"[{"text":"build with make, never cargo","kind":"rule","tags":["build"]}]"#.into(),
     )]);
-    let added = reflect::reflect_and_store(
-        &root,
-        ws.root(),
-        &fake,
-        &AtomicBool::new(false),
-        &transcript,
-        Some("sess-mem".into()),
-        100,
-    )
-    .expect("reflect should succeed");
+    let added = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(reflect::reflect_and_store(
+            &root,
+            ws.root(),
+            &fake,
+            tokio_util::sync::CancellationToken::new(),
+            &transcript,
+            Some("sess-mem".into()),
+            100,
+        ))
+        .expect("reflect should succeed");
     assert_eq!(added, 1);
 
     // The JSONL log is the source of truth.
@@ -371,5 +374,61 @@ fn memory_pipeline_reflect_store_index_inject() {
     assert!(
         system.contains("build with make, never cargo"),
         "later session should inject the lesson: {system}"
+    );
+}
+
+/// CRAB-130: the provider-reported prompt token count must flow through the
+/// adapter into the runtime's `usage` event (context budgeting's anchor).
+#[test]
+fn usage_event_carries_provider_reported_prompt_tokens() {
+    use crab_core::provider::{Completion, Provider, ProviderError};
+    use std::sync::Mutex;
+
+    struct TokenReporter;
+    impl Provider for TokenReporter {
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async {
+                Ok(Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: Some(4321),
+                    aborted: false,
+                })
+            })
+        }
+    }
+    let _ = Mutex::new(()); // no shared state; type anchor only
+
+    let tmp = tempdir("usage-flow");
+    let ws = Workspace::new(tmp.path().to_path_buf()).unwrap();
+    let cfg = config_for(tmp.path(), 5);
+    let (rt, mut rx) =
+        AgentRuntime::new(cfg, Box::new(TokenReporter), ToolSet::new(1000), ws, None);
+    let worker = rt.clone();
+    let handle = std::thread::spawn(move || worker.run_forever());
+    rt.prompt("hi");
+    let mut saw_usage = None;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while saw_usage.is_none() && std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(crab_core::runtime::Event::Usage { prompt_tokens }) => {
+                saw_usage = prompt_tokens;
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+    rt.shutdown();
+    handle.join().unwrap_or(());
+    assert_eq!(
+        saw_usage,
+        Some(4321),
+        "prompt_tokens must reach the usage event"
     );
 }

@@ -27,7 +27,6 @@ use crab_core::tools::resolver::ToolSet;
 use crab_core::workspace::Workspace;
 
 mod modes;
-mod term;
 mod tui;
 
 use modes::Mode;
@@ -164,30 +163,30 @@ fn run(cli: Cli) -> Result<i32, String> {
     };
     match mode {
         Some(Mode::Json) => {
-            let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let mut stdout = std::io::stdout();
-            modes::run_json(&rt, &rx, &cli.prompt(), &mut stdout)
+            modes::run_json(&rt, &mut rx, &cli.prompt(), &mut stdout)
         }
         Some(Mode::Rpc) => {
-            let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
             let reader: Box<dyn std::io::BufRead + Send> =
                 Box::new(std::io::BufReader::new(std::io::stdin()));
             let mut stdout = std::io::stdout();
-            modes::run_rpc(&rt, &rx, &root, reader, &mut stdout)
+            modes::run_rpc(&rt, &mut rx, &root, reader, &mut stdout)
         }
         Some(Mode::Tui) | None => {
             let mem = memory_root.clone().unwrap_or_else(memory::default_root);
-            let (rt, rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
+            let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace, memory_root);
             rt.set_interactive(true); // human present: no iteration cap
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
-            tui::run_tui(&rt, &rx, &cli.prompt(), root.as_path(), mem.as_path())
+            tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path(), mem.as_path())
         }
     }
 }
@@ -231,15 +230,24 @@ fn auto_save(rt: &AgentRuntime, root: &Path, memory_root: &Path) {
     // The session was just saved, so lessons can carry its real id.
     let source = saved.as_deref().and_then(session::file_id);
     let ws = rt.workspace_root();
-    match reflect::reflect_and_store(
+    // Reflection is an LLM call (async, CRAB-130); block the caller on it —
+    // this runs at session end, where nothing else needs the thread.
+    let block_on = |fut| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("auto_save tokio runtime")
+            .block_on(fut)
+    };
+    match block_on(reflect::reflect_and_store(
         memory_root,
         &ws,
         rt.provider().as_ref(),
-        term::cancel_flag(),
+        rt.cancel_token(),
         &history,
         source,
         now_millis(),
-    ) {
+    )) {
         Ok(0) => {}
         Ok(n) => {
             crab_core::reflect::mark_reflected(memory_root, &ws, &fingerprint);
@@ -273,15 +281,22 @@ fn handle_reflect(rt: &AgentRuntime, root: &Path, memory_root: &Path) -> String 
     let history = rt.history();
     let ws = rt.workspace_root();
     let fingerprint = crab_core::reflect::history_fingerprint(&history);
-    match reflect::reflect_and_store(
+    let block_on = |fut| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reflect tokio runtime")
+            .block_on(fut)
+    };
+    match block_on(reflect::reflect_and_store(
         memory_root,
         &ws,
         rt.provider().as_ref(),
-        term::cancel_flag(),
+        rt.cancel_token(),
         &history,
         session::file_id(&path),
         now_millis(),
-    ) {
+    )) {
         Ok(0) => "reflected: no new lessons".to_string(),
         Ok(n) => {
             crab_core::reflect::mark_reflected(memory_root, &ws, &fingerprint);
@@ -313,7 +328,6 @@ mod tests {
     use crab_core::tools::resolver::ToolSet;
     use crab_core::workspace::Workspace;
     use std::path::PathBuf;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Mutex;
 
     /// A provider that records every history it is given and answers "done".
@@ -322,18 +336,22 @@ mod tests {
     }
 
     impl Provider for RecordingProvider {
-        fn complete(
-            &self,
-            history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<crab_core::provider::Completion, ProviderError> {
-            self.histories.lock().unwrap().push(history.to_vec());
-            Ok(crab_core::provider::Completion {
-                response: Response::Text("done".into()),
-                prompt_tokens: None,
-                aborted: false,
+        fn complete<'a>(
+            &'a self,
+            history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<crab_core::provider::Completion, ProviderError>>
+        {
+            Box::pin(async move {
+                self.histories.lock().unwrap().push(history.to_vec());
+                Ok(crab_core::provider::Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                })
             })
         }
     }
@@ -345,24 +363,28 @@ mod tests {
     }
 
     impl Provider for ScriptedProvider {
-        fn complete(
-            &self,
-            history: &[Message],
-            _tools: &[serde_json::Value],
-            _cancel: &AtomicBool,
-            _on_text: &mut dyn FnMut(&str),
-        ) -> Result<crab_core::provider::Completion, ProviderError> {
-            self.histories.lock().unwrap().push(history.to_vec());
-            let response = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or(crab_core::provider::Response::Text("done".into()));
-            Ok(crab_core::provider::Completion {
-                response,
-                prompt_tokens: None,
-                aborted: false,
+        fn complete<'a>(
+            &'a self,
+            history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_text: &'a mut (dyn FnMut(&str) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<crab_core::provider::Completion, ProviderError>>
+        {
+            Box::pin(async move {
+                self.histories.lock().unwrap().push(history.to_vec());
+                let response = self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(crab_core::provider::Response::Text("done".into()));
+                Ok(crab_core::provider::Completion {
+                    response,
+                    prompt_tokens: None,
+                    aborted: false,
+                })
             })
         }
     }

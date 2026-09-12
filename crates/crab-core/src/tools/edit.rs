@@ -7,10 +7,10 @@
 //! are matched against the original file (not incrementally) and applied
 //! together, so disjoint replacements cannot interfere.
 
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
-
+use futures::future::BoxFuture;
 use serde_json::{json, Value};
+use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
@@ -217,12 +217,25 @@ impl Tool for EditTool {
         })
     }
 
-    fn run(
-        &self,
-        workspace: &Workspace,
-        args: &Value,
-        _cancel: &AtomicBool,
-    ) -> Result<ToolOutput, ToolError> {
+    fn run<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        args: &'a Value,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move {
+            let ws = workspace.clone();
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || EditTool.run_sync(&ws, &args))
+                .await
+                .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
+        })
+    }
+}
+
+impl EditTool {
+    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let edits: Vec<(String, String)> =
             if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
@@ -329,49 +342,52 @@ mod tests {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap()
     }
 
-    #[test]
-    fn unique_match_replaces() {
+    #[tokio::test]
+    async fn unique_match_replaces() {
         let (ws, dir) = setup("unique", "hello world");
         let tool = EditTool;
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "world", "newText": "there"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(read(&dir), "hello there");
     }
 
-    #[test]
-    fn zero_match_is_error() {
+    #[tokio::test]
+    async fn zero_match_is_error() {
         let (ws, _dir) = setup("zero", "hello");
         let tool = EditTool;
         let err = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt", "oldText": "zzz", "newText": "x"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
     }
 
-    #[test]
-    fn multiple_match_is_error() {
+    #[tokio::test]
+    async fn multiple_match_is_error() {
         let (ws, _dir) = setup("multi", "a a a");
         let tool = EditTool;
         let err = tool
             .run(
                 &ws,
                 &json!({"path": "a.txt", "oldText": "a", "newText": "b"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
     }
 
-    #[test]
-    fn multiple_disjoint_edits() {
+    #[tokio::test]
+    async fn multiple_disjoint_edits() {
         let (ws, dir) = setup("disjoint", "one two three");
         let tool = EditTool;
         tool.run(
@@ -380,55 +396,59 @@ mod tests {
                 {"oldText": "one", "newText": "1"},
                 {"oldText": "three", "newText": "3"}
             ]}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(read(&dir), "1 two 3");
     }
 
-    #[test]
-    fn edits_crlf_file_and_preserves_line_endings() {
+    #[tokio::test]
+    async fn edits_crlf_file_and_preserves_line_endings() {
         let (ws, dir) = setup("crlf", "line one\r\nline two\r\nline three\r\n");
         let tool = EditTool;
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "line two", "newText": "LINE TWO"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(read(&dir), "line one\r\nLINE TWO\r\nline three\r\n");
     }
 
-    #[test]
-    fn fuzzy_matches_smart_quotes() {
+    #[tokio::test]
+    async fn fuzzy_matches_smart_quotes() {
         // The file uses a curly quote; the model sends an ASCII quote.
         let (ws, dir) = setup("fuzzy", "don\u{2019}t panic");
         let tool = EditTool;
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "don't", "newText": "do not"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(read(&dir), "do not panic");
     }
 
-    #[test]
-    fn fuzzy_matches_nfkc_fullwidth_and_ligatures() {
+    #[tokio::test]
+    async fn fuzzy_matches_nfkc_fullwidth_and_ligatures() {
         // Fullwidth Latin (NFKC -> ASCII) in the model's oldText.
         let (ws, dir) = setup("nfkc", "use HelloWorld here");
         let tool = EditTool;
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "ＨｅｌｌｏＷｏｒｌｄ", "newText": "hi"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(read(&dir), "use hi here");
     }
 
-    #[test]
-    fn fuzzy_tolerates_trailing_whitespace_on_the_line() {
+    #[tokio::test]
+    async fn fuzzy_tolerates_trailing_whitespace_on_the_line() {
         // The model's oldText has no trailing spaces, but the file line does;
         // the match must still succeed (pi's normalizeForFuzzyMatch trims each
         // line). The trailing spaces themselves are not part of oldText, so
@@ -438,14 +458,15 @@ mod tests {
         tool.run(
             &ws,
             &json!({"path": "a.txt", "oldText": "beta", "newText": "gamma"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(read(&dir), "alpha   \ngamma   \n");
     }
 
-    #[test]
-    fn overlapping_edits_are_rejected() {
+    #[tokio::test]
+    async fn overlapping_edits_are_rejected() {
         let (ws, _dir) = setup("overlap", "hello world");
         let tool = EditTool;
         let err = tool
@@ -455,8 +476,9 @@ mod tests {
                     {"oldText": "hello", "newText": "hi"},
                     {"oldText": "hello world", "newText": "bye"}
                 ]}),
-                &std::sync::atomic::AtomicBool::new(false),
+                tokio_util::sync::CancellationToken::new(),
             )
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
     }

@@ -1,22 +1,20 @@
-//! LLM provider integration (CRAB-103).
+//! LLM provider integration (CRAB-103), async on rig-core (CRAB-130).
 //!
 //! Providers implement the `Provider` trait; the agent loop is
-//! provider-agnostic. `openai` (OpenAI chat-completions + tools, also serving
-//! DeepSeek via a configurable base URL) and `anthropic` (Messages API) are
-//! real HTTP clients; `fake` is an in-memory scripted provider for offline
-//! tests. Adding a provider means implementing `Provider` and registering it in
-//! `from_config`.
+//! provider-agnostic. The real HTTP clients live in `provider/rig.rs`, a thin
+//! adapter over rig-core 0.42's unified provider contracts (OpenAI
+//! chat-completions serving OpenAI + DeepSeek via a configurable base URL,
+//! and Anthropic Messages); `fake` is an in-memory scripted provider for
+//! offline tests. Adding a provider means extending the adapter and
+//! registering it in `from_config`.
 
-pub mod anthropic;
 pub mod fake;
-pub mod openai;
+pub mod rig;
 
-use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-
+use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, ProviderKind};
 
@@ -80,35 +78,40 @@ pub enum ProviderError {
 
 /// A chat + tool-calling backend. Implementations must be `Send + Sync` so the
 /// loop can hold them behind `Box<dyn Provider>`.
+///
+/// `complete` is async (CRAB-130) but the trait stays object-safe: it returns
+/// a boxed future rather than using `async_trait`. `cancel` is checked
+/// between streamed chunks (via `select!`); when cancelled, the request is
+/// aborted and `Completion.aborted` is set. `on_text` receives text deltas as
+/// they stream in. `effort_params` carries the provider-flavored wire
+/// parameters for the current thinking level (`provider_effort`, CRAB-116) —
+/// an empty object means "nothing to add".
 pub trait Provider: Send + Sync {
-    /// Send `history` plus the tool schemas and return the completion (text or
-    /// tool calls) together with any reported prompt token usage. `cancel` is
-    /// checked between streamed chunks; when set, the request is aborted and
-    /// `Completion.aborted` is set. `on_text` receives text deltas as they
-    /// stream in.
-    fn complete(
-        &self,
-        history: &[Message],
-        tools: &[Value],
-        cancel: &AtomicBool,
-        on_text: &mut dyn FnMut(&str),
-    ) -> Result<Completion, ProviderError>;
+    fn complete<'a>(
+        &'a self,
+        history: &'a [Message],
+        tools: &'a [Value],
+        effort_params: &'a Value,
+        cancel: CancellationToken,
+        on_text: &'a mut (dyn FnMut(&str) + Send),
+    ) -> BoxFuture<'a, Result<Completion, ProviderError>>;
 }
 
-/// Build the provider selected by `config`. DeepSeek reuses the OpenAI client
-/// (only base URL + model differ); Anthropic is its own client.
+/// Build the provider selected by `config`. OpenAI and DeepSeek share the
+/// OpenAI chat-completions adapter (only base URL + model differ); Anthropic
+/// uses its own Messages client; `fake` is the scripted offline provider.
 pub fn from_config(config: &Config) -> Box<dyn Provider> {
     match config.provider {
         ProviderKind::Openai | ProviderKind::Deepseek => {
-            Box::new(openai::OpenAIProvider::new(config))
+            Box::new(rig::RigProvider::openai_compatible(config))
         }
-        ProviderKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(config)),
+        ProviderKind::Anthropic => Box::new(rig::RigProvider::anthropic(config)),
         ProviderKind::Fake => Box::new(fake::FakeProvider::new(vec![])),
     }
 }
 
 /// Map an HTTP status code to a typed provider error.
-fn map_status_error(code: u16, text: String) -> ProviderError {
+pub(crate) fn map_status_error(code: u16, text: String) -> ProviderError {
     if is_quota_or_billing(&text) {
         ProviderError::Http(format!("quota or billing limit (status {code}): {text}"))
     } else if code == 401 || code == 403 {
@@ -121,14 +124,14 @@ fn map_status_error(code: u16, text: String) -> ProviderError {
 }
 
 /// True when a status code indicates a transient failure worth retrying.
-fn is_transient_status(code: u16) -> bool {
+pub(crate) fn is_transient_status(code: u16) -> bool {
     code == 408 || code == 429 || (500..=599).contains(&code)
 }
 
 /// True when an error body indicates a quota/billing limit rather than a
 /// transient failure, so it is never retried (mirrors pi's non-retryable
 /// provider-limit patterns in `ai/src/utils/retry.ts`).
-fn is_quota_or_billing(text: &str) -> bool {
+pub(crate) fn is_quota_or_billing(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
     [
         "insufficient_quota",
@@ -142,98 +145,6 @@ fn is_quota_or_billing(text: &str) -> bool {
     ]
     .iter()
     .any(|p| t.contains(p))
-}
-
-/// Classify a transport error, separating timeouts from generic HTTP failures.
-fn map_transport(t: &ureq::Transport) -> ProviderError {
-    let msg = t.to_string();
-    if t.kind() == ureq::ErrorKind::Io && msg.to_ascii_lowercase().contains("timed") {
-        ProviderError::Timeout(msg)
-    } else {
-        ProviderError::Http(msg)
-    }
-}
-
-fn backoff(attempt: usize) {
-    let ms = 250u64 << attempt.min(6);
-    std::thread::sleep(Duration::from_millis(ms));
-}
-
-/// Send a JSON body and return the response body as a blocking reader for
-/// streaming (SSE), with the same timeout + retry policy as the old
-/// non-streaming `post_json`.
-fn post_stream(
-    url: &str,
-    headers: &[(&str, &str)],
-    body: Value,
-    timeout_secs: u64,
-    max_retries: usize,
-) -> Result<Box<dyn Read + Send + Sync>, ProviderError> {
-    let mut attempt = 0usize;
-    loop {
-        let mut req = ureq::post(url).set("Content-Type", "application/json");
-        for (k, v) in headers {
-            req = req.set(k, v);
-        }
-        req = req.timeout(Duration::from_secs(timeout_secs));
-
-        match req.send_json(body.clone()) {
-            Ok(resp) => return Ok(resp.into_reader()),
-            Err(ureq::Error::Status(code, resp)) => {
-                let text = resp.into_string().unwrap_or_default();
-                if is_quota_or_billing(&text)
-                    || !is_transient_status(code)
-                    || attempt >= max_retries
-                {
-                    return Err(map_status_error(code, text));
-                }
-                attempt += 1;
-                backoff(attempt);
-            }
-            Err(ureq::Error::Transport(t)) => {
-                if attempt >= max_retries {
-                    return Err(map_transport(&t));
-                }
-                attempt += 1;
-                backoff(attempt);
-            }
-        }
-    }
-}
-
-/// Read the next SSE `data:` payload as a parsed JSON value, returning `None`
-/// at end of stream or `[DONE]`, or when `cancel` is set. `event:` lines,
-/// comments, and empty lines are skipped.
-fn next_sse_event(
-    reader: &mut impl std::io::BufRead,
-    cancel: &AtomicBool,
-) -> Result<Option<Value>, ProviderError> {
-    let mut line = String::new();
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Ok(None);
-        }
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
-        if n == 0 {
-            return Ok(None);
-        }
-        let trimmed = line.trim();
-        if let Some(data) = trimmed.strip_prefix("data:") {
-            let data = data.trim();
-            if data == "[DONE]" {
-                return Ok(None);
-            }
-            if data.is_empty() {
-                continue;
-            }
-            let value: Value =
-                serde_json::from_str(data).map_err(|e| ProviderError::Malformed(e.to_string()))?;
-            return Ok(Some(value));
-        }
-    }
 }
 
 #[cfg(test)]
@@ -251,5 +162,23 @@ mod tests {
     fn transient_429_still_maps_to_timeout() {
         let e = map_status_error(429, "rate limit exceeded".into());
         assert!(matches!(e, ProviderError::Timeout(_)));
+    }
+
+    #[test]
+    fn from_config_builds_each_kind() {
+        for kind in [
+            ProviderKind::Openai,
+            ProviderKind::Deepseek,
+            ProviderKind::Anthropic,
+            ProviderKind::Fake,
+        ] {
+            let mut config = Config::defaults(std::env::temp_dir());
+            config.provider = kind;
+            let p = from_config(&config);
+            let mut c2 = config.clone();
+            c2.provider = ProviderKind::Fake;
+            let _q = from_config(&c2);
+            drop(p);
+        }
     }
 }

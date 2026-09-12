@@ -12,6 +12,11 @@ path = "src/main.rs"
 [dependencies]
 crab-core = { path = "../crab-core" }
 serde_json = "1"
+# CRAB-130: blocking bridges over crab-core's async seams (auto-save reflect)
+# and the async Provider trait used by the test fakes.
+tokio = { version = "1", features = ["rt"] }
+tokio-util = "0.7"
+futures = "0.3"
 # CRAB-135: libc dropped from this crate — it was only used by term.rs's
 # REPL raw-mode line editor. crossterm owns the terminal for the TUI.
 # Maintainability crates (CRAB-119), era-appropriate for the 1.85 MSRV floor.

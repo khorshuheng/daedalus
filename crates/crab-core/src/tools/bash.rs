@@ -8,9 +8,10 @@
 //! stdout/stderr open (e.g. `sh -c "sleep 100 &"`) will block until that
 //! process exits, because the readers wait for the pipes to reach EOF.
 
+use futures::future::BoxFuture;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -31,7 +32,7 @@ fn run_command(
     command: &str,
     cwd: &Path,
     timeout_secs: Option<u64>,
-    cancel: &AtomicBool,
+    cancel: &CancellationToken,
 ) -> Result<Output, ToolError> {
     use std::io::Read;
     use std::time::{Duration, Instant};
@@ -75,7 +76,7 @@ fn run_command(
         match child.try_wait().map_err(|e| ToolError::Io(e.to_string()))? {
             Some(status) => break status,
             None => {
-                if cancel.load(Ordering::Relaxed) {
+                if cancel.is_cancelled() {
                     kill_tree(&mut child);
                     return Err(ToolError::Cancelled);
                 }
@@ -162,11 +163,32 @@ impl Tool for BashTool {
         })
     }
 
-    fn run(
+    fn run<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        args: &'a Value,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        let max_output = self.max_output;
+        Box::pin(async move {
+            let ws = workspace.clone();
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || {
+                BashTool { max_output }.run_sync(&ws, &args, cancel)
+            })
+            .await
+            .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
+        })
+    }
+}
+
+impl BashTool {
+    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    fn run_sync(
         &self,
         workspace: &Workspace,
         args: &Value,
-        cancel: &AtomicBool,
+        cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let command = arg_string(args, "command")?;
         let timeout = match arg_usize(args, "timeout")? {
@@ -175,7 +197,7 @@ impl Tool for BashTool {
             None => None,
         };
 
-        let output = run_command(&command, workspace.root(), timeout, cancel)?;
+        let output = run_command(&command, workspace.root(), timeout, &cancel)?;
 
         let mut text = String::new();
         if !output.stdout.is_empty() {
@@ -229,31 +251,38 @@ mod tests {
         (Workspace::new(root).unwrap(), dir)
     }
 
-    #[test]
-    fn captures_stdout_and_exit_code() {
+    /// Block on a tool future (tests are sync; CRAB-130).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    fn token() -> CancellationToken {
+        CancellationToken::new()
+    }
+
+    #[tokio::test]
+    async fn captures_stdout_and_exit_code() {
         let (ws, _dir) = setup("out");
         let tool = BashTool { max_output: 1000 };
         let out = tool
-            .run(
-                &ws,
-                &json!({"command": "echo hello"}),
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            .run(&ws, &json!({"command": "echo hello"}), token())
+            .await
             .unwrap();
         assert!(out.content.contains("hello"));
         assert!(out.content.contains("exit code: 0"));
     }
 
-    #[test]
-    fn nonzero_exit_is_a_tool_error() {
+    #[tokio::test]
+    async fn nonzero_exit_is_a_tool_error() {
         let (ws, _dir) = setup("err");
         let tool = BashTool { max_output: 1000 };
         let err = tool
-            .run(
-                &ws,
-                &json!({"command": "echo boo 1>&2; exit 3"}),
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            .run(&ws, &json!({"command": "echo boo 1>&2; exit 3"}), token())
+            .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("stderr:"));
@@ -261,23 +290,20 @@ mod tests {
         assert!(msg.contains("Command exited with code 3"));
     }
 
-    #[test]
-    fn runs_in_workspace_dir() {
+    #[tokio::test]
+    async fn runs_in_workspace_dir() {
         let (ws, dir) = setup("pwd");
         std::fs::write(dir.path().join("marker.txt"), "x").unwrap();
         let tool = BashTool { max_output: 1000 };
         let out = tool
-            .run(
-                &ws,
-                &json!({"command": "ls"}),
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            .run(&ws, &json!({"command": "ls"}), token())
+            .await
             .unwrap();
         assert!(out.content.contains("marker.txt"));
     }
 
-    #[test]
-    fn caps_output_from_the_tail() {
+    #[tokio::test]
+    async fn caps_output_from_the_tail() {
         let (ws, _dir) = setup("cap");
         let tool = BashTool { max_output: 64 };
         // 10000 '1's: the tail (last bytes) is kept, the head is dropped.
@@ -285,29 +311,27 @@ mod tests {
             .run(
                 &ws,
                 &json!({"command": "printf '%.0s1' {1..10000}"}),
-                &std::sync::atomic::AtomicBool::new(false),
+                token(),
             )
+            .await
             .unwrap();
         assert!(out.content.contains("[truncated"));
         assert!(out.content.contains("[full output:"));
     }
 
-    #[test]
-    fn timeout_kills_command() {
+    #[tokio::test]
+    async fn timeout_kills_command() {
         let (ws, _dir) = setup("timeout");
         let tool = BashTool { max_output: 1000 };
         let err = tool
-            .run(
-                &ws,
-                &json!({"command": "sleep 5", "timeout": 1}),
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            .run(&ws, &json!({"command": "sleep 5", "timeout": 1}), token())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
     }
 
-    #[test]
-    fn timeout_returns_promptly_when_command_forks() {
+    #[tokio::test]
+    async fn timeout_returns_promptly_when_command_forks() {
         let (ws, _dir) = setup("timeout-fork");
         let tool = BashTool { max_output: 1000 };
         let start = std::time::Instant::now();
@@ -315,8 +339,9 @@ mod tests {
             .run(
                 &ws,
                 &json!({"command": "sleep 2 && echo done", "timeout": 1}),
-                &std::sync::atomic::AtomicBool::new(false),
+                token(),
             )
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
         assert!(start.elapsed() < std::time::Duration::from_millis(1500));
@@ -324,24 +349,22 @@ mod tests {
 
     #[test]
     fn cancel_kills_running_command() {
-        use std::sync::atomic::Ordering;
-
         let (ws, _dir) = setup("cancel");
         let tool = BashTool { max_output: 1000 };
-        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let cancel2 = std::sync::Arc::clone(&cancel);
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
         let handle = std::thread::spawn(move || {
-            tool.run(&ws, &json!({"command": "sleep 5"}), cancel2.as_ref())
+            block_on(tool.run(&ws, &json!({"command": "sleep 5"}), cancel2))
         });
         std::thread::sleep(std::time::Duration::from_millis(200));
-        cancel.store(true, Ordering::SeqCst);
+        cancel.cancel();
         let result = handle.join().unwrap();
         assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 
     #[cfg(unix)]
-    #[test]
-    fn timeout_kills_grandchild_processes() {
+    #[tokio::test]
+    async fn timeout_kills_grandchild_processes() {
         let (ws, dir) = setup("grandchild");
         let tool = BashTool { max_output: 1000 };
         // Start a backgrounded grandchild that writes its PID and sleeps; the
@@ -353,11 +376,8 @@ mod tests {
         // alive. The group kill must reap both.
         let cmd = format!("sleep 30 & echo $! > '{}'; wait", marker.display());
         let err = tool
-            .run(
-                &ws,
-                &json!({"command": cmd, "timeout": 1}),
-                &std::sync::atomic::AtomicBool::new(false),
-            )
+            .run(&ws, &json!({"command": cmd, "timeout": 1}), token())
+            .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
         // Give the kill a moment to land, then confirm the grandchild is gone.

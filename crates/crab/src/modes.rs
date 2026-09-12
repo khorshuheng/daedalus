@@ -19,9 +19,27 @@
 
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::mpsc::Receiver;
 
 use crab_core::runtime::{AgentRuntime, Command, CommandKind, Event};
+
+/// The runtime's event receiver type (tokio unbounded channel, CRAB-130).
+type EventRx = tokio::sync::mpsc::UnboundedReceiver<Event>;
+
+/// Blocking receive with a timeout (tokio receivers have no
+/// `blocking_recv_timeout`; a poll loop keeps the semantics).
+fn recv_timeout<T>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
+    timeout: std::time::Duration,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return Some(v),
+            Err(_) if std::time::Instant::now() > deadline => return None,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
 
 /// The frontend selected by `--mode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +73,7 @@ impl Mode {
 /// until `agent_settled`. Returns the process exit code.
 pub fn run_json(
     rt: &AgentRuntime,
-    rx: &Receiver<Event>,
+    rx: &mut EventRx,
     prompt: &str,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
@@ -78,7 +96,7 @@ pub fn run_json(
 /// Returns the process exit code (0 on EOF / normal shutdown).
 pub fn run_rpc(
     rt: &AgentRuntime,
-    rx: &Receiver<Event>,
+    rx: &mut EventRx,
     root: &Path,
     input: Box<dyn BufRead + Send>,
     out: &mut dyn Write,
@@ -218,14 +236,14 @@ fn forward_interactive(rt: &AgentRuntime, kind: &CommandKind) {
 /// Drain runtime events, writing each as a JSONL line, until `stop` matches.
 /// Returns the number of events written.
 fn drain_until(
-    rx: &Receiver<Event>,
+    rx: &mut EventRx,
     out: &mut dyn Write,
     stop: impl Fn(&Event) -> bool,
 ) -> Result<usize, String> {
     let mut count = 0usize;
     loop {
-        match rx.recv() {
-            Ok(event) => {
+        match rx.blocking_recv() {
+            Some(event) => {
                 let line = serde_json::to_string(&event).map_err(|e| e.to_string())?;
                 writeln!(out, "{line}").map_err(|e| e.to_string())?;
                 count += 1;
@@ -233,7 +251,7 @@ fn drain_until(
                     return Ok(count);
                 }
             }
-            Err(_) => return Ok(count),
+            None => return Ok(count),
         }
     }
 }
@@ -241,14 +259,14 @@ fn drain_until(
 /// Drain events like `drain_until`, but give up after a short quiet period so
 /// an abort while idle (no settle follows) cannot hang the adapter.
 fn drain_until_quiet(
-    rx: &Receiver<Event>,
+    rx: &mut EventRx,
     out: &mut dyn Write,
     stop: impl Fn(&Event) -> bool,
 ) -> Result<usize, String> {
     let mut count = 0usize;
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(event) => {
+        match recv_timeout(rx, std::time::Duration::from_millis(100)) {
+            Some(event) => {
                 let line = serde_json::to_string(&event).map_err(|e| e.to_string())?;
                 writeln!(out, "{line}").map_err(|e| e.to_string())?;
                 count += 1;
@@ -256,7 +274,7 @@ fn drain_until_quiet(
                     return Ok(count);
                 }
             }
-            Err(_) => return Ok(count),
+            None => return Ok(count),
         }
     }
 }
@@ -293,7 +311,7 @@ mod tests {
         TempDir,
         PathBuf,
         AgentRuntime,
-        Receiver<Event>,
+        EventRx,
         std::thread::JoinHandle<()>,
         Workspace,
     ) {
@@ -306,7 +324,7 @@ mod tests {
             ..Config::defaults(dir.path().to_path_buf())
         };
         let tools = ToolSet::new(1000);
-        let (rt, rx) = AgentRuntime::new(
+        let (rt, mut rx) = AgentRuntime::new(
             cfg,
             Box::new(FakeProvider::new(responses)),
             tools,
@@ -316,7 +334,7 @@ mod tests {
         let worker = rt.clone();
         let handle = std::thread::spawn(move || worker.run_forever());
         // Drain the initial agent_start so tests see events from their command.
-        let _ = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let _ = recv_timeout(&mut rx, std::time::Duration::from_secs(2));
         (dir, root, rt, rx, handle, ws)
     }
 
@@ -327,10 +345,10 @@ mod tests {
 
     #[test]
     fn json_mode_emits_every_event_as_jsonl() {
-        let (tmp, _root, rt, rx, handle, _ws) =
+        let (tmp, _root, rt, mut rx, handle, _ws) =
             setup("json", vec![Response::Text("hello world".into())]);
         let mut out = Vec::new();
-        let code = run_json(&rt, &rx, "greet", &mut out).unwrap();
+        let code = run_json(&rt, &mut rx, "greet", &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -354,13 +372,13 @@ mod tests {
 
     #[test]
     fn rpc_prompt_with_id_streams_events_then_responds() {
-        let (tmp, _root, rt, rx, handle, _ws) =
+        let (tmp, _root, rt, mut rx, handle, _ws) =
             setup("rpc-prompt", vec![Response::Text("the answer".into())]);
         let input = Box::new(Cursor::new(
             "{\"id\":\"1\",\"type\":\"prompt\",\"text\":\"what is 2+2\"}\n".to_string(),
         ));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap();
+        let code = run_rpc(&rt, &mut rx, tmp.path(), input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -380,7 +398,7 @@ mod tests {
 
     #[test]
     fn rpc_get_state_and_set_effort_round_trip() {
-        let (tmp, _root, rt, rx, handle, _ws) = setup("rpc-state", vec![]);
+        let (tmp, _root, rt, mut rx, handle, _ws) = setup("rpc-state", vec![]);
         let input = concat!(
             "{\"id\":\"s1\",\"type\":\"get_state\"}\n",
             "{\"id\":\"s2\",\"type\":\"set_effort\",\"effort\":\"high\"}\n",
@@ -388,7 +406,7 @@ mod tests {
         );
         let input = Box::new(Cursor::new(input.to_string()));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap();
+        let code = run_rpc(&rt, &mut rx, tmp.path(), input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -409,7 +427,7 @@ mod tests {
 
     #[test]
     fn rpc_resume_loads_the_previous_session() {
-        let (tmp, root, rt, rx, handle, ws) = setup("rpc-resume", vec![]);
+        let (tmp, root, rt, mut rx, handle, ws) = setup("rpc-resume", vec![]);
         // Save a prior session for this workspace.
         let prior = vec![
             Message::System("sys".into()),
@@ -425,7 +443,7 @@ mod tests {
             "{\"id\":\"r1\",\"type\":\"resume\"}\n".to_string(),
         ));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, &root, input, &mut out).unwrap();
+        let code = run_rpc(&rt, &mut rx, &root, input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let last: serde_json::Value = text
@@ -453,7 +471,7 @@ mod tests {
         // The provider would answer immediately, but the test sends prompt +
         // steer back-to-back in one stdin batch; the steer must reach the
         // runtime while the prompt turn is draining, not be queued behind it.
-        let (tmp, _root, rt, rx, handle, _ws) = setup(
+        let (tmp, _root, rt, mut rx, handle, _ws) = setup(
             "rpc-steer",
             vec![
                 Response::Text("first answer".into()),
@@ -466,7 +484,7 @@ mod tests {
         );
         let input = Box::new(Cursor::new(input.to_string()));
         let mut out = Vec::new();
-        let code = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap();
+        let code = run_rpc(&rt, &mut rx, tmp.path(), input, &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -488,10 +506,10 @@ mod tests {
 
     #[test]
     fn rpc_malformed_request_reports_an_error() {
-        let (tmp, _root, rt, rx, handle, _ws) = setup("rpc-bad", vec![]);
+        let (tmp, _root, rt, mut rx, handle, _ws) = setup("rpc-bad", vec![]);
         let input = Box::new(Cursor::new("not json\n".to_string()));
         let mut out = Vec::new();
-        let err = run_rpc(&rt, &rx, tmp.path(), input, &mut out).unwrap_err();
+        let err = run_rpc(&rt, &mut rx, tmp.path(), input, &mut out).unwrap_err();
         assert!(err.contains("bad request"));
         shutdown(&rt, handle);
         let _ = tmp;

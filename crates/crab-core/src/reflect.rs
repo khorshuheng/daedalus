@@ -242,9 +242,9 @@ pub fn reflection_messages(history: &[Message], cwd: &Path) -> Vec<Message> {
 /// Empty (system-only) histories are rejected before any LLM call. A provider
 /// failure or malformed answer surfaces as `ReflectError`; nothing is written
 /// to memory here — that happens only after dedupe, in the caller.
-pub fn extract(
+pub async fn extract(
     provider: &dyn crate::provider::Provider,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: tokio_util::sync::CancellationToken,
     history: &[Message],
     cwd: &Path,
 ) -> Result<Vec<DraftLesson>, ReflectError> {
@@ -255,8 +255,12 @@ pub fn extract(
         return Err(ReflectError::EmptyHistory);
     }
     let messages = reflection_messages(history, cwd);
+    static EMPTY: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    let no_effort = EMPTY.get_or_init(|| serde_json::Value::Object(Default::default()));
+    let mut on_text = |_: &str| {};
     let completion = provider
-        .complete(&messages, &[], cancel, &mut |_| {})
+        .complete(&messages, &[], no_effort, cancel, &mut on_text)
+        .await
         .map_err(ReflectError::Provider)?;
     match completion.response {
         crate::provider::Response::Text(text) => parse_lessons(&text),
@@ -273,11 +277,11 @@ pub fn extract(
 ///
 /// Nothing is written until parsing and dedupe succeed, so a provider
 /// failure or malformed answer leaves existing memory untouched.
-pub fn reflect_and_store(
+pub async fn reflect_and_store(
     root: &Path,
     cwd: &Path,
     provider: &dyn crate::provider::Provider,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: tokio_util::sync::CancellationToken,
     history: &[Message],
     source_session_id: Option<String>,
     created_at: u64,
@@ -290,7 +294,7 @@ pub fn reflect_and_store(
         return Err(ReflectError::EmptyHistory);
     }
     // Extract (LLM) first: a failure here must not touch memory.
-    let drafts = extract(provider, cancel, history, cwd)?;
+    let drafts = extract(provider, cancel, history, cwd).await?;
     // Dedupe against what is already stored, then append only the survivors.
     let existing = crate::memory::list_lessons(root, cwd).map_err(ReflectError::Memory)?;
     let fresh = dedupe(&drafts, &existing);
@@ -327,6 +331,16 @@ pub fn lessons_from_drafts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    /// Block on an async reflection call (tests are sync; CRAB-130).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
 
     #[test]
     fn normalize_text_trims_and_collapses_whitespace() {
@@ -573,12 +587,12 @@ mod tests {
         let fake = FakeProvider::new(vec![Response::Text(
             r#"[{"text":"run make","kind":"rule"}]"#.into(),
         )]);
-        let lessons = extract(
+        let lessons = block_on(extract(
             &fake,
-            &std::sync::atomic::AtomicBool::new(false),
+            CancellationToken::new(),
             &history,
             Path::new("/tmp/proj"),
-        )
+        ))
         .unwrap();
         assert_eq!(lessons.len(), 1);
         assert_eq!(lessons[0].text, "run make");
@@ -588,12 +602,12 @@ mod tests {
     fn extract_rejects_empty_history_without_calling_provider() {
         use crate::provider::{fake::FakeProvider, Response};
         let fake = FakeProvider::new(vec![Response::Text("[]".into())]);
-        let err = extract(
+        let err = block_on(extract(
             &fake,
-            &std::sync::atomic::AtomicBool::new(false),
+            CancellationToken::new(),
             &[Message::System("sys".into())],
             Path::new("/tmp/proj"),
-        )
+        ))
         .unwrap_err();
         assert!(matches!(err, ReflectError::EmptyHistory));
         assert_eq!(fake.calls(), 0, "no LLM call for empty history");
@@ -605,12 +619,12 @@ mod tests {
         // Exhausted fake returns final text "done" which is not JSON -> malformed.
         let fake = FakeProvider::new(vec![]);
         let history = vec![text_msg("user", "q"), text_msg("assistant", "a")];
-        let err = extract(
+        let err = block_on(extract(
             &fake,
-            &std::sync::atomic::AtomicBool::new(false),
+            CancellationToken::new(),
             &history,
             Path::new("/tmp/proj"),
-        )
+        ))
         .unwrap_err();
         assert!(matches!(err, ReflectError::Malformed(_)));
     }
@@ -661,16 +675,16 @@ mod tests {
         use crate::provider::{fake::FakeProvider, Response};
         let (_guard, mem) = temp_mem("store1");
         let fake = FakeProvider::new(vec![Response::Text(lessons_json(2))]);
-        let cancel = std::sync::atomic::AtomicBool::new(false);
-        let added = reflect_and_store(
+        let cancel = CancellationToken::new();
+        let added = block_on(reflect_and_store(
             &mem,
             Path::new("/tmp/proj"),
             &fake,
-            &cancel,
+            cancel,
             &conversation(),
             Some("sess-7".into()),
             100,
-        )
+        ))
         .unwrap();
         assert_eq!(added, 2);
         let stored = crate::memory::list_lessons(&mem, Path::new("/tmp/proj")).unwrap();
@@ -684,19 +698,19 @@ mod tests {
     fn reflect_and_store_dedupes_against_existing_memory() {
         use crate::provider::{fake::FakeProvider, Response};
         let (_guard, mem) = temp_mem("store-dedupe");
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = CancellationToken::new();
         // First reflection stores two lessons.
         let fake = FakeProvider::new(vec![Response::Text(lessons_json(2))]);
         assert_eq!(
-            reflect_and_store(
+            block_on(reflect_and_store(
                 &mem,
                 Path::new("/tmp/proj"),
                 &fake,
-                &cancel,
+                cancel.clone(),
                 &conversation(),
                 None,
                 100,
-            )
+            ))
             .unwrap(),
             2
         );
@@ -704,15 +718,15 @@ mod tests {
         // lessons -> nothing new to add.
         let fake2 = FakeProvider::new(vec![Response::Text(lessons_json(2))]);
         assert_eq!(
-            reflect_and_store(
+            block_on(reflect_and_store(
                 &mem,
                 Path::new("/tmp/proj"),
                 &fake2,
-                &cancel,
+                cancel,
                 &conversation(),
                 None,
                 200,
-            )
+            ))
             .unwrap(),
             0
         );
@@ -728,18 +742,18 @@ mod tests {
     fn reflect_and_store_error_never_touches_memory() {
         use crate::provider::{fake::FakeProvider, Response};
         let (_guard, mem) = temp_mem("store-err");
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let cancel = CancellationToken::new();
         // A malformed answer (non-JSON) must error and leave memory empty.
         let fake = FakeProvider::new(vec![Response::Text("not json at all".into())]);
-        let err = reflect_and_store(
+        let err = block_on(reflect_and_store(
             &mem,
             Path::new("/tmp/proj"),
             &fake,
-            &cancel,
+            cancel.clone(),
             &conversation(),
             None,
             100,
-        )
+        ))
         .unwrap_err();
         assert!(matches!(err, ReflectError::Malformed(_)));
         assert_eq!(
@@ -748,15 +762,15 @@ mod tests {
         );
         // An empty history must be rejected before any LLM call.
         let fake2 = FakeProvider::new(vec![Response::Text(lessons_json(1))]);
-        let err = reflect_and_store(
+        let err = block_on(reflect_and_store(
             &mem,
             Path::new("/tmp/proj"),
             &fake2,
-            &cancel,
+            cancel,
             &[Message::System("sys".into())],
             None,
             100,
-        )
+        ))
         .unwrap_err();
         assert!(matches!(err, ReflectError::EmptyHistory));
         assert_eq!(fake2.calls(), 0);

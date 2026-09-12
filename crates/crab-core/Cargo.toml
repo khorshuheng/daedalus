@@ -13,24 +13,25 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-ureq = { version = "2", features = ["json"] }
-# Pin url to 2.4.x: url >=2.5 pulls idna 1.x -> icu 2.x, which needs rust >=1.88
-# and would exceed the project's 1.85 MSRV.
-url = "=2.4.1"
-# Pin rusqlite to 0.34.x (Mar 2025, MSRV ~1.85 era): newer releases track
-# the then-latest stable rust and would exceed the 1.85 floor. Links the
-# system sqlite3 (pkg-config); no vendored C build.
-rusqlite = "=0.34.0"
-# Maintainability crates (CRAB-119): era-appropriate versions for the 1.85
-# MSRV floor (2024-2025 releases).
-thiserror = "=1.0.69"
-directories = "=5.0.1"
-tempfile = "=3.15.0"
-similar = "=2.6.0"
-keyring = { version = "=3.6.2", features = ["sync-secret-service"] }
+# CRAB-130: the provider layer moved to rig-core (async); the hand-written
+# HTTP/SSE clients and their MSRV-era pins are gone.
+rig-core = "=0.42.0"
+# CRAB-130: crab-core is async — tokio drives the turn loop (current-thread
+# runtime owned by the worker thread), tokio-util provides CancellationToken.
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = "0.7"
+futures = "0.3"
+# Era pins from CRAB-119 are retired with the MSRV-1.85 floor (CRAB-130).
+rusqlite = "0.37"
+thiserror = "2"
+directories = "6"
+tempfile = "3"
+similar = "2"
+keyring = { version = "3", features = ["sync-secret-service"] }
 # bash process-group kill (CRAB-107 #14) uses libc setsid/kill on Unix.
 libc = "0.2"
 # NFKC normalization for fuzzy edit matching (CRAB-107 #15).
-unicode-normalization = "=0.1.24"
+unicode-normalization = "0.1"
 
-# crab-core must stay synchronous: no tokio/async dependencies here.
+# CRAB-130: the crate is async now (tokio). The runtime stays runtime-agnostic
+# (no #[tokio::main]); the worker thread owns a current-thread runtime.

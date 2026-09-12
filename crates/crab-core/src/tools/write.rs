@@ -1,9 +1,9 @@
 //! The `write` tool: create or overwrite a file in the workspace.
 
-use std::path::Path;
-use std::sync::atomic::AtomicBool;
-
+use futures::future::BoxFuture;
 use serde_json::{json, Value};
+use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
@@ -26,12 +26,25 @@ impl Tool for WriteTool {
         })
     }
 
-    fn run(
-        &self,
-        workspace: &Workspace,
-        args: &Value,
-        _cancel: &AtomicBool,
-    ) -> Result<ToolOutput, ToolError> {
+    fn run<'a>(
+        &'a self,
+        workspace: &'a Workspace,
+        args: &'a Value,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+        Box::pin(async move {
+            let ws = workspace.clone();
+            let args = args.clone();
+            tokio::task::spawn_blocking(move || WriteTool.run_sync(&ws, &args))
+                .await
+                .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
+        })
+    }
+}
+
+impl WriteTool {
+    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let content = args
             .get("content")
@@ -61,15 +74,16 @@ mod tests {
         (Workspace::new(root).unwrap(), dir)
     }
 
-    #[test]
-    fn creates_file() {
+    #[tokio::test]
+    async fn creates_file() {
         let (ws, dir) = setup("create");
         let tool = WriteTool;
         tool.run(
             &ws,
             &json!({"path": "b.txt", "content": "data"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
@@ -77,16 +91,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn overwrites_file() {
+    #[tokio::test]
+    async fn overwrites_file() {
         let (ws, dir) = setup("overwrite");
         std::fs::write(dir.path().join("b.txt"), "old").unwrap();
         let tool = WriteTool;
         tool.run(
             &ws,
             &json!({"path": "b.txt", "content": "new"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
@@ -94,15 +109,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn creates_parent_dirs() {
+    #[tokio::test]
+    async fn creates_parent_dirs() {
         let (ws, dir) = setup("parents");
         let tool = WriteTool;
         tool.run(
             &ws,
             &json!({"path": "a/b/c.txt", "content": "deep"}),
-            &std::sync::atomic::AtomicBool::new(false),
+            tokio_util::sync::CancellationToken::new(),
         )
+        .await
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),

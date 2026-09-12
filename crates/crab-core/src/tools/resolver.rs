@@ -1,9 +1,8 @@
 //! The resolver maps a `{name, args}` pair to the correct tool executor and
 //! surfaces unknown-tool / bad-args / not-found errors clearly.
 
-use std::sync::atomic::AtomicBool;
-
 use serde_json::{json, Value};
+use tokio_util::sync::CancellationToken;
 
 use super::{
     bash::BashTool, edit::EditTool, read::ReadTool, write::WriteTool, Tool, ToolError, ToolOutput,
@@ -73,17 +72,17 @@ impl ToolSet {
     /// Route `name`+`args` to the matching executor, or a clear error. Args
     /// are validated against the tool's declared JSON Schema first (CRAB-107
     /// #9), so malformed model calls never reach an executor.
-    pub fn execute(
+    pub async fn execute(
         &self,
         workspace: &Workspace,
         name: &str,
         args: &Value,
-        cancel: &AtomicBool,
+        cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         match self.tool(name) {
             Some(tool) => {
                 super::validate_args(&tool.schema(), args)?;
-                tool.run(workspace, args, cancel)
+                tool.run(workspace, args, cancel).await
             }
             None => Err(ToolError::Argument(format!(
                 "unknown tool '{name}' (expected read, bash, edit, write)"
@@ -103,8 +102,8 @@ mod tests {
         (dir, ws)
     }
 
-    #[test]
-    fn routes_to_correct_executor() {
+    #[tokio::test]
+    async fn routes_to_correct_executor() {
         let (_dir, ws) = workspace("bash");
         let ts = ToolSet::new(1000);
 
@@ -113,18 +112,20 @@ mod tests {
                 &ws,
                 "bash",
                 &json!({"command": "echo hi"}),
-                &AtomicBool::new(false),
+                CancellationToken::new(),
             )
+            .await
             .unwrap();
         assert!(out.content.contains("hi"));
     }
 
-    #[test]
-    fn unknown_tool_is_clear_error() {
+    #[tokio::test]
+    async fn unknown_tool_is_clear_error() {
         let (_dir, ws) = workspace("unknown");
         let ts = ToolSet::new(1000);
         let err = ts
-            .execute(&ws, "frobnicate", &json!({}), &AtomicBool::new(false))
+            .execute(&ws, "frobnicate", &json!({}), CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown tool 'frobnicate'"));
         assert!(err.to_string().contains("read, bash, edit, write"));
@@ -142,17 +143,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn rejects_bad_args_before_running() {
+    #[tokio::test]
+    async fn rejects_bad_args_before_running() {
         let (_dir, ws) = workspace("badargs");
         let ts = ToolSet::new(1000);
         let err = ts
-            .execute(&ws, "read", &json!({}), &AtomicBool::new(false))
+            .execute(&ws, "read", &json!({}), CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("missing required 'path'"));
         // A non-string path is rejected too.
         let err = ts
-            .execute(&ws, "read", &json!({"path": 7}), &AtomicBool::new(false))
+            .execute(&ws, "read", &json!({"path": 7}), CancellationToken::new())
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("'path' must be a string"));
     }
