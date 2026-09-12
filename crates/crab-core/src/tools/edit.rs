@@ -139,6 +139,16 @@ fn locate_match(
     let exact: Vec<usize> = content.match_indices(old).map(|(i, _)| i).collect();
     match exact.len() {
         1 => {
+            // CRAB-151: uniqueness is decided in normalized space even when the
+            // exact match is unique, so an ASCII-quote oldText cannot silently
+            // pick one of several curly-quote twins (pi's `countOccurrences`).
+            let normalized_count = normalized_occurrences(content, old);
+            if normalized_count > 1 {
+                return Err(ToolError::Invalid(format!(
+                    "{} matched {normalized_count} times in '{path}' (expected exactly 1)",
+                    describe_edit(idx, total)
+                )));
+            }
             let start = exact[0];
             return Ok((start, start + old.len()));
         }
@@ -184,6 +194,15 @@ fn locate_match(
             describe_edit(idx, total)
         ))),
     }
+}
+
+/// Number of occurrences of `old` in `content` after fuzzy normalization
+/// (CRAB-151). Zero is possible when an exact byte match spans a grapheme
+/// cluster that normalization composes away; only counts > 1 are ambiguous.
+fn normalized_occurrences(content: &str, old: &str) -> usize {
+    let (fuzzy_content, _) = normalize_for_fuzzy(content);
+    let (fuzzy_old, _) = normalize_for_fuzzy(old);
+    fuzzy_content.match_indices(&fuzzy_old).count()
 }
 
 /// Minimal unified diff (no context) between two texts, sufficient to show the
@@ -550,6 +569,40 @@ mod tests {
         .unwrap();
         // The trailing tab after BETA is outside the match and survives.
         assert_eq!(read(&dir), "ALPHA\nBETA\t\n");
+    }
+
+    /// CRAB-151: an exact match that is ambiguous in normalized space (an ASCII
+    /// quote and a curly-quote twin) must be rejected, like pi.
+    #[tokio::test]
+    async fn exact_match_ambiguous_in_normalized_space_is_rejected() {
+        let (ws, _dir) = setup("normdup", "a'b and a\u{2019}b\n");
+        let tool = EditTool;
+        let err = tool
+            .run(
+                &ws,
+                &json!({"path": "a.txt", "oldText": "a'b", "newText": "x"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Invalid(_)), "{err}");
+        assert!(err.to_string().contains("matched 2 times"), "{err}");
+    }
+
+    /// CRAB-151: enough context makes the normalized space unique, so the edit
+    /// is allowed.
+    #[tokio::test]
+    async fn exact_match_unique_in_normalized_space_is_allowed() {
+        let (ws, dir) = setup("normuniq", "a'b and a\u{2019}b\n");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "a'b and", "newText": "X"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&dir), "X a\u{2019}b\n");
     }
 
     #[tokio::test]
