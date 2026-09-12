@@ -73,18 +73,23 @@ fn normalize_for_fuzzy(s: &str) -> (String, Vec<(usize, usize)>) {
         }
     }
     // Trim trailing whitespace on each line (pi's normalizeForFuzzyMatch), so
-    // a model's oldText without trailing spaces matches file lines that have
-    // them. Trimming drops entries from the map, keeping indices aligned.
+    // a model's oldText without trailing whitespace matches file lines that
+    // have it (spaces, tabs, any Unicode whitespace — `char::is_whitespace`,
+    // CRAB-150). Trimming drops entries from the map, keeping indices aligned.
     let mut result = String::new();
     let mut result_map: Vec<(usize, usize)> = Vec::new();
     let mut line: Vec<(char, (usize, usize))> = Vec::new();
     for item in norm_chars {
         if item.0 == '\n' {
             let mut keep = line.len();
-            while keep > 0 && line[keep - 1].0 == ' ' {
+            while keep > 0 && line[keep - 1].0.is_whitespace() {
                 keep -= 1;
             }
-            for (ch, range) in line.drain(..keep) {
+            // Truncate *before* draining: `drain(..keep)` alone leaves the
+            // trimmed whitespace in `line`, which would carry it onto the next
+            // line.
+            line.truncate(keep);
+            for (ch, range) in line.drain(..) {
                 result.push(ch);
                 result_map.push(range);
             }
@@ -95,10 +100,11 @@ fn normalize_for_fuzzy(s: &str) -> (String, Vec<(usize, usize)>) {
         }
     }
     let mut keep = line.len();
-    while keep > 0 && line[keep - 1].0 == ' ' {
+    while keep > 0 && line[keep - 1].0.is_whitespace() {
         keep -= 1;
     }
-    for (ch, range) in line.drain(..keep) {
+    line.truncate(keep);
+    for (ch, range) in line.drain(..) {
         result.push(ch);
         result_map.push(range);
     }
@@ -526,6 +532,24 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read(&dir), "before X after\n");
+    }
+
+    /// CRAB-150: trailing whitespace other than a space (tabs, etc.) is trimmed
+    /// in the fuzzy view too, and bytes outside the match are preserved.
+    #[tokio::test]
+    async fn fuzzy_trims_trailing_tabs() {
+        let (ws, dir) = setup("trailtab", "alpha\t\nbeta\t\n");
+        let tool = EditTool;
+        // No exact match: the interior tab after "alpha" forces the fuzzy path.
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "alpha\nbeta", "newText": "ALPHA\nBETA"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        // The trailing tab after BETA is outside the match and survives.
+        assert_eq!(read(&dir), "ALPHA\nBETA\t\n");
     }
 
     #[tokio::test]
