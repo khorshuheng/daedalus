@@ -5,7 +5,8 @@
 # Members:
 #   crates/crab-core — the sync library (config, tools, provider, session,
 #                      memory, reflect, index, runtime, workspace).
-#   crates/crab     — the CLI binary (main + stdio modes + terminal input).
+#   crates/crab     — the CLI binary (main + stdio modes + TUI frontend; the
+#                     interactive REPL was removed in CRAB-135).
 #
 # CRAB-122 adds crates/crab-server (axum/tokio/tungstenite) later.
 

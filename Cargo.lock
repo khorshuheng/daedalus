@@ -182,7 +182,6 @@ dependencies = [
  "crab-core",
  "crossterm",
  "directories",
- "libc",
  "ratatui",
  "serde_json",
  "tempfile",

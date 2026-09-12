@@ -12,8 +12,8 @@ path = "src/main.rs"
 [dependencies]
 crab-core = { path = "../crab-core" }
 serde_json = "1"
-# term.rs uses libc for raw terminal input mode.
-libc = "0.2"
+# CRAB-135: libc dropped from this crate — it was only used by term.rs's
+# REPL raw-mode line editor. crossterm owns the terminal for the TUI.
 # Maintainability crates (CRAB-119), era-appropriate for the 1.85 MSRV floor.
 clap = { version = "=4.5.23", features = ["derive"] }
 anyhow = "=1.0.95"

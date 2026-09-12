@@ -147,6 +147,23 @@ fn cli_smoke_piped_without_mode_is_rejected() {
     assert!(stderr.contains("--mode rpc"), "{stderr}");
 }
 
+/// CLI smoke: `--mode repl` must fail at load with the migration note
+/// (CRAB-135: the REPL was removed).
+#[test]
+fn cli_smoke_repl_mode_is_removed() {
+    let tmp = tempdir("cli-repl-removed");
+    let out = Command::new(env!("CARGO_BIN_EXE_crab"))
+        .args(["hello", "--mode", "repl", "--provider", "fake", "--dir"])
+        .arg(tmp.path())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run crab binary");
+    assert!(!out.status.success(), "--mode repl must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("REPL was removed"), "{stderr}");
+    assert!(stderr.contains("TUI"), "{stderr}");
+}
+
 /// CLI smoke: an unknown provider must fail fast with a non-zero exit.
 #[test]
 fn cli_smoke_unknown_provider_fails() {

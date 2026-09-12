@@ -1,11 +1,8 @@
-//! Stdio frontends (CRAB-120): thin synchronous adapters over AgentRuntime,
-//! selected with `--mode`. Each adapter consumes only the runtime's Event
-//! stream and Command surface — no loop internals.
-//!
 //! Headless frontends (CRAB-120): synchronous adapters over AgentRuntime for
 //! scripted/non-interactive use, selected with `--mode`. Interactive use is
-//! the REPL (default) or the TUI (`--mode tui`). Each adapter consumes only
-//! the runtime's Event stream and Command surface — no loop internals.
+//! the TUI (default on a terminal; the REPL was removed in CRAB-135). Each
+//! adapter consumes only the runtime's Event stream and Command surface — no
+//! loop internals.
 //!
 //! - `json`: one-shot; runs one prompt and emits **every** runtime Event as
 //!   a JSONL object to stdout (the same serialization the TUI and server
@@ -18,7 +15,7 @@
 //!
 //! These headless modes do **not** auto-reflect lessons into memory
 //! (CRAB-123 #4, documented non-goal): the session-save + reflection trigger
-//! belongs to the interactive REPL and TUI.
+//! belongs to the interactive TUI.
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -35,12 +32,18 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Parse a `--mode` value.
+    /// Parse a `--mode` value. `repl` gets its own migration note (CRAB-135:
+    /// the REPL was removed; the TUI is the interactive frontend).
     pub fn parse(s: &str) -> Result<Mode, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "json" => Ok(Mode::Json),
             "rpc" => Ok(Mode::Rpc),
             "tui" => Ok(Mode::Tui),
+            "repl" => Err(
+                "the REPL was removed in CRAB-135; the TUI is the interactive \
+                 frontend and the default on a terminal"
+                    .into(),
+            ),
             other => Err(format!(
                 "unknown mode '{other}' (supported: json, rpc, tui)"
             )),

@@ -63,6 +63,9 @@ pub enum SlashCommand {
     Resume,
     /// Reset the conversation to a fresh context.
     Clear,
+    /// Reflect the conversation into memory as lessons (CRAB-112; TUI parity
+    /// with the removed REPL, CRAB-135).
+    Reflect,
     /// Show the command list.
     Help,
     /// Quit (saving the session).
@@ -86,6 +89,7 @@ pub fn parse_line(line: &str) -> LineAction {
             "workspace" => Some(SlashCommand::Workspace(PathBuf::from(arg))),
             "resume" => Some(SlashCommand::Resume),
             "clear" => Some(SlashCommand::Clear),
+            "reflect" => Some(SlashCommand::Reflect),
             "help" => Some(SlashCommand::Help),
             "exit" | "quit" | "q" => Some(SlashCommand::Exit),
             _ => None,
@@ -476,12 +480,15 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 
 /// Ratatui rendering + event loop shell. Owns the screen (crossterm raw
 /// mode + alternate screen); all *state* lives in the pure model above.
-/// Never prints to stdout directly — ratatui owns the terminal.
+/// Never prints to stdout directly — ratatui owns the terminal. On exit the
+/// session is auto-saved and reflected into memory via `crate::auto_save`
+/// (REPL parity, CRAB-135); `memory_root` is where lessons are stored.
 pub fn run_tui(
     rt: &AgentRuntime,
     rx: &Receiver<Event>,
     initial: &str,
     session_root: &Path,
+    memory_root: &Path,
 ) -> Result<i32, String> {
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let mut stdout = std::io::stdout();
@@ -555,6 +562,7 @@ pub fn run_tui(
                         &mut login_pending,
                         &mut should_exit,
                         session_root,
+                        memory_root,
                         key.code,
                         key.modifiers,
                     ),
@@ -566,10 +574,6 @@ pub fn run_tui(
                 }
             }
         }
-        // Save the session on exit (auto-save at session end).
-        let history = rt.history();
-        let _ = crab_core::session::save_session(session_root, &rt.workspace_root(), &history);
-        rt.shutdown();
         Ok(0)
     })();
 
@@ -581,6 +585,12 @@ pub fn run_tui(
     )
     .ok();
     terminal.show_cursor().ok();
+    // Auto-save at session end (CRAB-109) *after* the terminal is restored,
+    // so its stderr output lands on the normal screen: save the session and
+    // reflect lessons into memory (CRAB-112; REPL parity, CRAB-135). Failures
+    // are warnings only — quitting must never be blocked by persistence.
+    crate::auto_save(rt, session_root, memory_root);
+    rt.shutdown();
     result
 }
 
@@ -606,6 +616,7 @@ fn handle_key(
     login_pending: &mut bool,
     should_exit: &mut bool,
     session_root: &Path,
+    memory_root: &Path,
     code: KeyCode,
     modifiers: KeyModifiers,
 ) {
@@ -661,7 +672,15 @@ fn handle_key(
         }
         KeyCode::Enter => {
             let line = input.take();
-            if submit_line(rt, model, picker, session_root, login_pending, &line) {
+            if submit_line(
+                rt,
+                model,
+                picker,
+                session_root,
+                memory_root,
+                login_pending,
+                &line,
+            ) {
                 *should_exit = true;
             }
         }
@@ -691,6 +710,7 @@ fn submit_line(
     model: &mut UiModel,
     picker: &mut Option<Picker>,
     session_root: &Path,
+    memory_root: &Path,
     login_pending: &mut bool,
     line: &str,
 ) -> bool {
@@ -722,9 +742,15 @@ fn submit_line(
             }
             false
         }
-        LineAction::Command(cmd) => {
-            run_command(rt, model, picker, session_root, login_pending, cmd)
-        }
+        LineAction::Command(cmd) => run_command(
+            rt,
+            model,
+            picker,
+            session_root,
+            memory_root,
+            login_pending,
+            cmd,
+        ),
     }
 }
 
@@ -735,17 +761,24 @@ fn run_command(
     model: &mut UiModel,
     picker: &mut Option<Picker>,
     session_root: &Path,
+    memory_root: &Path,
     login_pending: &mut bool,
     cmd: SlashCommand,
 ) -> bool {
     match cmd {
         SlashCommand::Help => {
-            model.push_notice("/login /model /effort /workspace /resume /clear /help /exit");
+            model.push_notice(
+                "/login /model /effort /workspace /resume /clear /reflect /help /exit",
+            );
         }
         SlashCommand::Clear => {
             rt.clear();
             model.transcript.clear();
             model.push_notice("conversation cleared");
+        }
+        SlashCommand::Reflect => {
+            let msg = crate::handle_reflect(rt, session_root, memory_root);
+            model.push_notice(&msg);
         }
         SlashCommand::Exit => {
             // Auto-save happens in run_tui after the loop exits.
@@ -1008,6 +1041,7 @@ mod tests {
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
+            Path::new("/tmp"), // memory_root
             code,
             mods,
         );
@@ -1032,6 +1066,7 @@ mod tests {
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
+            Path::new("/tmp"), // memory_root
             code,
             mods,
         );
@@ -1056,6 +1091,10 @@ mod tests {
         assert_eq!(
             parse_line("/clear"),
             LineAction::Command(SlashCommand::Clear)
+        );
+        assert_eq!(
+            parse_line("/reflect"),
+            LineAction::Command(SlashCommand::Reflect)
         );
         assert_eq!(parse_line("/help"), LineAction::Command(SlashCommand::Help));
         assert_eq!(parse_line("/exit"), LineAction::Command(SlashCommand::Exit));
