@@ -58,6 +58,10 @@ enum Backend {
 pub struct RigProvider {
     backend: Backend,
     model: String,
+    /// Registry row: drives the key requirement and env-var name.
+    provider: &'static crate::config::ProviderInfo,
+    /// Resolved API key (empty when none was configured).
+    api_key: String,
 }
 
 impl RigProvider {
@@ -78,7 +82,7 @@ impl RigProvider {
                     format!("{base}/v1")
                 };
                 let client = openai::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid OpenAI-compatible client");
@@ -90,7 +94,7 @@ impl RigProvider {
             }
             "anthropic" => {
                 let client = anthropic::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid Anthropic client");
@@ -98,7 +102,7 @@ impl RigProvider {
             }
             "gemini" => {
                 let client = gemini::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid Gemini client");
@@ -106,7 +110,7 @@ impl RigProvider {
             }
             "mistral" => {
                 let client = mistral::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid Mistral client");
@@ -114,7 +118,7 @@ impl RigProvider {
             }
             "groq" => {
                 let client = groq::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid Groq client");
@@ -122,7 +126,7 @@ impl RigProvider {
             }
             "xai" => {
                 let client = xai::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid xAI client");
@@ -130,7 +134,7 @@ impl RigProvider {
             }
             "openrouter" => {
                 let client = openrouter::Client::builder()
-                    .api_key(key)
+                    .api_key(key.clone())
                     .base_url(base)
                     .build()
                     .expect("valid OpenRouter client");
@@ -152,6 +156,8 @@ impl RigProvider {
         Self {
             backend,
             model: config.model.clone(),
+            provider: config.provider,
+            api_key: key,
         }
     }
 
@@ -365,6 +371,16 @@ impl Provider for RigProvider {
         on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
     ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
         Box::pin(async move {
+            // Never send an empty bearer token: refuse with an actionable
+            // message when a key-requiring provider has no key (CRAB-143).
+            // Enforced at request time, not at startup, so the interactive
+            // frontends still launch and `/login` stays reachable.
+            if self.provider.requires_key() && self.api_key.is_empty() {
+                return Err(ProviderError::Auth(format!(
+                    "no API key configured; set {}, pass --api-key, or run /login",
+                    self.provider.api_key_env.unwrap_or("<PROVIDER>_API_KEY")
+                )));
+            }
             let request = self.build_request(history, tools, effort_params);
             let mut stream = self.with_retries(request, cancel.clone()).await?;
 
@@ -461,6 +477,28 @@ impl Provider for RigProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn missing_key_fails_before_any_request() {
+        let mut config = crate::config::Config::defaults(std::env::temp_dir());
+        config.provider = crate::config::provider_by_name("deepseek").unwrap();
+        config.model = "deepseek-chat".into();
+        config.api_key = None;
+        let provider = RigProvider::new(&config);
+        let mut on_delta = |_: StreamDelta| {};
+        let err = provider
+            .complete(
+                &[],
+                &[],
+                &serde_json::json!({}),
+                CancellationToken::new(),
+                &mut on_delta,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::Auth(_)));
+        assert!(err.to_string().contains("DEEPSEEK_API_KEY"), "{err}");
+    }
 
     #[test]
     fn reasoning_text_concatenates_text_and_summary() {

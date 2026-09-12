@@ -887,7 +887,12 @@ fn submit_line(
         }
         let provider = rt.provider_kind();
         match crab_core::credential::store_api_key(provider, key) {
-            Ok(()) => model.push_notice(&format!("stored API key for {}", provider.name)),
+            // The running runtime built its provider at startup, so the stored
+            // key applies from the next launch (CRAB-143 review).
+            Ok(()) => model.push_notice(&format!(
+                "stored API key for {} (restart crab to use it)",
+                provider.name
+            )),
             Err(e) => model.push_notice(&format!("could not store key: {e}")),
         }
         return false;

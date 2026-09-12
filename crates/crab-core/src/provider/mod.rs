@@ -110,14 +110,15 @@ pub enum StreamDelta {
 /// Build the provider selected by `config`. OpenAI and DeepSeek share the
 /// OpenAI chat-completions adapter (only base URL + model differ); Anthropic
 /// uses its own Messages client; `fake` is the scripted offline provider.
-/// Fails fast when a hosted provider has no key, instead of sending an empty
-/// bearer token (CRAB-143).
-pub fn from_config(config: &Config) -> Result<Box<dyn Provider>, String> {
-    crate::config::ensure_api_key(config)?;
-    Ok(match config.provider.name {
+///
+/// A missing API key is not rejected here: the real provider refuses to make a
+/// request without one (CRAB-143), so the interactive frontends still start
+/// and `/login` stays reachable.
+pub fn from_config(config: &Config) -> Box<dyn Provider> {
+    match config.provider.name {
         "fake" => Box::new(fake::FakeProvider::new(vec![])),
         _ => Box::new(rig::RigProvider::new(config)),
-    })
+    }
 }
 
 /// Map an HTTP status code to a typed provider error.
@@ -179,20 +180,7 @@ mod tests {
         for info in crate::config::PROVIDERS {
             let mut config = Config::defaults(std::env::temp_dir());
             config.provider = info;
-            // Hosted providers require a key (CRAB-143).
-            config.api_key = Some("test-key".into());
-            drop(from_config(&config).unwrap());
-        }
-    }
-
-    #[test]
-    fn from_config_rejects_a_missing_key() {
-        let mut config = Config::defaults(std::env::temp_dir());
-        config.model = "gpt-x".into();
-        config.api_key = None;
-        match from_config(&config) {
-            Ok(_) => panic!("a key-requiring provider must not build without a key"),
-            Err(e) => assert!(e.contains("no API key for provider 'openai'"), "{e}"),
+            drop(from_config(&config));
         }
     }
 }
