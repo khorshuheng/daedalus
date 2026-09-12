@@ -8,6 +8,7 @@
 //! - `session` (CRAB-109): on-disk conversation persistence for `/resume`.
 //! - `runtime` (CRAB-116): stateful AgentRuntime engine + Event/Command surface.
 //! - `skills` (CRAB-138): load-on-demand instruction files (user + workspace).
+//! - `mcp` (CRAB-133): external MCP tool servers bridged onto the Tool trait.
 //! - `paths` (CRAB-119): XDG config/data base directories.
 //!
 //! The frontends (`crab` binary: main/modes/term) live in the sibling crate so
@@ -16,6 +17,7 @@
 
 pub mod config;
 pub mod credential;
+pub mod mcp;
 pub mod paths;
 pub mod provider;
 pub mod runtime;

@@ -62,6 +62,8 @@ pub enum SlashCommand {
     Skills,
     /// Load a skill's content into the conversation as a user message.
     Skill(String),
+    /// List the registered tools (built-ins + MCP servers, CRAB-133).
+    Tools,
     /// Continue the previous session for this workspace.
     Resume,
     /// Reset the conversation to a fresh context.
@@ -89,6 +91,7 @@ pub fn parse_line(line: &str) -> LineAction {
             "workspace" => Some(SlashCommand::Workspace(PathBuf::from(arg))),
             "skills" => Some(SlashCommand::Skills),
             "skill" => Some(SlashCommand::Skill(arg.to_string())),
+            "tools" => Some(SlashCommand::Tools),
             "resume" => Some(SlashCommand::Resume),
             "clear" => Some(SlashCommand::Clear),
             "help" => Some(SlashCommand::Help),
@@ -724,7 +727,7 @@ fn run_command(
     match cmd {
         SlashCommand::Help => {
             model.push_notice(
-                "/login /model /effort /workspace /resume /clear /skills /skill /help /exit",
+                "/login /model /effort /workspace /resume /clear /skills /skill /tools /help /exit",
             );
         }
         SlashCommand::Clear => {
@@ -811,6 +814,11 @@ fn run_command(
                     }
                     None => model.push_notice(&format!("unknown skill '{name}' (see /skills)")),
                 }
+            }
+        }
+        SlashCommand::Tools => {
+            for (name, description) in rt.tool_listing() {
+                model.push_notice(&format!("{name} — {description}"));
             }
         }
     }
@@ -1087,6 +1095,37 @@ mod tests {
             parse_line("/skill"),
             LineAction::Command(SlashCommand::Skill(String::new()))
         );
+        assert_eq!(
+            parse_line("/tools"),
+            LineAction::Command(SlashCommand::Tools)
+        );
+    }
+
+    /// CRAB-133: `/tools` lists the registered toolset (the four built-ins
+    /// when no MCP servers are configured).
+    #[test]
+    fn tools_command_lists_builtins() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut picker = None;
+        let mut login_pending = false;
+        run_command(
+            &rt,
+            &mut model,
+            &mut picker,
+            Path::new("/tmp"),
+            &mut login_pending,
+            SlashCommand::Tools,
+        );
+        for builtin in ["read", "bash", "edit", "write"] {
+            assert!(
+                model
+                    .transcript
+                    .iter()
+                    .any(|l| matches!(l, TranscriptLine::Notice(n) if n.starts_with(builtin))),
+                "missing tool listing for {builtin}"
+            );
+        }
     }
 
     /// CRAB-138: `/skills` lists discovered skills and `/skill <name>` loads

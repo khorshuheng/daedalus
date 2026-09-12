@@ -592,6 +592,12 @@ impl AgentRuntime {
         skills::discover(&workspace)
     }
 
+    /// `(name, description)` for every registered tool — built-ins plus any
+    /// MCP tools (CRAB-133) — for the TUI `/tools` listing.
+    pub fn tool_listing(&self) -> Vec<(String, String)> {
+        self.inner.tools.listing()
+    }
+
     /// Current runtime state snapshot.
     pub fn state(&self) -> RuntimeState {
         self.inner.state.lock().unwrap().clone()

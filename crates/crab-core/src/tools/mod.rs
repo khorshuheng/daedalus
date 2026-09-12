@@ -52,12 +52,13 @@ pub enum ToolError {
     #[error("cancelled")]
     Cancelled,
 }
-/// A built-in tool. Implementations must be cheap to construct and stateless
-/// apart from their output cap. `run` is async (CRAB-130): the built-ins wrap
-/// their blocking bodies in `spawn_blocking`; an MCP tool (CRAB-133) will
-/// implement it natively async behind the same trait.
+/// A tool. Implementations must be cheap to construct and stateless apart
+/// from their output cap. `run` is async (CRAB-130): the built-ins wrap their
+/// blocking bodies in `spawn_blocking`; an MCP tool (CRAB-133) implements it
+/// natively async behind the same trait. `name` returns `&str` (not
+/// `&'static str`) because MCP tool names are runtime data.
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     /// JSON Schema describing the accepted arguments.
     fn schema(&self) -> Value;
     fn run<'a>(

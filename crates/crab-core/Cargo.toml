@@ -18,7 +18,8 @@ toml = "0.8"
 rig-core = "=0.42.0"
 # CRAB-130: crab-core is async — tokio drives the turn loop (current-thread
 # runtime owned by the worker thread), tokio-util provides CancellationToken.
-tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+# CRAB-133: rt-multi-thread gives MCP servers a small background runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
 tokio-util = "0.7"
 futures = "0.3"
 thiserror = "2"
@@ -30,6 +31,15 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 libc = "0.2"
 # NFKC normalization for fuzzy edit matching (CRAB-107 #15).
 unicode-normalization = "0.1"
+# CRAB-133: MCP client (official Rust SDK). The spec originally named
+# "rig-rmcp"; rig-core 0.42 has no MCP integration, so this uses `rmcp`
+# directly. Client + stdio child-process + streamable-http transports.
+rmcp = { version = "3.3.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
 
 # CRAB-130: the crate is async now (tokio). The runtime stays runtime-agnostic
 # (no #[tokio::main]); the worker thread owns a current-thread runtime.

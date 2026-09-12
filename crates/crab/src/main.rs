@@ -140,7 +140,12 @@ fn run(cli: Cli) -> Result<i32, String> {
 
     let workspace = Workspace::new(config.workspace.clone())?;
     let provider = provider::from_config(&config);
-    let tools = ToolSet::new(config.max_output_bytes);
+    // CRAB-133: built-ins plus configured MCP servers. Server startup is
+    // non-fatal — a failure is a warning and the agent keeps the rest.
+    let (tools, mcp_warnings) = ToolSet::from_config(&config, config.max_output_bytes);
+    for warning in &mcp_warnings {
+        eprintln!("crab: warning: {warning}");
+    }
 
     // No --mode: an interactive terminal gets the TUI (CRAB-135: the REPL
     // was removed). Piped/non-tty stdin without an explicit mode is an

@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::mcp::{validate_servers, McpServerConfig};
+
 /// How a provider's canonical `Effort` level maps to wire parameters
 /// (CRAB-116). `None` = the provider gets no effort params (unsupported or
 /// unknown semantics — capability honesty over guesswork).
@@ -168,6 +170,8 @@ pub struct Config {
     pub max_context_tokens: usize,
     /// The single root directory the agent is allowed to touch.
     pub workspace: PathBuf,
+    /// External MCP tool servers (CRAB-133), started at runtime construction.
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 impl Config {
@@ -194,6 +198,7 @@ impl Config {
             // Leave headroom for the completion output (max_tokens).
             max_context_tokens: DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096),
             workspace,
+            mcp_servers: Vec::new(),
         }
     }
 }
@@ -216,6 +221,9 @@ pub struct PartialConfig {
     pub max_retries: Option<usize>,
     pub max_context_tokens: Option<usize>,
     pub workspace: Option<PathBuf>,
+    /// `[[mcp_servers]]` tables (CRAB-133).
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 impl PartialConfig {
@@ -240,6 +248,7 @@ impl PartialConfig {
         take!(max_retries);
         take!(max_context_tokens);
         take!(workspace);
+        take!(mcp_servers);
     }
 
     /// Resolve to a complete `Config`: fill defaults (provider presets) and
@@ -291,6 +300,8 @@ impl PartialConfig {
         if max_context_tokens == 0 {
             return Err("max_context_tokens must be >= 1".into());
         }
+        let mcp_servers = self.mcp_servers.unwrap_or_default();
+        validate_servers(&mcp_servers)?;
 
         Ok(Config {
             provider,
@@ -305,6 +316,7 @@ impl PartialConfig {
             max_retries: self.max_retries.unwrap_or(2),
             max_context_tokens,
             workspace,
+            mcp_servers,
         })
     }
 }
@@ -495,5 +507,48 @@ mod tests {
         merged.overlay(&flags);
         assert_eq!(merged.model.as_deref(), Some("flag-model"));
         assert_eq!(merged.max_iterations, Some(5));
+    }
+
+    #[test]
+    fn config_file_parses_mcp_servers() {
+        let dir = std::env::temp_dir().join("crab-config-mcp");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+model = "m"
+[[mcp_servers]]
+name = "fs"
+command = "npx"
+args = ["-y", "server"]
+[[mcp_servers]]
+name = "remote"
+transport = "http"
+url = "http://localhost:8000/mcp"
+"#,
+        )
+        .unwrap();
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.mcp_servers.len(), 2);
+        assert_eq!(c.mcp_servers[0].name, "fs");
+        assert!(c.mcp_servers[0].enabled);
+        assert_eq!(
+            c.mcp_servers[1].transport,
+            crate::mcp::McpTransportKind::Http
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_mcp_server_in_file_fails() {
+        let dir = std::env::temp_dir().join("crab-config-mcp-bad");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // A stdio server with no command is a validation error.
+        std::fs::write(&path, "model = \"m\"\n[[mcp_servers]]\nname = \"fs\"\n").unwrap();
+        let err = load(ws(), Some(&path), PartialConfig::default()).unwrap_err();
+        assert!(err.contains("needs a 'command'"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
