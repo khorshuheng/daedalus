@@ -31,6 +31,8 @@ crossterm = "0.28.1"
 # CRAB-126: display-width of input text so the caret column is correct for
 # wide (CJK) and zero-width chars. Already in the tree via ratatui 0.29.
 unicode-width = "0.2.0"
+# CRAB-145: CommonMark parsing for the transcript's markdown renderer.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # The crab binary owns its frontend dependencies (term, stdio modes). Async
 # server deps (axum/tokio) arrive with crates/crab-server in CRAB-122, so this

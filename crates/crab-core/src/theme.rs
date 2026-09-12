@@ -69,11 +69,17 @@ pub enum Token {
     Spinner,
     Input,
     Selection,
+    MdHeading,
+    MdCode,
+    MdCodeBlock,
+    MdLink,
+    MdQuote,
+    MdBullet,
 }
 
 impl Token {
     /// Number of tokens.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 19;
 
     /// `(toml key, token)` for every token — one source of truth for parsing,
     /// formatting, and error messages.
@@ -91,6 +97,12 @@ impl Token {
         ("spinner", Token::Spinner),
         ("input", Token::Input),
         ("selection", Token::Selection),
+        ("md_heading", Token::MdHeading),
+        ("md_code", Token::MdCode),
+        ("md_code_block", Token::MdCodeBlock),
+        ("md_link", Token::MdLink),
+        ("md_quote", Token::MdQuote),
+        ("md_bullet", Token::MdBullet),
     ];
 
     fn index(self) -> usize {
@@ -144,6 +156,12 @@ impl Theme {
         t.set(Token::ToolErr, fg(8));
         t.set(Token::Notice, fg(3));
         t.set(Token::Selection, bold());
+        t.set(Token::MdHeading, bold());
+        t.set(Token::MdCode, fg(3));
+        t.set(Token::MdCodeBlock, fg(3));
+        t.set(Token::MdLink, fg_underlined(4));
+        t.set(Token::MdQuote, italic(8));
+        t.set(Token::MdBullet, fg(8));
         t
     }
 
@@ -161,6 +179,12 @@ impl Theme {
         t.set(Token::ToolErr, fg(8));
         t.set(Token::Notice, fg(5));
         t.set(Token::Selection, bold());
+        t.set(Token::MdHeading, bold());
+        t.set(Token::MdCode, fg(5));
+        t.set(Token::MdCodeBlock, fg(5));
+        t.set(Token::MdLink, fg_underlined(4));
+        t.set(Token::MdQuote, fg(8));
+        t.set(Token::MdBullet, fg(8));
         t
     }
 }
@@ -187,6 +211,17 @@ fn bold() -> StyleSpec {
     StyleSpec {
         modifiers: Modifiers {
             bold: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn fg_underlined(index: u8) -> StyleSpec {
+    StyleSpec {
+        fg: ThemeColor::Indexed(index),
+        modifiers: Modifiers {
+            underlined: true,
             ..Default::default()
         },
         ..Default::default()
@@ -291,6 +326,12 @@ pub struct ThemeColors {
     pub spinner: Option<StyleValue>,
     pub input: Option<StyleValue>,
     pub selection: Option<StyleValue>,
+    pub md_heading: Option<StyleValue>,
+    pub md_code: Option<StyleValue>,
+    pub md_code_block: Option<StyleValue>,
+    pub md_link: Option<StyleValue>,
+    pub md_quote: Option<StyleValue>,
+    pub md_bullet: Option<StyleValue>,
 }
 
 impl ThemeColors {
@@ -309,6 +350,12 @@ impl ThemeColors {
             Token::Spinner => self.spinner.as_ref(),
             Token::Input => self.input.as_ref(),
             Token::Selection => self.selection.as_ref(),
+            Token::MdHeading => self.md_heading.as_ref(),
+            Token::MdCode => self.md_code.as_ref(),
+            Token::MdCodeBlock => self.md_code_block.as_ref(),
+            Token::MdLink => self.md_link.as_ref(),
+            Token::MdQuote => self.md_quote.as_ref(),
+            Token::MdBullet => self.md_bullet.as_ref(),
         }
     }
 
@@ -333,6 +380,12 @@ impl ThemeColors {
         take!(spinner);
         take!(input);
         take!(selection);
+        take!(md_heading);
+        take!(md_code);
+        take!(md_code_block);
+        take!(md_link);
+        take!(md_quote);
+        take!(md_bullet);
     }
 }
 

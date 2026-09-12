@@ -32,6 +32,7 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line as TLine, Span};
 use ratatui::widgets::Clear;
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -254,6 +255,10 @@ pub struct UiModel {
     pub settled: bool,
     /// Transcript scrollback (follow the tail unless the user scrolled up).
     pub scroll: TranscriptScroll,
+    /// Bumped whenever the transcript changes, to key the render cache.
+    pub revision: u64,
+    /// Cache of the rendered transcript, keyed by (revision, area width).
+    pub md_cache: Option<(u64, u16, Vec<ratatui::text::Line<'static>>)>,
 }
 
 impl UiModel {
@@ -267,6 +272,8 @@ impl UiModel {
             iterations: 0,
             settled: false,
             scroll: TranscriptScroll::default(),
+            revision: 0,
+            md_cache: None,
         }
     }
 
@@ -347,6 +354,7 @@ impl UiModel {
                     .push(TranscriptLine::Notice(format!("error: {message}")));
             }
         }
+        self.revision += 1;
     }
 
     /// Push accumulated model reasoning (if any) as a transcript line.
@@ -376,12 +384,14 @@ impl UiModel {
         // A new message should be visible: resume following the tail.
         self.scroll.follow_tail();
         self.transcript.push(TranscriptLine::User(text.to_string()));
+        self.revision += 1;
     }
 
     /// Show a notice line (slash command results, etc.).
     pub fn push_notice(&mut self, text: &str) {
         self.transcript
             .push(TranscriptLine::Notice(text.to_string()));
+        self.revision += 1;
     }
 }
 
@@ -1075,6 +1085,60 @@ fn modifiers(m: Modifiers) -> Modifier {
     out
 }
 
+/// Markdown styles pulled from the active theme (CRAB-145).
+fn markdown_style(theme: &Theme) -> crate::markdown::MarkdownStyle {
+    crate::markdown::MarkdownStyle {
+        text: style(theme.token(Token::Assistant)),
+        heading: style(theme.token(Token::MdHeading)),
+        code: style(theme.token(Token::MdCode)),
+        code_block: style(theme.token(Token::MdCodeBlock)),
+        link: style(theme.token(Token::MdLink)),
+        quote: style(theme.token(Token::MdQuote)),
+        bullet: style(theme.token(Token::MdBullet)),
+    }
+}
+
+/// Build the ratatui lines for the flushed transcript, rendering assistant
+/// messages as markdown (CRAB-145).
+fn transcript_lines(
+    transcript: &[TranscriptLine],
+    theme: &Theme,
+    width: u16,
+) -> Vec<TLine<'static>> {
+    let md = markdown_style(theme);
+    let mut out: Vec<TLine<'static>> = Vec::new();
+    for line in transcript {
+        match line {
+            TranscriptLine::User(t) => out.push(TLine::from(Span::styled(
+                format!("▶ {t}"),
+                style(theme.token(Token::User)),
+            ))),
+            TranscriptLine::Assistant(t) => out.extend(crate::markdown::render(t, width, &md)),
+            TranscriptLine::Thinking(t) => out.push(TLine::from(Span::styled(
+                format!("  {t}"),
+                style(theme.token(Token::Thinking)),
+            ))),
+            TranscriptLine::Tool(t) => out.push(TLine::from(Span::styled(
+                format!("  {t}"),
+                style(theme.token(Token::Tool)),
+            ))),
+            TranscriptLine::ToolResult { name, ok } => {
+                let marker = if *ok { "✓" } else { "✗" };
+                let token = if *ok { Token::ToolOk } else { Token::ToolErr };
+                out.push(TLine::from(Span::styled(
+                    format!("  {marker} {name}"),
+                    style(theme.token(token)),
+                )));
+            }
+            TranscriptLine::Notice(t) => out.push(TLine::from(Span::styled(
+                format!("• {t}"),
+                style(theme.token(Token::Notice)),
+            ))),
+        }
+    }
+    out
+}
+
 /// Render a frame: transcript on top, input editor (with a visible caret) at
 /// the bottom, footer with an animated spinner while busy. The model/effort
 /// picker renders as a centered overlay sized to its choices (CRAB-127).
@@ -1090,7 +1154,6 @@ fn draw(
     provider: &str,
 ) {
     use ratatui::layout::{Constraint, Direction, Layout};
-    use ratatui::text::{Line as TLine, Span};
     use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
     let area = f.area();
@@ -1103,45 +1166,25 @@ fn draw(
         ])
         .split(area);
 
-    // Transcript.
-    let lines: Vec<TLine> = model
-        .transcript
-        .iter()
-        .map(|tl| match tl {
-            TranscriptLine::User(t) => TLine::from(Span::styled(
-                format!("▶ {t}"),
-                style(theme.token(Token::User)),
-            )),
-            TranscriptLine::Assistant(t) => TLine::from(Span::styled(
-                t.to_string(),
-                style(theme.token(Token::Assistant)),
-            )),
-            TranscriptLine::Thinking(t) => TLine::from(Span::styled(
-                format!("  {t}"),
-                style(theme.token(Token::Thinking)),
-            )),
-            TranscriptLine::Tool(t) => TLine::from(Span::styled(
-                format!("  {t}"),
-                style(theme.token(Token::Tool)),
-            )),
-            TranscriptLine::ToolResult { name, ok } => {
-                let marker = if *ok { "✓" } else { "✗" };
-                let token = if *ok { Token::ToolOk } else { Token::ToolErr };
-                TLine::from(Span::styled(
-                    format!("  {marker} {name}"),
-                    style(theme.token(token)),
-                ))
-            }
-            TranscriptLine::Notice(t) => TLine::from(Span::styled(
-                format!("• {t}"),
-                style(theme.token(Token::Notice)),
-            )),
-        })
-        .collect();
+    // Transcript: markdown-rendered and cached by (revision, width), plus the
+    // live streaming answer as a trailing block (CRAB-145).
+    let inner_w = chunks[0].width.saturating_sub(2);
+    if !matches!(&model.md_cache, Some((r, w, _)) if *r == model.revision && *w == chunks[0].width)
+    {
+        let rendered = transcript_lines(&model.transcript, theme, inner_w);
+        model.md_cache = Some((model.revision, chunks[0].width, rendered));
+    }
+    let mut lines: Vec<TLine> = model.md_cache.as_ref().unwrap().2.clone();
+    if !model.assistant_buf.is_empty() {
+        lines.extend(crate::markdown::render(
+            &model.assistant_buf,
+            inner_w,
+            &markdown_style(theme),
+        ));
+    }
     // `line_count` returns the wrapped height including the block's border
     // rows, so the full chunk height is the matching viewport. Scrolling by the
     // logical line count instead left the newest (wrapped) lines off-screen.
-    let inner_w = chunks[0].width.saturating_sub(2);
     let transcript = Paragraph::new(lines)
         .block(
             Block::default()
@@ -1213,7 +1256,6 @@ fn draw(
 /// 1-row input slot), cleared behind, with a viewport that keeps the selected
 /// row visible and the current selection highlighted.
 fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str, theme: &Theme) {
-    use ratatui::text::{Line as TLine, Span};
     use ratatui::widgets::{Block, Borders, Paragraph};
 
     let item_w = items.iter().map(|s| s.width()).max().unwrap_or(0) as u16;

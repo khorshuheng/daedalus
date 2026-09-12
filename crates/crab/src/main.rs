@@ -24,6 +24,7 @@ use crab_core::session;
 use crab_core::tools::resolver::ToolSet;
 use crab_core::workspace::Workspace;
 
+mod markdown;
 mod modes;
 mod tui;
 
