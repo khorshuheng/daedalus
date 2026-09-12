@@ -585,9 +585,11 @@ impl AgentRuntime {
     /// Skills discovered for the current workspace (user + workspace levels,
     /// workspace wins on a name clash, CRAB-138). Re-read on every call so a
     /// file dropped into `<workspace>/.crab/skills/` is picked up on the next
-    /// turn.
+    /// turn. Workspace skills are resolved through the sandbox, so a symlinked
+    /// skill cannot smuggle content from outside the workspace.
     pub fn skills(&self) -> Vec<Skill> {
-        skills::discover(&self.workspace_path())
+        let workspace = self.inner.workspace.lock().unwrap().clone();
+        skills::discover(&workspace)
     }
 
     /// Current runtime state snapshot.
@@ -1312,10 +1314,12 @@ mod tests {
         assert!(prompt.contains("demo — Demo skill."));
         assert!(prompt.contains("demo.md"));
         // The model can self-serve with the existing read tool rather than a
-        // new skill tool.
+        // new skill tool. Assert on the specific skill, not the count: a real
+        // `~/.config/crab/skills` may contribute extra user-level entries.
         let skills = rt.skills();
-        assert_eq!(skills.len(), 1);
-        assert!(skills[0].prompt().contains("Do the demo thing."));
+        assert!(skills
+            .iter()
+            .any(|s| s.name == "demo" && s.prompt().contains("Do the demo thing.")));
     }
 
     fn runtime_with(

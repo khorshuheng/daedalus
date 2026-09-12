@@ -786,8 +786,9 @@ fn run_command(
             } else {
                 for s in &skills {
                     model.push_notice(&format!(
-                        "{} — {} ({})",
+                        "{} [{}] — {} ({})",
                         s.name,
+                        s.level.label(),
                         s.description,
                         s.path.display()
                     ));
