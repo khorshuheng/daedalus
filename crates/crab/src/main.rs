@@ -70,6 +70,10 @@ struct Cli {
     /// from stdin and needs no <prompt>); tui is the full-screen interface.
     #[arg(long, value_name = "MODE", value_parser = parse_mode)]
     mode: Option<Mode>,
+
+    /// TUI theme preset: dark | light (default: detected from the terminal).
+    #[arg(long, value_name = "NAME", value_parser = parse_theme)]
+    theme: Option<String>,
 }
 
 fn parse_provider(s: &str) -> Result<&'static crab_core::config::ProviderInfo, String> {
@@ -85,6 +89,14 @@ fn parse_max_iterations(s: &str) -> Result<usize, String> {
         .map_err(|_| format!("invalid --max-iterations '{s}'"))
 }
 
+fn parse_theme(s: &str) -> Result<String, String> {
+    if crab_core::theme::Theme::builtin(s).is_some() {
+        Ok(s.to_string())
+    } else {
+        Err(format!("invalid --theme '{s}' (supported: dark, light)"))
+    }
+}
+
 impl Cli {
     /// Reassemble positional prompt words and the config-file precedence the
     /// way the hand-rolled parser did (flags here are merged over env and
@@ -98,6 +110,13 @@ impl Cli {
             provider: self.provider.map(|p| p.name.to_string()),
             model: self.model.clone(),
             max_iterations: self.max_iterations,
+            theme: self
+                .theme
+                .clone()
+                .map(|name| crab_core::theme::ThemePartial {
+                    name: Some(name),
+                    ..Default::default()
+                }),
             ..Default::default()
         }
     }
@@ -181,12 +200,13 @@ fn run(cli: Cli) -> Result<i32, String> {
             modes::run_rpc(&rt, &mut rx, &root, reader, &mut stdout)
         }
         Some(Mode::Tui) | None => {
+            let theme = config.theme.clone();
             let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
             rt.set_interactive(true); // human present: no iteration cap
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
-            tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path())
+            tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path(), &theme)
         }
     }
 }

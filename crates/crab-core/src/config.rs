@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::mcp::{validate_servers, McpServerConfig};
+use crate::theme::{Theme, ThemePartial};
 
 /// How a provider's canonical `Effort` level maps to wire parameters
 /// (CRAB-116). `None` = the provider gets no effort params (unsupported or
@@ -188,6 +189,8 @@ pub struct Config {
     /// a Tailscale login header) selects a session workspace. Empty = use
     /// `workspace` for every session.
     pub identity_workspaces: BTreeMap<String, PathBuf>,
+    /// The resolved TUI theme (CRAB-140).
+    pub theme: Theme,
 }
 
 impl Config {
@@ -217,6 +220,7 @@ impl Config {
             workspace,
             mcp_servers: Vec::new(),
             identity_workspaces: BTreeMap::new(),
+            theme: Theme::dark(),
         }
     }
 
@@ -251,6 +255,9 @@ pub struct PartialConfig {
     /// `[identities]` table: identity -> workspace directory (CRAB-124).
     #[serde(default, rename = "identities")]
     pub identity_workspaces: Option<BTreeMap<String, PathBuf>>,
+    /// `[theme]` table (CRAB-140).
+    #[serde(default)]
+    pub theme: Option<ThemePartial>,
 }
 
 impl PartialConfig {
@@ -278,6 +285,14 @@ impl PartialConfig {
         take!(workspace);
         take!(mcp_servers);
         take!(identity_workspaces);
+        // The theme table merges per field: a flag name must not discard the
+        // file's per-token overrides.
+        if let Some(higher_theme) = &higher.theme {
+            match &mut self.theme {
+                Some(t) => t.overlay(higher_theme),
+                None => self.theme = Some(higher_theme.clone()),
+            }
+        }
     }
 
     /// Resolve to a complete `Config`: fill defaults (provider presets) and
@@ -344,6 +359,9 @@ impl PartialConfig {
             }
         }
 
+        let theme_partial = self.theme.clone().unwrap_or_default();
+        let theme = crate::theme::resolve(&theme_partial, crate::theme::detect_scheme())?;
+
         Ok(Config {
             provider,
             base_url,
@@ -360,6 +378,7 @@ impl PartialConfig {
             workspace,
             mcp_servers,
             identity_workspaces,
+            theme,
         })
     }
 }
@@ -462,6 +481,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(load(ws(), None, flags).unwrap().bash_timeout_secs, 7);
+    }
+
+    #[test]
+    fn theme_table_resolves_and_overlays() {
+        let dir = std::env::temp_dir().join("crab-config-theme");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "model = \"m\"\n[theme]\nname = \"light\"\n[theme.colors]\nuser = \"red\"\n",
+        )
+        .unwrap();
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.theme.name, "light");
+        assert_eq!(
+            c.theme.token(crate::theme::Token::User).fg,
+            crate::theme::ThemeColor::Indexed(1)
+        );
+        // A `--theme` name merges over the file but keeps its token overrides.
+        let flags = PartialConfig {
+            theme: Some(crate::theme::ThemePartial {
+                name: Some("dark".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let c = load(ws(), Some(&path), flags).unwrap();
+        assert_eq!(c.theme.name, "dark");
+        assert_eq!(
+            c.theme.token(crate::theme::Token::User).fg,
+            crate::theme::ThemeColor::Indexed(1)
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

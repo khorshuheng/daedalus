@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crab_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
+use crab_core::theme::{Modifiers, StyleSpec, Theme, ThemeColor, Token};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
     Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
@@ -230,6 +231,11 @@ pub enum TranscriptLine {
     /// Streamed model reasoning (CRAB-139), rendered dim and italic.
     Thinking(String),
     Tool(String),
+    /// A finished tool call: the `✓`/`✗` marker line (CRAB-140 tokens).
+    ToolResult {
+        name: String,
+        ok: bool,
+    },
     Notice(String),
 }
 
@@ -291,9 +297,10 @@ impl UiModel {
             }
             Event::ToolEnd { name, ok, .. } => {
                 self.flush_thinking();
-                let marker = if *ok { "✓" } else { "✗" };
-                self.transcript
-                    .push(TranscriptLine::Tool(format!("{marker} {name}")));
+                self.transcript.push(TranscriptLine::ToolResult {
+                    name: name.clone(),
+                    ok: *ok,
+                });
             }
             Event::TurnEnd {} => {
                 self.flush_thinking();
@@ -634,6 +641,7 @@ pub fn run_tui(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     initial: &str,
     session_root: &Path,
+    theme: &Theme,
 ) -> Result<i32, String> {
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let mut stdout = std::io::stdout();
@@ -691,6 +699,7 @@ pub fn run_tui(
                         draw(
                             f,
                             &mut model,
+                            theme,
                             &input,
                             &picker,
                             rt.is_busy(),
@@ -1027,12 +1036,53 @@ fn run_command(
     false
 }
 
+/// Map a theme style spec onto a ratatui style.
+pub fn style(spec: StyleSpec) -> Style {
+    Style::default()
+        .fg(color(spec.fg))
+        .bg(color(spec.bg))
+        .add_modifier(modifiers(spec.modifiers))
+}
+
+fn color(c: ThemeColor) -> ratatui::style::Color {
+    match c {
+        ThemeColor::Default => ratatui::style::Color::Reset,
+        ThemeColor::Indexed(n) => ratatui::style::Color::Indexed(n),
+        ThemeColor::Rgb(r, g, b) => ratatui::style::Color::Rgb(r, g, b),
+    }
+}
+
+fn modifiers(m: Modifiers) -> Modifier {
+    let mut out = Modifier::empty();
+    if m.bold {
+        out |= Modifier::BOLD;
+    }
+    if m.dim {
+        out |= Modifier::DIM;
+    }
+    if m.italic {
+        out |= Modifier::ITALIC;
+    }
+    if m.underlined {
+        out |= Modifier::UNDERLINED;
+    }
+    if m.reversed {
+        out |= Modifier::REVERSED;
+    }
+    if m.crossed_out {
+        out |= Modifier::CROSSED_OUT;
+    }
+    out
+}
+
 /// Render a frame: transcript on top, input editor (with a visible caret) at
 /// the bottom, footer with an animated spinner while busy. The model/effort
 /// picker renders as a centered overlay sized to its choices (CRAB-127).
+#[allow(clippy::too_many_arguments)] // shell glue: one call site
 fn draw(
     f: &mut Frame,
     model: &mut UiModel,
+    theme: &Theme,
     input: &InputEditor,
     picker: &Option<Picker>,
     busy: bool,
@@ -1060,25 +1110,31 @@ fn draw(
         .map(|tl| match tl {
             TranscriptLine::User(t) => TLine::from(Span::styled(
                 format!("▶ {t}"),
-                ratatui::style::Style::default().fg(ratatui::style::Color::Cyan),
+                style(theme.token(Token::User)),
             )),
             TranscriptLine::Assistant(t) => TLine::from(Span::styled(
                 t.to_string(),
-                ratatui::style::Style::default().fg(ratatui::style::Color::White),
+                style(theme.token(Token::Assistant)),
             )),
             TranscriptLine::Thinking(t) => TLine::from(Span::styled(
                 format!("  {t}"),
-                ratatui::style::Style::default()
-                    .fg(ratatui::style::Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
+                style(theme.token(Token::Thinking)),
             )),
             TranscriptLine::Tool(t) => TLine::from(Span::styled(
                 format!("  {t}"),
-                ratatui::style::Style::default().fg(ratatui::style::Color::DarkGray),
+                style(theme.token(Token::Tool)),
             )),
+            TranscriptLine::ToolResult { name, ok } => {
+                let marker = if *ok { "✓" } else { "✗" };
+                let token = if *ok { Token::ToolOk } else { Token::ToolErr };
+                TLine::from(Span::styled(
+                    format!("  {marker} {name}"),
+                    style(theme.token(token)),
+                ))
+            }
             TranscriptLine::Notice(t) => TLine::from(Span::styled(
                 format!("• {t}"),
-                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+                style(theme.token(Token::Notice)),
             )),
         })
         .collect();
@@ -1087,7 +1143,13 @@ fn draw(
     // logical line count instead left the newest (wrapped) lines off-screen.
     let inner_w = chunks[0].width.saturating_sub(2);
     let transcript = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" crab "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(style(theme.token(Token::Border)))
+                .title(" crab ")
+                .title_style(style(theme.token(Token::Title))),
+        )
         .wrap(Wrap { trim: false });
     let total = transcript.line_count(inner_w);
     let top = model.scroll.resolve(total, chunks[0].height as usize);
@@ -1102,7 +1164,7 @@ fn draw(
                 .iter()
                 .map(|e| e.name().to_string())
                 .collect();
-            draw_picker(f, &names, *selected, title);
+            draw_picker(f, &names, *selected, title, theme);
         }
         None => {
             // Show the window of the text that contains the caret so long
@@ -1111,7 +1173,14 @@ fn draw(
             let inner_w = chunks[1].width.saturating_sub(2) as usize;
             let (window, cursor_col) = input.window(inner_w);
             let editor = Paragraph::new(window)
-                .block(Block::default().borders(Borders::ALL).title(" input "));
+                .style(style(theme.token(Token::Input)))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(style(theme.token(Token::Border)))
+                        .title(" input ")
+                        .title_style(style(theme.token(Token::Title))),
+                );
             f.render_widget(editor, chunks[1]);
             let x = chunks[1].x + 1 + cursor_col as u16;
             f.set_cursor_position(Position {
@@ -1123,8 +1192,7 @@ fn draw(
 
     // Footer/status.
     let status = format!(
-        "{} {} ({}) | effort {} | {} | {} | {:?} tokens | {} turn(s){}",
-        spinner,
+        " {} ({}) | effort {} | {} | {} | {:?} tokens | {} turn(s){}",
         model.state.model,
         provider,
         model.state.effort.name(),
@@ -1134,14 +1202,17 @@ fn draw(
         model.iterations,
         if model.settled { " · settled" } else { "" },
     );
-    let footer = Paragraph::new(TLine::from(Span::raw(status)));
+    let footer = Paragraph::new(TLine::from(vec![
+        Span::styled(spinner.to_string(), style(theme.token(Token::Spinner))),
+        Span::styled(status, style(theme.token(Token::Text))),
+    ]));
     f.render_widget(footer, chunks[2]);
 }
 
 /// Render the picker overlay: a centered window sized to the choices (not the
 /// 1-row input slot), cleared behind, with a viewport that keeps the selected
 /// row visible and the current selection highlighted.
-fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str) {
+fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str, theme: &Theme) {
     use ratatui::text::{Line as TLine, Span};
     use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -1161,13 +1232,19 @@ fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str) {
             let marker = if i == selected { "❯ " } else { "  " };
             let line = TLine::from(Span::raw(format!("{marker}{c}")));
             if i == selected {
-                line.style(Style::default().add_modifier(Modifier::BOLD))
+                line.style(style(theme.token(Token::Selection)))
             } else {
-                line
+                line.style(style(theme.token(Token::Text)))
             }
         })
         .collect();
-    let picker = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
+    let picker = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(style(theme.token(Token::Border)))
+            .title(title)
+            .title_style(style(theme.token(Token::Title))),
+    );
     f.render_widget(picker, area);
 }
 
@@ -1791,6 +1868,31 @@ mod tests {
         assert_eq!(picker_offset(4, 3), 2);
         // Degenerate zero-height viewport.
         assert_eq!(picker_offset(9, 0), 9);
+    }
+
+    // --- CRAB-140: theme → ratatui style mapping ---
+
+    #[test]
+    fn theme_style_maps_colors_and_modifiers() {
+        use crab_core::theme::{Modifiers, StyleSpec, ThemeColor};
+        let s = style(StyleSpec {
+            fg: ThemeColor::Rgb(1, 2, 3),
+            bg: ThemeColor::Indexed(4),
+            modifiers: Modifiers {
+                bold: true,
+                italic: true,
+                ..Default::default()
+            },
+        });
+        assert_eq!(s.fg, Some(ratatui::style::Color::Rgb(1, 2, 3)));
+        assert_eq!(s.bg, Some(ratatui::style::Color::Indexed(4)));
+        assert!(s.add_modifier.contains(Modifier::BOLD));
+        assert!(s.add_modifier.contains(Modifier::ITALIC));
+        // The terminal default maps to Reset.
+        assert_eq!(
+            style(StyleSpec::default()).fg,
+            Some(ratatui::style::Color::Reset)
+        );
     }
 
     // --- CRAB-128: animated spinner ---
