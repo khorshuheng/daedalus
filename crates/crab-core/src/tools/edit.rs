@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
+use super::mutation::with_file_mutation;
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
 
@@ -255,90 +256,100 @@ impl EditTool {
             };
 
         let resolved = resolve(workspace, Path::new(&path))?;
-        // Reject non-regular files before opening: a FIFO/device/socket would
-        // block the read forever, and blocking tasks cannot be cancelled
-        // (CRAB-139 review).
-        let meta = match std::fs::metadata(&resolved) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::NotFound(path));
-            }
-            Err(e) => return Err(ToolError::Io(e.to_string())),
-        };
-        if !meta.is_file() {
-            return Err(ToolError::Invalid(format!(
-                "refusing to edit '{path}': not a regular file"
-            )));
-        }
-        let bytes = match std::fs::read(&resolved) {
-            Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::NotFound(path));
-            }
-            Err(e) => return Err(ToolError::Io(e.to_string())),
-        };
-
-        let (has_bom, body) = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
-            (true, &bytes[3..])
-        } else {
-            (false, bytes.as_slice())
-        };
-        let content = match std::str::from_utf8(body) {
-            Ok(s) => s.to_string(),
-            Err(_) => {
-                return Err(ToolError::Invalid(format!(
-                    "file '{path}' is not valid UTF-8"
-                )))
-            }
-        };
-
-        let ending = detect_line_ending(&content);
-        let lf = normalize_lf(&content);
-
-        let mut replacements: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
-        for (idx, (old, new)) in edits.iter().enumerate() {
-            let old_lf = normalize_lf(old);
-            let new_lf = normalize_lf(new);
-            let (start, end) = locate_match(&lf, &old_lf, &path, idx, edits.len())?;
-            replacements.push((start, end, new_lf));
-        }
-
-        replacements.sort_by_key(|r| r.0);
-        for window in replacements.windows(2) {
-            if window[0].1 > window[1].0 {
-                return Err(ToolError::Invalid(format!(
-                    "edits overlap in '{path}': merge overlapping edits or target disjoint regions"
-                )));
-            }
-        }
-
-        let mut new_lf = lf.clone();
-        for (start, end, new) in replacements.iter().rev() {
-            new_lf.replace_range(*start..*end, new);
-        }
-        if new_lf == lf {
-            return Err(ToolError::Invalid(format!(
-                "no change made to '{path}': replacements produced identical content"
-            )));
-        }
-
-        let diff = unified_diff(&lf, &new_lf);
-
-        let restored = restore_line_endings(&new_lf, ending);
-        let mut out = Vec::with_capacity(restored.len() + 3);
-        if has_bom {
-            out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
-        }
-        out.extend_from_slice(restored.as_bytes());
-        std::fs::write(&resolved, &out).map_err(|e| ToolError::Io(e.to_string()))?;
-
-        Ok(ToolOutput {
-            content: format!(
-                "Successfully replaced {} block(s) in {path}\n\n{diff}",
-                edits.len()
-            ),
-        })
+        // Serialize with any concurrent write/edit of the same file (CRAB-146).
+        with_file_mutation(&resolved, || edit_at(&resolved, &path, &edits))
     }
+}
+
+/// The locked body of `edit`: reject non-regular files, read, match, and write.
+fn edit_at(
+    resolved: &Path,
+    path: &str,
+    edits: &[(String, String)],
+) -> Result<ToolOutput, ToolError> {
+    // Reject non-regular files before opening: a FIFO/device/socket would
+    // block the read forever, and blocking tasks cannot be cancelled
+    // (CRAB-139 review).
+    let meta = match std::fs::metadata(resolved) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolError::NotFound(path.to_string()));
+        }
+        Err(e) => return Err(ToolError::Io(e.to_string())),
+    };
+    if !meta.is_file() {
+        return Err(ToolError::Invalid(format!(
+            "refusing to edit '{path}': not a regular file"
+        )));
+    }
+    let bytes = match std::fs::read(resolved) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ToolError::NotFound(path.to_string()));
+        }
+        Err(e) => return Err(ToolError::Io(e.to_string())),
+    };
+
+    let (has_bom, body) = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        (true, &bytes[3..])
+    } else {
+        (false, bytes.as_slice())
+    };
+    let content = match std::str::from_utf8(body) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            return Err(ToolError::Invalid(format!(
+                "file '{path}' is not valid UTF-8"
+            )))
+        }
+    };
+
+    let ending = detect_line_ending(&content);
+    let lf = normalize_lf(&content);
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
+    for (idx, (old, new)) in edits.iter().enumerate() {
+        let old_lf = normalize_lf(old);
+        let new_lf = normalize_lf(new);
+        let (start, end) = locate_match(&lf, &old_lf, path, idx, edits.len())?;
+        replacements.push((start, end, new_lf));
+    }
+
+    replacements.sort_by_key(|r| r.0);
+    for window in replacements.windows(2) {
+        if window[0].1 > window[1].0 {
+            return Err(ToolError::Invalid(format!(
+                "edits overlap in '{path}': merge overlapping edits or target disjoint regions"
+            )));
+        }
+    }
+
+    let mut new_lf = lf.clone();
+    for (start, end, new) in replacements.iter().rev() {
+        new_lf.replace_range(*start..*end, new);
+    }
+    if new_lf == lf {
+        return Err(ToolError::Invalid(format!(
+            "no change made to '{path}': replacements produced identical content"
+        )));
+    }
+
+    let diff = unified_diff(&lf, &new_lf);
+
+    let restored = restore_line_endings(&new_lf, ending);
+    let mut out = Vec::with_capacity(restored.len() + 3);
+    if has_bom {
+        out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    out.extend_from_slice(restored.as_bytes());
+    std::fs::write(resolved, &out).map_err(|e| ToolError::Io(e.to_string()))?;
+
+    Ok(ToolOutput {
+        content: format!(
+            "Successfully replaced {} block(s) in {path}\n\n{diff}",
+            edits.len()
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -496,6 +507,40 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Invalid(_)));
+    }
+
+    /// CRAB-146: concurrent edits to the same file must not lose updates.
+    #[tokio::test]
+    async fn concurrent_edits_to_same_file_all_apply() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().to_path_buf();
+        let original: String = (0..8).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(root.join("a.txt"), &original).unwrap();
+        let ws = Workspace::new(root).unwrap();
+
+        let edits = (0..8).map(|i| {
+            let ws = ws.clone();
+            async move {
+                EditTool
+                    .run(
+                        &ws,
+                        &json!({
+                            "path": "a.txt",
+                            "oldText": format!("line{i}"),
+                            "newText": format!("LINE{i}")
+                        }),
+                        tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        for result in futures::future::join_all(edits).await {
+            result.unwrap();
+        }
+
+        let expected: String = (0..8).map(|i| format!("LINE{i}\n")).collect();
+        let got = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
+        assert_eq!(got, expected);
     }
 
     /// CRAB-139 review: a FIFO must be rejected before the read, which would

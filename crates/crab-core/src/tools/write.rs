@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
+use super::mutation::with_file_mutation;
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
 
@@ -52,25 +53,32 @@ impl WriteTool {
             .ok_or_else(|| ToolError::Argument("'content' must be a string".into()))?;
 
         let resolved = resolve(workspace, Path::new(&path))?;
-        // A FIFO/device/socket at this path would block `fs::write` on open, so
-        // reject an existing non-regular file. A missing path is a normal
-        // create (CRAB-139 review).
-        if let Ok(meta) = std::fs::metadata(&resolved) {
-            if !meta.is_file() {
-                return Err(ToolError::Invalid(format!(
-                    "refusing to write '{path}': not a regular file"
-                )));
-            }
-        }
-        if let Some(parent) = resolved.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
-        }
-        std::fs::write(&resolved, content).map_err(|e| ToolError::Io(e.to_string()))?;
-
-        Ok(ToolOutput {
-            content: format!("wrote {} bytes to {}", content.len(), path),
-        })
+        // Serialize with any concurrent write/edit of the same file (CRAB-146).
+        with_file_mutation(&resolved, || write_at(&resolved, &path, content))
     }
+}
+
+/// The locked body of `write`: reject non-regular targets, create parents, and
+/// write the content.
+fn write_at(resolved: &Path, path: &str, content: &str) -> Result<ToolOutput, ToolError> {
+    // A FIFO/device/socket at this path would block `fs::write` on open, so
+    // reject an existing non-regular file. A missing path is a normal
+    // create (CRAB-139 review).
+    if let Ok(meta) = std::fs::metadata(resolved) {
+        if !meta.is_file() {
+            return Err(ToolError::Invalid(format!(
+                "refusing to write '{path}': not a regular file"
+            )));
+        }
+    }
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
+    }
+    std::fs::write(resolved, content).map_err(|e| ToolError::Io(e.to_string()))?;
+
+    Ok(ToolOutput {
+        content: format!("wrote {} bytes to {}", content.len(), path),
+    })
 }
 
 #[cfg(test)]

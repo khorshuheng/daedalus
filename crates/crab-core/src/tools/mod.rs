@@ -7,6 +7,7 @@
 
 pub mod bash;
 pub mod edit;
+pub mod mutation;
 pub mod read;
 pub mod resolver;
 pub mod search;
