@@ -4,13 +4,17 @@
 //! kill the whole tree — including grandchildren — not just the direct child
 //! (CRAB-107 #14).
 //!
-//! Known limitation: a command that backgrounds a process while keeping
-//! stdout/stderr open (e.g. `sh -c "sleep 100 &"`) will block until that
-//! process exits, because the readers wait for the pipes to reach EOF.
+//! stdout/stderr are drained on reader threads. A command that leaves a
+//! background process holding the pipes open (`sh -c "sleep 100 &"`) does not
+//! block the tool: after the direct child exits the readers get a short grace
+//! to drain, then are stopped (CRAB-147, mirroring pi's `EXIT_STDIO_GRACE_MS`).
 
 use futures::future::BoxFuture;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
@@ -28,6 +32,62 @@ pub struct BashTool {
     pub default_timeout_secs: Option<u64>,
 }
 
+/// How long after the direct child exits to let the stdout/stderr readers reach
+/// EOF before proceeding without them (CRAB-147). A descendant that keeps a
+/// pipe write end open must not hold the tool hostage.
+const EXIT_STDIO_GRACE: Duration = Duration::from_millis(150);
+
+/// State shared between `run_command` and its reader threads.
+struct StreamCapture {
+    stdout: Mutex<Vec<u8>>,
+    stderr: Mutex<Vec<u8>>,
+    /// Set once the parent has stopped caring; readers then stop appending, so
+    /// a chatty descendant cannot grow the buffer after the result is read.
+    stop: AtomicBool,
+    /// Number of reader threads that have reached EOF.
+    done: AtomicUsize,
+}
+
+impl StreamCapture {
+    fn new() -> Self {
+        Self {
+            stdout: Mutex::new(Vec::new()),
+            stderr: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(false),
+            done: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Drain `pipe` into `capture` until EOF or the `stop` flag is set (CRAB-147).
+/// The thread exits on EOF; a descendant that keeps the pipe open can leave it
+/// blocked in `read`, which is deliberate — the parent never joins it.
+fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCapture>, stderr: bool) {
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if capture.stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let slot = if stderr {
+                        &capture.stderr
+                    } else {
+                        &capture.stdout
+                    };
+                    slot.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&chunk[..n]);
+                }
+                Err(_) => break,
+            }
+        }
+        capture.done.fetch_add(1, Ordering::SeqCst);
+    });
+}
+
 /// Run `sh -c <command>` capturing stdout/stderr, with an optional timeout in
 /// seconds. Both pipes are drained on background threads so a chatty child
 /// cannot deadlock the parent on a full pipe buffer while we wait.
@@ -37,9 +97,6 @@ fn run_command(
     timeout_secs: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<Output, ToolError> {
-    use std::io::Read;
-    use std::time::{Duration, Instant};
-
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -60,37 +117,37 @@ fn run_command(
     }
     let mut child = cmd.spawn().map_err(|e| ToolError::Io(e.to_string()))?;
 
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
+    let capture = Arc::new(StreamCapture::new());
+    if let Some(stdout) = child.stdout.take() {
+        drain(stdout, Arc::clone(&capture), false);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        drain(stderr, Arc::clone(&capture), true);
+    }
 
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
+    // `checked_add` so an absurd timeout is a bad argument, not a panic
+    // (defense in depth behind the argument/schema clamp in CRAB-153).
+    let deadline = match timeout_secs {
+        Some(s) => Some(
+            Instant::now()
+                .checked_add(Duration::from_secs(s))
+                .ok_or_else(|| ToolError::Argument(format!("'timeout' is too large: {s}")))?,
+        ),
+        None => None,
+    };
     let status = loop {
         match child.try_wait().map_err(|e| ToolError::Io(e.to_string()))? {
             Some(status) => break status,
             None => {
                 if cancel.is_cancelled() {
+                    capture.stop.store(true, Ordering::SeqCst);
                     kill_tree(&mut child);
                     return Err(ToolError::Cancelled);
                 }
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
+                        capture.stop.store(true, Ordering::SeqCst);
                         kill_tree(&mut child);
-                        // Do NOT join the reader threads here: a grandchild of
-                        // `sh` (e.g. `sh -c "a && b"`) may still hold the pipe
-                        // write end open, so joining would block past the
-                        // deadline. The threads are abandoned and finish once
-                        // every writer has exited.
                         return Err(ToolError::Timeout(format!(
                             "after {} seconds",
                             timeout_secs.unwrap()
@@ -103,12 +160,16 @@ fn run_command(
     };
 
     let _ = child.wait();
-    let stdout = out_handle
-        .join()
-        .map_err(|_| ToolError::Io("stdout reader panicked".into()))?;
-    let stderr = err_handle
-        .join()
-        .map_err(|_| ToolError::Io("stderr reader panicked".into()))?;
+    // Let the readers drain what the child already wrote, then stop them, so a
+    // descendant holding the pipe cannot block the join or grow the buffer
+    // (CRAB-147).
+    let drain_deadline = Instant::now() + EXIT_STDIO_GRACE;
+    while capture.done.load(Ordering::SeqCst) < 2 && Instant::now() < drain_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    capture.stop.store(true, Ordering::SeqCst);
+    let stdout = std::mem::take(&mut *capture.stdout.lock().unwrap_or_else(|e| e.into_inner()));
+    let stderr = std::mem::take(&mut *capture.stderr.lock().unwrap_or_else(|e| e.into_inner()));
 
     Ok(Output {
         status,
@@ -367,6 +428,29 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Timeout(_)));
+    }
+
+    /// CRAB-147: a backgrounded descendant that keeps the pipes open must not
+    /// hang the tool when no default timeout applies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_pipe_holder_does_not_hang() {
+        let (ws, _dir) = setup("pipe-holder");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
+        let start = std::time::Instant::now();
+        let out = tool
+            .run(&ws, &json!({"command": "sleep 5 & echo hi"}), token())
+            .await
+            .unwrap();
+        assert!(out.content.contains("hi"), "{}", out.content);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "returned too slowly: {:?}",
+            start.elapsed()
+        );
     }
 
     #[tokio::test]
