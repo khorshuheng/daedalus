@@ -31,6 +31,9 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 libc = "0.2"
 # NFKC normalization for fuzzy edit matching (CRAB-107 #15).
 unicode-normalization = "0.1"
+# CRAB-149: extended grapheme clusters so fuzzy NFKC composes across code
+# points (e.g. "e" + U+0301 -> "é") while keeping an exact source mapping.
+unicode-segmentation = "1"
 # CRAB-144: the native search tool walks like ripgrep (`ignore`) and matches
 # with `regex`.
 ignore = "0.4"

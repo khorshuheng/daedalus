@@ -52,18 +52,23 @@ fn fuzzy_char(c: char) -> char {
 }
 
 /// A normalized string plus, for each normalized char, the byte range it
-/// came from in the original. NFKC can expand one original char into several
-/// (e.g. ligatures, compat forms), so a match in normalized space maps back
-/// to the original through this table. Trailing whitespace on each line is
-/// trimmed and excluded from the map (pi's `normalizeForFuzzyMatch`).
+/// came from in the original. NFKC is applied per extended grapheme cluster
+/// (CRAB-149): it can compose across code points ("e" + U+0301 -> "é") and
+/// expand one cluster into several chars (ligatures, compat forms), so a
+/// match in normalized space maps back to the original through this table.
+/// Trailing whitespace on each line is trimmed and excluded from the map
+/// (pi's `normalizeForFuzzyMatch`).
 fn normalize_for_fuzzy(s: &str) -> (String, Vec<(usize, usize)>) {
     use unicode_normalization::UnicodeNormalization;
-    // NFKC-normalize char-by-char so each output char knows its source byte
-    // range (one original char may expand to several normalized chars).
+    use unicode_segmentation::UnicodeSegmentation;
+    // Normalize whole grapheme clusters rather than single chars: NFKC
+    // composition only happens within a combining sequence, i.e. within one
+    // extended grapheme cluster, so this equals whole-string NFKC while still
+    // letting each output char know its source byte range.
     let mut norm_chars: Vec<(char, (usize, usize))> = Vec::new();
-    for (byte_start, c) in s.char_indices() {
-        let byte_end = byte_start + c.len_utf8();
-        for n in c.nfkc() {
+    for (byte_start, grapheme) in s.grapheme_indices(true) {
+        let byte_end = byte_start + grapheme.len();
+        for n in grapheme.nfkc() {
             norm_chars.push((fuzzy_char(n), (byte_start, byte_end)));
         }
     }
@@ -489,6 +494,38 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read(&dir), "alpha   \ngamma   \n");
+    }
+
+    /// CRAB-149: NFKC composition across a code-point boundary must match
+    /// (precomposed file text vs a decomposed model oldText).
+    #[tokio::test]
+    async fn fuzzy_matches_decomposed_against_precomposed() {
+        // "café" with a precomposed U+00E9.
+        let (ws, dir) = setup("decomposed", "caf\u{00E9}\n");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "cafe\u{0301}", "newText": "tea"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&dir), "tea\n");
+    }
+
+    /// CRAB-149: bytes around a normalized match are preserved exactly.
+    #[tokio::test]
+    async fn fuzzy_match_preserves_surrounding_bytes() {
+        let (ws, dir) = setup("surround", "before cafe\u{0301} after\n");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "caf\u{00E9}", "newText": "X"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&dir), "before X after\n");
     }
 
     #[tokio::test]

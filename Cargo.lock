@@ -503,6 +503,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "unicode-normalization",
+ "unicode-segmentation",
 ]
 
 [[package]]
