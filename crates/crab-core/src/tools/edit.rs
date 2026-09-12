@@ -252,12 +252,12 @@ impl Tool for EditTool {
         &'a self,
         workspace: &'a Workspace,
         args: &'a Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
             let ws = workspace.clone();
             let args = args.clone();
-            tokio::task::spawn_blocking(move || EditTool.run_sync(&ws, &args))
+            tokio::task::spawn_blocking(move || EditTool.run_sync(&ws, &args, &cancel))
                 .await
                 .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
         })
@@ -266,7 +266,12 @@ impl Tool for EditTool {
 
 impl EditTool {
     /// The synchronous body, executed on the blocking pool (CRAB-130).
-    fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run_sync(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let edits: Vec<(String, String)> =
             if let Some(edits) = args.get("edits").and_then(|v| v.as_array()) {
@@ -287,7 +292,7 @@ impl EditTool {
 
         let resolved = resolve(workspace, Path::new(&path))?;
         // Serialize with any concurrent write/edit of the same file (CRAB-146).
-        with_file_mutation(&resolved, || edit_at(&resolved, &path, &edits))
+        with_file_mutation(&resolved, || edit_at(&resolved, &path, &edits, cancel))
     }
 }
 
@@ -296,7 +301,13 @@ fn edit_at(
     resolved: &Path,
     path: &str,
     edits: &[(String, String)],
+    cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
+    // Check before the read-modify-write so an aborted turn leaves the file
+    // untouched (CRAB-152).
+    if cancel.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
     // Reject non-regular files before opening: a FIFO/device/socket would
     // block the read forever, and blocking tasks cannot be cancelled
     // (CRAB-139 review).
@@ -372,6 +383,9 @@ fn edit_at(
         out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     }
     out.extend_from_slice(restored.as_bytes());
+    if cancel.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
     std::fs::write(resolved, &out).map_err(|e| ToolError::Io(e.to_string()))?;
 
     Ok(ToolOutput {
@@ -655,6 +669,24 @@ mod tests {
         let expected: String = (0..8).map(|i| format!("LINE{i}\n")).collect();
         let got = std::fs::read_to_string(dir.path().join("a.txt")).unwrap();
         assert_eq!(got, expected);
+    }
+
+    /// CRAB-152: a pre-cancelled token means the file is never rewritten.
+    #[tokio::test]
+    async fn cancelled_edit_leaves_file_unchanged() {
+        let (ws, dir) = setup("cancel", "hello");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let err = EditTool
+            .run(
+                &ws,
+                &json!({"path": "a.txt", "oldText": "hello", "newText": "bye"}),
+                cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Cancelled), "{err}");
+        assert_eq!(read(&dir), "hello");
     }
 
     /// CRAB-139 review: a FIFO must be rejected before the read, which would

@@ -31,12 +31,12 @@ impl Tool for WriteTool {
         &'a self,
         workspace: &'a Workspace,
         args: &'a Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         Box::pin(async move {
             let ws = workspace.clone();
             let args = args.clone();
-            tokio::task::spawn_blocking(move || WriteTool.run_sync(&ws, &args))
+            tokio::task::spawn_blocking(move || WriteTool.run_sync(&ws, &args, &cancel))
                 .await
                 .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
         })
@@ -45,7 +45,12 @@ impl Tool for WriteTool {
 
 impl WriteTool {
     /// The synchronous body, executed on the blocking pool (CRAB-130).
-    fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run_sync(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
         let path = arg_string(args, "path")?;
         let content = args
             .get("content")
@@ -54,13 +59,23 @@ impl WriteTool {
 
         let resolved = resolve(workspace, Path::new(&path))?;
         // Serialize with any concurrent write/edit of the same file (CRAB-146).
-        with_file_mutation(&resolved, || write_at(&resolved, &path, content))
+        with_file_mutation(&resolved, || write_at(&resolved, &path, content, cancel))
     }
 }
 
 /// The locked body of `write`: reject non-regular targets, create parents, and
 /// write the content.
-fn write_at(resolved: &Path, path: &str, content: &str) -> Result<ToolOutput, ToolError> {
+fn write_at(
+    resolved: &Path,
+    path: &str,
+    content: &str,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, ToolError> {
+    // Check before touching the filesystem so an aborted turn cannot write
+    // (CRAB-152); the single `fs::write` below cannot be interrupted anyway.
+    if cancel.is_cancelled() {
+        return Err(ToolError::Cancelled);
+    }
     // A FIFO/device/socket at this path would block `fs::write` on open, so
     // reject an existing non-regular file. A missing path is a normal
     // create (CRAB-139 review).
@@ -73,6 +88,9 @@ fn write_at(resolved: &Path, path: &str, content: &str) -> Result<ToolOutput, To
     }
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ToolError::Io(e.to_string()))?;
+    }
+    if cancel.is_cancelled() {
+        return Err(ToolError::Cancelled);
     }
     std::fs::write(resolved, content).map_err(|e| ToolError::Io(e.to_string()))?;
 
@@ -142,6 +160,20 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b/c.txt")).unwrap(),
             "deep"
         );
+    }
+
+    /// CRAB-152: a pre-cancelled token means the write never happens.
+    #[tokio::test]
+    async fn cancelled_write_leaves_no_file() {
+        let (ws, dir) = setup("cancel");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let err = WriteTool
+            .run(&ws, &json!({"path": "b.txt", "content": "x"}), cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Cancelled), "{err}");
+        assert!(!dir.path().join("b.txt").exists());
     }
 
     /// CRAB-139 review: writing to an existing FIFO would block on open.

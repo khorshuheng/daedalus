@@ -150,22 +150,32 @@ impl Tool for ReadTool {
         &'a self,
         workspace: &'a Workspace,
         args: &'a Value,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
         let max_output = self.max_output;
         Box::pin(async move {
             let ws = workspace.clone();
             let args = args.clone();
-            tokio::task::spawn_blocking(move || ReadTool { max_output }.run_sync(&ws, &args))
-                .await
-                .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
+            tokio::task::spawn_blocking(move || {
+                ReadTool { max_output }.run_sync(&ws, &args, &cancel)
+            })
+            .await
+            .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
         })
     }
 }
 
 impl ReadTool {
     /// The synchronous body, executed on the blocking pool (CRAB-130).
-    fn run_sync(&self, workspace: &Workspace, args: &Value) -> Result<ToolOutput, ToolError> {
+    fn run_sync(
+        &self,
+        workspace: &Workspace,
+        args: &Value,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         let paths = get_paths(args)?;
         let globs = get_globs(args)?;
         let offset = arg_usize(args, "offset")?.unwrap_or(1);
@@ -228,13 +238,16 @@ impl ReadTool {
         let multi = files.len() > 1;
         let mut out = String::new();
         for (i, f) in files.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
             let display = f
                 .strip_prefix(workspace.root())
                 .unwrap_or(f)
                 .display()
                 .to_string();
             // A file may vanish between listing and reading; skip it quietly.
-            let content = match self.read_one(f, &display, offset, limit) {
+            let content = match self.read_one(f, &display, offset, limit, cancel) {
                 Ok(c) => c,
                 Err(ToolError::NotFound(_)) => continue,
                 Err(e) => return Err(e),
@@ -276,12 +289,16 @@ impl ReadTool {
         display: &str,
         offset: usize,
         limit: Option<usize>,
+        cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
         let meta = std::fs::metadata(resolved).map_err(|e| ToolError::Io(e.to_string()))?;
         if meta.len() <= MAX_FULL_READ {
             self.read_whole(resolved, display, offset, limit)
         } else {
-            self.read_streaming(resolved, display, offset, limit)
+            self.read_streaming(resolved, display, offset, limit, cancel)
         }
     }
 
@@ -366,6 +383,7 @@ impl ReadTool {
         display: &str,
         offset: usize,
         limit: Option<usize>,
+        cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
         let file = std::fs::File::open(resolved).map_err(|e| ToolError::Io(e.to_string()))?;
         let reader = std::io::BufReader::new(file);
@@ -377,6 +395,9 @@ impl ReadTool {
         let mut more = false;
 
         for line in reader.lines() {
+            if cancel.is_cancelled() {
+                return Err(ToolError::Cancelled);
+            }
             let line = line.map_err(|e| ToolError::Io(e.to_string()))?;
             line_no += 1;
             if line_no <= start {
@@ -493,6 +514,20 @@ mod tests {
             )),
             Err(ToolError::NotFound(_))
         ));
+    }
+
+    /// CRAB-152: a pre-cancelled token stops the read before any work.
+    #[tokio::test]
+    async fn cancelled_read_returns_cancelled() {
+        let (ws, _dir) = setup("cancel", "x\n");
+        let tool = ReadTool { max_output: 1000 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let err = tool
+            .run(&ws, &json!({"path": "a.txt"}), cancel)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Cancelled), "{err}");
     }
 
     #[tokio::test]
