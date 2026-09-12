@@ -31,6 +31,10 @@ keyring = { version = "3", features = ["sync-secret-service"] }
 libc = "0.2"
 # NFKC normalization for fuzzy edit matching (CRAB-107 #15).
 unicode-normalization = "0.1"
+# CRAB-144: the native search tool walks like ripgrep (`ignore`) and matches
+# with `regex`.
+ignore = "0.4"
+regex = "1"
 # CRAB-133: MCP client (official Rust SDK). The spec originally named
 # "rig-rmcp"; rig-core 0.42 has no MCP integration, so this uses `rmcp`
 # directly. Client + stdio child-process + streamable-http transports.

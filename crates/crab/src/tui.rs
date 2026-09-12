@@ -1313,7 +1313,7 @@ mod tests {
         );
     }
 
-    /// CRAB-133: `/tools` lists the registered toolset (the four built-ins
+    /// CRAB-133: `/tools` lists the registered toolset (the built-ins
     /// when no MCP servers are configured).
     #[test]
     fn tools_command_lists_builtins() {
@@ -1329,7 +1329,7 @@ mod tests {
             &mut login_pending,
             SlashCommand::Tools,
         );
-        for builtin in ["read", "bash", "edit", "write"] {
+        for builtin in ["read", "bash", "search", "edit", "write"] {
             assert!(
                 model
                     .transcript

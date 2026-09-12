@@ -1,4 +1,4 @@
-//! The tool layer (CRAB-102): the four built-in tools, plus external MCP
+//! The tool layer (CRAB-102): the built-in tools, plus external MCP
 //! tools (CRAB-133) registered at runtime.
 //!
 //! A shared `Tool` trait with `name()`, `schema()` (JSON Schema for arguments)
@@ -9,6 +9,7 @@ pub mod bash;
 pub mod edit;
 pub mod read;
 pub mod resolver;
+pub mod search;
 pub mod write;
 
 use std::path::Path;

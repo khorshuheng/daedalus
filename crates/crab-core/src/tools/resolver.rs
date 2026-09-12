@@ -5,7 +5,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    bash::BashTool, edit::EditTool, read::ReadTool, write::WriteTool, Tool, ToolError, ToolOutput,
+    bash::BashTool, edit::EditTool, read::ReadTool, search::SearchTool, write::WriteTool, Tool,
+    ToolError, ToolOutput,
 };
 use crate::workspace::Workspace;
 
@@ -22,14 +23,14 @@ struct ToolEntry {
     external: bool,
 }
 
-/// The four built-in tools plus any configured MCP tools, sharing one output
+/// The built-in tools plus any configured MCP tools, sharing one output size
 /// cap.
 pub struct ToolSet {
     tools: Vec<ToolEntry>,
 }
 
 impl ToolSet {
-    /// The four built-ins, in a stable order (no default bash timeout).
+    /// The built-ins, in a stable order (no default bash timeout).
     pub fn new(max_output: usize) -> Self {
         Self::with_bash_timeout(max_output, None)
     }
@@ -53,6 +54,11 @@ impl ToolSet {
             }),
         );
         set.push(
+            "search",
+            "Search file contents with a regex (ripgrep-style: respects .gitignore, skips hidden and binary files).",
+            Box::new(SearchTool { max_output }),
+        );
+        set.push(
             "edit",
             "Apply precise, validated text replacements to a file.",
             Box::new(EditTool),
@@ -65,8 +71,8 @@ impl ToolSet {
         set
     }
 
-    /// Build the tool set from config: the four built-ins plus every enabled
-    /// MCP server (CRAB-133). Returns the set and non-fatal warnings for
+    /// Build the tool set from config: the built-ins plus every enabled MCP
+    /// server (CRAB-133). Returns the set and non-fatal warnings for
     /// servers that failed to start — the agent runs with the tools that did.
     pub fn from_config(config: &crate::config::Config, max_output: usize) -> (Self, Vec<String>) {
         let mut set = Self::with_bash_timeout(max_output, config.bash_default_timeout());
@@ -217,14 +223,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown tool 'frobnicate'"));
-        assert!(err.to_string().contains("read, bash, edit, write"));
+        assert!(err.to_string().contains("search"));
     }
 
     #[test]
-    fn exposes_four_tool_schemas() {
+    fn exposes_builtin_tool_schemas() {
         let ts = ToolSet::new(1000);
         let schemas = ts.tool_schemas();
-        assert_eq!(schemas.len(), 4);
+        assert_eq!(schemas.len(), 5);
         for s in &schemas {
             assert!(s.get("name").is_some());
             assert!(s.get("description").is_some());
@@ -262,7 +268,7 @@ mod tests {
                 name: "mcp__echo__echo".into(),
             }),
         );
-        assert_eq!(ts.tool_schemas().len(), 5);
+        assert_eq!(ts.tool_schemas().len(), 6);
         assert!(ts
             .listing()
             .iter()
@@ -349,11 +355,11 @@ mod tests {
     }
 
     #[test]
-    fn from_config_without_mcp_keeps_the_four_builtins() {
+    fn from_config_without_mcp_keeps_the_builtins() {
         let (_dir, ws) = workspace("fromconfig");
         let cfg = crate::config::Config::defaults(ws.root().to_path_buf());
         let (ts, warnings) = ToolSet::from_config(&cfg, 1000);
         assert!(warnings.is_empty());
-        assert_eq!(ts.tool_schemas().len(), 4);
+        assert_eq!(ts.tool_schemas().len(), 5);
     }
 }
