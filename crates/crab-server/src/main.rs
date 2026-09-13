@@ -5,7 +5,7 @@
 //! behind `tailscale serve` (HTTPS + tailnet identity); binding a
 //! non-loopback address prints a warning. No public exposure is provided.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use crab_core::config::{Config, PartialConfig, PROVIDERS};
@@ -55,6 +55,18 @@ fn parse_max_iterations(s: &str) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Prune `workspace`'s sessions to `keep`, returning how many were removed.
+/// Best-effort: a failure warns and counts as zero.
+fn prune_sessions(root: &Path, workspace: &Path, keep: usize) -> usize {
+    match session::prune_sessions(root, workspace, keep) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("crab-server: warning: could not prune sessions: {e}");
+            0
+        }
+    }
+}
+
 /// Print the supported providers for `--help` clarity when none match.
 fn provider_names() -> String {
     PROVIDERS
@@ -79,6 +91,27 @@ async fn main() -> Result<(), String> {
     let config = Config::load(default_workspace, cli.config.as_deref(), flags, None)
         .map_err(|e| format!("{e}\n(supported providers: {})", provider_names()))?;
     let workspace = Workspace::new(config.workspace.clone())?;
+
+    // Session GC: keep only the newest `session_retention` sessions for the
+    // default workspace and every identity-mapped workspace (0 disables).
+    // `?workspace=` overrides are only known per request, so they are not
+    // swept here. Best-effort: failures only warn.
+    if config.session_retention > 0 {
+        let root = session::default_root();
+        let mut removed = prune_sessions(&root, workspace.root(), config.session_retention);
+        for path in config.identity_workspaces.values() {
+            match Workspace::new(path.clone()) {
+                Ok(ws) => removed += prune_sessions(&root, ws.root(), config.session_retention),
+                Err(e) => eprintln!("crab-server: warning: identity workspace invalid: {e}"),
+            }
+        }
+        if removed > 0 {
+            eprintln!(
+                "crab-server: pruned {removed} old session(s) (keeping {})",
+                config.session_retention
+            );
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await

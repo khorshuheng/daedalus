@@ -135,9 +135,11 @@ impl Tool for ReadTool {
                     "description": "File(s) to read, relative to the workspace. Pass a directory together with 'glob' to read matching files."
                 },
                 "glob": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "When 'path' is a directory, read the files matching these globs (a leading '!' excludes)."
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ],
+                    "description": "When 'path' is a directory, read the files matching these glob(s) (a leading '!' excludes). One glob or a list."
                 },
                 "offset": { "type": "integer", "minimum": 1, "description": "1-indexed starting line (applies per file)." },
                 "limit": { "type": "integer", "minimum": 1, "description": "Number of lines to return per file." }

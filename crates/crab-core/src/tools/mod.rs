@@ -71,7 +71,8 @@ pub trait Tool: Send + Sync {
 
 /// Validate `args` against the small JSON-Schema subset this crate's tools
 /// declare (CRAB-107 #9): an object with `properties` (string/integer/array
-/// of objects, optional `minimum`), `required`, and `oneOf`. The tools are a
+/// of objects, optional `minimum`, or a `oneOf` of those), `required`, and a
+/// top-level `oneOf`. The tools are a
 /// closed set we author, so validating against exactly the subset we emit
 /// (rather than pulling a full JSON-Schema engine) is sufficient and keeps
 /// bad model args from reaching executors. Returns a clear `ToolError`
@@ -138,35 +139,34 @@ pub(crate) fn validate_args(schema: &Value, args: &Value) -> Result<(), ToolErro
 
 /// Validate a single property value against its subschema.
 fn check_property(key: &str, prop: &Value, value: &Value) -> Result<(), ToolError> {
-    let type_name = prop.get("type").and_then(Value::as_str).unwrap_or("");
-    let ok = match type_name {
-        "string" => value.is_string(),
-        "integer" => value.is_i64() || value.is_u64(),
-        "array" => {
-            if !value.is_array() {
-                false
-            } else if let Some(items) = prop.get("items") {
-                let items_type = items.get("type").and_then(Value::as_str).unwrap_or("");
-                value.as_array().is_some_and(|arr| {
-                    arr.iter().all(|it| match items_type {
-                        "object" => it.is_object(),
-                        "string" => it.is_string(),
-                        "integer" => it.is_i64() || it.is_u64(),
-                        _ => true,
-                    })
-                })
-            } else {
-                true
+    // `oneOf`: the value must satisfy at least one branch. `read` and `search`
+    // declare `path`/`glob` this way because `get_paths`/`get_globs` accept a
+    // single string or an array of strings.
+    if let Some(branches) = prop.get("oneOf").and_then(Value::as_array) {
+        return match branches.iter().find(|branch| type_matches(branch, value)) {
+            Some(branch) => check_bounds(key, branch, value),
+            None => {
+                let expected = branches
+                    .iter()
+                    .map(describe_type)
+                    .collect::<Vec<_>>()
+                    .join(" or ");
+                Err(ToolError::Argument(format!("'{key}' must be {expected}")))
             }
-        }
-        "object" => value.is_object(),
-        _ => true,
-    };
-    if !ok {
+        };
+    }
+
+    if !type_matches(prop, value) {
         return Err(ToolError::Argument(format!(
-            "'{key}' must be a {type_name}"
+            "'{key}' must be {}",
+            describe_type(prop)
         )));
     }
+    check_bounds(key, prop, value)
+}
+
+/// Apply a subschema's `minimum`/`maximum` to an integer value.
+fn check_bounds(key: &str, prop: &Value, value: &Value) -> Result<(), ToolError> {
     if let Some(min) = prop.get("minimum").and_then(Value::as_i64) {
         if let Some(n) = value.as_i64() {
             if n < min {
@@ -182,6 +182,55 @@ fn check_property(key: &str, prop: &Value, value: &Value) -> Result<(), ToolErro
         }
     }
     Ok(())
+}
+
+/// Does `value` satisfy the `type` (and `items`) constraint declared by `prop`?
+/// A missing or unknown `type` accepts anything: the subset is deliberately
+/// permissive, and each executor re-checks its own arguments.
+fn type_matches(prop: &Value, value: &Value) -> bool {
+    match prop.get("type").and_then(Value::as_str).unwrap_or("") {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "array" => {
+            let Some(items) = value.as_array() else {
+                return false;
+            };
+            let items_type = prop
+                .get("items")
+                .and_then(|i| i.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            items.iter().all(|it| match items_type {
+                "object" => it.is_object(),
+                "string" => it.is_string(),
+                "integer" => it.is_i64() || it.is_u64(),
+                _ => true,
+            })
+        }
+        "object" => value.is_object(),
+        _ => true,
+    }
+}
+
+/// Human-readable type of a subschema for an error message, with the correct
+/// article (`an array`, not `a array`).
+fn describe_type(prop: &Value) -> String {
+    match prop.get("type").and_then(Value::as_str).unwrap_or("") {
+        "string" => "a string".to_string(),
+        "integer" => "an integer".to_string(),
+        "object" => "an object".to_string(),
+        "array" => match prop
+            .get("items")
+            .and_then(|i| i.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some("string") => "an array of strings".to_string(),
+            Some("object") => "an array of objects".to_string(),
+            Some("integer") => "an array of integers".to_string(),
+            _ => "an array".to_string(),
+        },
+        other => format!("a {other}"),
+    }
 }
 
 /// Truncate `s` to at most `max` bytes keeping the *tail* (last bytes),
@@ -334,5 +383,43 @@ mod validate_tests {
             &json!({"path": "f", "oldText": "a", "newText": "b"})
         )
         .is_ok());
+    }
+
+    #[test]
+    fn one_of_property_accepts_either_branch() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "glob": {"oneOf": [
+                    {"type": "string"},
+                    {"type": "array", "items": {"type": "string"}}
+                ]}
+            },
+            "required": ["glob"]
+        });
+        // A bare string was previously rejected by an array-only declaration
+        // even though the executor accepts it (regression: search `glob`).
+        assert!(validate_args(&schema, &json!({"glob": "*.rs"})).is_ok());
+        assert!(validate_args(&schema, &json!({"glob": ["*.rs", "!vendor/*"]})).is_ok());
+        let err = validate_args(&schema, &json!({"glob": 7})).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("'glob' must be a string or an array of strings"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn type_error_uses_the_right_article() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"glob": {"type": "array", "items": {"type": "string"}}},
+            "required": []
+        });
+        let err = validate_args(&schema, &json!({"glob": "*.rs"})).unwrap_err();
+        assert!(
+            err.to_string().contains("must be an array of strings"),
+            "{err}"
+        );
     }
 }

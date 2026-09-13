@@ -53,9 +53,11 @@ impl Tool for SearchTool {
                 "pattern": { "type": "string", "description": "Regex to search for (Rust regex syntax)." },
                 "path": { "type": "string", "description": "File or directory to search (default: the workspace root)." },
                 "glob": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Include/exclude globs; a leading '!' excludes (rg -g). Repeatable."
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ],
+                    "description": "Include/exclude glob(s); a leading '!' excludes (rg -g). One glob or a list."
                 },
                 "type": { "type": "string", "description": "Only search files of this type, e.g. rust, py, js (rg -t)." },
                 "ignore_case": { "type": "boolean", "description": "Case-insensitive (rg -i)." },

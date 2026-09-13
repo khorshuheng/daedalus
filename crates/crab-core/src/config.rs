@@ -1,11 +1,11 @@
 //! Configuration (CRAB-105, revised CRAB-118).
 //!
 //! Keys: provider, base URL, model, temperature, max_iterations, output size
-//! caps, workspace. Sources merge with documented precedence:
-//! `flags > config file > defaults` (the `CRAB_*` env layer was removed in
-//! CRAB-118). API keys are **not** a config key: they are resolved separately
-//! via `credential` (`--api-key` > provider-native env > OS keyring), so a
-//! secret can never be stored in the config file.
+//! caps, workspace, session retention. Sources merge with documented
+//! precedence: `flags > config file > defaults` (the `CRAB_*` env layer was
+//! removed in CRAB-118). API keys are **not** a config key: they are resolved
+//! separately via `credential` (`--api-key` > provider-native env > OS
+//! keyring), so a secret can never be stored in the config file.
 //!
 //! Supported providers: a registry (`PROVIDERS`) grown from the original
 //! `openai`/`anthropic`/`deepseek` set in CRAB-132 — provider + model +
@@ -181,6 +181,9 @@ pub struct Config {
     /// Rough token budget for the conversation history. The oldest tool turns
     /// are dropped once exceeded so a session cannot blow the model context.
     pub max_context_tokens: usize,
+    /// Sessions to keep per workspace; older ones are pruned at startup.
+    /// `0` disables pruning (keep every session).
+    pub session_retention: usize,
     /// The single root directory the agent is allowed to touch.
     pub workspace: PathBuf,
     /// External MCP tool servers (CRAB-133), started at runtime construction.
@@ -217,6 +220,7 @@ impl Config {
             max_retries: 2,
             // Leave headroom for the completion output (max_tokens).
             max_context_tokens: DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096),
+            session_retention: 10,
             workspace,
             mcp_servers: Vec::new(),
             identity_workspaces: BTreeMap::new(),
@@ -248,6 +252,8 @@ pub struct PartialConfig {
     pub bash_timeout_secs: Option<u64>,
     pub max_retries: Option<usize>,
     pub max_context_tokens: Option<usize>,
+    /// Sessions to keep per workspace at startup (default 10; `0` = keep all).
+    pub session_retention: Option<usize>,
     pub workspace: Option<PathBuf>,
     /// `[[mcp_servers]]` tables (CRAB-133).
     #[serde(default)]
@@ -282,6 +288,7 @@ impl PartialConfig {
         take!(bash_timeout_secs);
         take!(max_retries);
         take!(max_context_tokens);
+        take!(session_retention);
         take!(workspace);
         take!(mcp_servers);
         take!(identity_workspaces);
@@ -375,6 +382,7 @@ impl PartialConfig {
             bash_timeout_secs,
             max_retries: self.max_retries.unwrap_or(2),
             max_context_tokens,
+            session_retention: self.session_retention.unwrap_or(10),
             workspace,
             mcp_servers,
             identity_workspaces,
@@ -457,6 +465,24 @@ mod tests {
         assert_eq!(c.api_key, None);
         assert_eq!(c.max_iterations, 30);
         assert_eq!(c.max_context_tokens, DEFAULT_CONTEXT_WINDOW - 4_096);
+        assert_eq!(c.session_retention, 10);
+    }
+
+    #[test]
+    fn session_retention_is_overridable_and_zero_is_allowed() {
+        let flags = PartialConfig {
+            model: Some("test-model".into()),
+            session_retention: Some(3),
+            ..Default::default()
+        };
+        assert_eq!(load(ws(), None, flags).unwrap().session_retention, 3);
+        // `0` is the documented "keep everything" value, not an error.
+        let flags = PartialConfig {
+            model: Some("test-model".into()),
+            session_retention: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(load(ws(), None, flags).unwrap().session_retention, 0);
     }
 
     #[test]

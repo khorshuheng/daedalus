@@ -353,6 +353,183 @@ pub fn file_id(path: &Path) -> Option<String> {
     value.get("id")?.as_str().map(|s| s.to_string())
 }
 
+/// A saved session offered by the `/resume` picker. Sessions store no title of
+/// their own (unlike pi), so the label is derived from the first user message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSummary {
+    pub path: PathBuf,
+    /// Creation time from the header (epoch millis); the sort key.
+    pub created_at: u64,
+    /// First user message on one clipped line, or a placeholder when empty.
+    pub title: String,
+}
+
+/// Longest derived session title, in characters.
+const MAX_TITLE_CHARS: usize = 80;
+
+/// Cap the title scan so listing many large sessions stays cheap. The first
+/// user message is always near the top, so this is never hit in practice.
+const MAX_SUMMARY_LINES: usize = 500;
+
+/// Load a specific saved session file. Used by the `/resume` picker after the
+/// user chooses a row (unlike [`load_previous`], which takes the newest).
+pub fn load_at(path: &Path) -> Result<Vec<Message>, SessionError> {
+    load_file(path)
+}
+
+/// Every saved session for `cwd`, newest first, for the `/resume` picker.
+/// Unreadable files are skipped rather than failing the whole listing.
+pub fn list_sessions(root: &Path, cwd: &Path) -> Result<Vec<SessionSummary>, SessionError> {
+    let dir = session_dir(root, cwd);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<SessionSummary> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(SessionError::Io)? {
+        let entry = entry.map_err(SessionError::Io)?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Some(summary) = summarize(&path) {
+            out.push(summary);
+        }
+    }
+    // Newest first; ties broken by path (descending) so the order is stable.
+    out.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| b.path.cmp(&a.path))
+    });
+    Ok(out)
+}
+
+/// Delete all but the `keep` most recent sessions for `cwd`, returning how many
+/// files were removed. `keep == 0` disables pruning. Recency matches the
+/// `/resume` picker (the header's `createdAt`, newest first); a file whose
+/// header cannot be read falls back to its modification time so it stays
+/// eligible. Non-`.jsonl` files (e.g. leftover atomic-write temps) are left
+/// alone.
+pub fn prune_sessions(root: &Path, cwd: &Path, keep: usize) -> Result<usize, SessionError> {
+    if keep == 0 {
+        return Ok(0);
+    }
+    let dir = session_dir(root, cwd);
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let mut sessions: Vec<(u64, PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(SessionError::Io)? {
+        let entry = entry.map_err(SessionError::Io)?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let created = header_created_at(&path).or_else(|| {
+            entry
+                .metadata()
+                .ok()?
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+        });
+        sessions.push((created.unwrap_or(0), path));
+    }
+    // Newest first, ties broken by path (descending), matching `list_sessions`.
+    sessions.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut removed = 0;
+    for (_, path) in sessions.into_iter().skip(keep) {
+        std::fs::remove_file(&path).map_err(SessionError::Io)?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+/// The `createdAt` from a session file's first header line, or `None` when it
+/// has no parseable header (the caller falls back to the file's mtime).
+fn header_created_at(path: &Path) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).ok()?;
+        return value.get("createdAt").and_then(serde_json::Value::as_u64);
+    }
+    None
+}
+
+/// Read just the header (`created_at`) and the first user message from a
+/// session file. `None` when the file has no usable header.
+fn summarize(path: &Path) -> Option<SessionSummary> {
+    let file = File::open(path).ok()?;
+    let mut created_at = 0u64;
+    let mut have_header = false;
+    let mut title = None;
+    for line in BufReader::new(file).lines().take(MAX_SUMMARY_LINES) {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Entry>(&line) {
+            Ok(Entry::Header { created_at: ts, .. }) if !have_header => {
+                created_at = ts;
+                have_header = true;
+            }
+            Ok(_) if !have_header => return None,
+            Ok(Entry::User { text }) => {
+                // Skip user messages that yield no text (e.g. whitespace only)
+                // and keep looking: they make an empty picker row.
+                let line_title = first_line(&text);
+                if !line_title.is_empty() {
+                    title = Some(line_title);
+                    break;
+                }
+            }
+            Ok(_) => {}
+            // A corrupt/unreadable line costs us the title, not the session:
+            // keep the summary so a torn tail does not hide a resumable file.
+            Err(_) => break,
+        }
+    }
+    if !have_header {
+        return None;
+    }
+    Some(SessionSummary {
+        path: path.to_path_buf(),
+        created_at,
+        title: title.unwrap_or_else(|| "(empty session)".to_string()),
+    })
+}
+
+/// The first non-empty line of `text`, trimmed and clipped for a picker row.
+/// Control characters are stripped (a user message must not be able to inject
+/// escape sequences into the terminal) and runs of whitespace collapse to one
+/// space, so the label is always a single clean line.
+fn first_line(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(|l| {
+            l.chars()
+                // Keep whitespace (it becomes a separator below); drop other
+                // control characters so no escape sequence reaches the screen.
+                .filter(|c| !c.is_control() || c.is_whitespace())
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let mut out: String = line.chars().take(MAX_TITLE_CHARS).collect();
+    if line.chars().count() > MAX_TITLE_CHARS {
+        out.push('…');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +604,140 @@ mod tests {
         second.push(Message::User("another turn".into()));
         save_session(&root, &cwd(), &second).unwrap();
         assert_eq!(load_previous(&root, &cwd()).unwrap().unwrap(), second);
+    }
+
+    #[test]
+    fn lists_sessions_newest_first_with_derived_titles() {
+        let (_guard, root) = tempdir("list");
+        save_session(&root, &cwd(), &sample_history()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = vec![Message::User("second session title\nand a body".into())];
+        let second_path = save_session(&root, &cwd(), &second).unwrap();
+
+        let sessions = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        // Newest first, and the title is the first line of the first user
+        // message (not the whole message).
+        assert_eq!(sessions[0].path, second_path);
+        assert_eq!(sessions[0].title, "second session title");
+        assert_eq!(sessions[1].title, "make a greeting");
+
+        // A different cwd has its own list.
+        assert!(list_sessions(&root, &PathBuf::from("/tmp/other-project"))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_without_a_user_message_gets_a_placeholder_title() {
+        let (_guard, root) = tempdir("empty");
+        save_session(&root, &cwd(), &[Message::System("sys".into())]).unwrap();
+        let sessions = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "(empty session)");
+    }
+
+    #[test]
+    fn blank_user_messages_are_skipped_for_the_title() {
+        let (_guard, root) = tempdir("blank");
+        let history = vec![
+            Message::User("   \n\t ".into()),
+            Message::User("real title".into()),
+        ];
+        save_session(&root, &cwd(), &history).unwrap();
+        let sessions = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(sessions[0].title, "real title");
+    }
+
+    #[test]
+    fn titles_strip_control_characters_and_collapse_whitespace() {
+        let (_guard, root) = tempdir("sanitize");
+        let history = vec![Message::User("a\x1b[31mt\tb   c".into())];
+        save_session(&root, &cwd(), &history).unwrap();
+        let sessions = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(sessions[0].title, "a[31mt b c");
+    }
+
+    #[test]
+    fn a_torn_tail_does_not_hide_the_session() {
+        let (_guard, root) = tempdir("torn-list");
+        // No user message, so the scan runs to the corrupt final line.
+        let path = save_session(&root, &cwd(), &[Message::System("sys".into())]).unwrap();
+        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"kind\":\"user\",\"text\":\"partial").unwrap();
+        drop(f);
+
+        let sessions = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(sessions.len(), 1, "a torn tail must not hide the session");
+        assert_eq!(sessions[0].path, path);
+        assert_eq!(sessions[0].title, "(empty session)");
+    }
+
+    #[test]
+    fn load_at_loads_the_chosen_file() {
+        let (_guard, root) = tempdir("load-at");
+        let first = sample_history();
+        let first_path = save_session(&root, &cwd(), &first).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        save_session(&root, &cwd(), &[Message::User("newer".into())]).unwrap();
+        // `load_at` ignores recency: it loads exactly the file given.
+        assert_eq!(load_at(&first_path).unwrap(), first);
+    }
+
+    #[test]
+    fn long_titles_are_clipped() {
+        let (_guard, root) = tempdir("clip");
+        let long = "x".repeat(MAX_TITLE_CHARS + 50);
+        save_session(&root, &cwd(), &[Message::User(long)]).unwrap();
+        let sessions = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(sessions[0].title.chars().count(), MAX_TITLE_CHARS + 1);
+        assert!(sessions[0].title.ends_with('…'));
+    }
+
+    #[test]
+    fn prune_keeps_only_the_newest_n() {
+        let (_guard, root) = tempdir("prune");
+        let mut paths = Vec::new();
+        for i in 0..4 {
+            paths.push(save_session(&root, &cwd(), &[Message::User(format!("s{i}"))]).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(prune_sessions(&root, &cwd(), 2).unwrap(), 2);
+        let left = list_sessions(&root, &cwd()).unwrap();
+        assert_eq!(left.len(), 2);
+        // The newest two survive; the older two are gone.
+        assert_eq!(left[0].path, paths[3]);
+        assert_eq!(left[1].path, paths[2]);
+        assert!(!paths[0].exists() && !paths[1].exists());
+    }
+
+    #[test]
+    fn prune_zero_disables_pruning() {
+        let (_guard, root) = tempdir("prune-zero");
+        for _ in 0..3 {
+            save_session(&root, &cwd(), &sample_history()).unwrap();
+        }
+        assert_eq!(prune_sessions(&root, &cwd(), 0).unwrap(), 0);
+        assert_eq!(list_sessions(&root, &cwd()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn prune_is_scoped_to_one_workspace_and_leaves_tmp_files() {
+        let (_guard, root) = tempdir("prune-scope");
+        for _ in 0..3 {
+            save_session(&root, &cwd(), &sample_history()).unwrap();
+        }
+        let other = PathBuf::from("/tmp/other-project");
+        let other_session = save_session(&root, &other, &sample_history()).unwrap();
+        // A leftover atomic-write temp is not a session and must survive.
+        let tmp = session_dir(&root, &cwd()).join("stale.tmp");
+        std::fs::write(&tmp, b"partial").unwrap();
+
+        assert_eq!(prune_sessions(&root, &cwd(), 1).unwrap(), 2);
+        assert!(tmp.exists(), "non-jsonl files are not sessions");
+        assert!(other_session.exists(), "other workspaces are untouched");
+        assert_eq!(list_sessions(&root, &cwd()).unwrap().len(), 1);
+        assert_eq!(list_sessions(&root, &other).unwrap().len(), 1);
     }
 
     #[test]

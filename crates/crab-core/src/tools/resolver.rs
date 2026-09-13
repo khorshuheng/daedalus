@@ -255,6 +255,26 @@ mod tests {
         assert!(err.to_string().contains("'path' must be a string"));
     }
 
+    /// Regression: `search`'s schema declared `glob` as array-only while the
+    /// executor accepts a bare string, so a string glob was rejected by
+    /// validation before the tool ever ran.
+    #[tokio::test]
+    async fn search_accepts_a_bare_string_glob() {
+        let (_dir, ws) = workspace("glob");
+        std::fs::write(ws.root().join("a.rs"), "needle\n").unwrap();
+        let ts = ToolSet::new(1000);
+        let out = ts
+            .execute(
+                &ws,
+                "search",
+                &json!({"pattern": "needle", "glob": "*.rs"}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("needle"), "{}", out.content);
+    }
+
     /// A dynamically registered tool (as an MCP server would contribute) is
     /// discoverable, listed, schema-exposed, and executable.
     #[tokio::test]

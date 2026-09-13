@@ -4,10 +4,11 @@
 //! It sends commands (`prompt`/`steer`/`abort`/`set_model`/`set_effort`/
 //! `switch_workspace`/`clear`/`resume`) and renders the runtime's Event
 //! stream. Layout: transcript on top, a line-editing input with a visible
-//! caret at the bottom (CRAB-126), a centered picker overlay for /model and
-//! /effort (CRAB-127), and a footer/status line (provider, model, effort,
+//! caret at the bottom (CRAB-126), a centered picker overlay for /model,
+//! /effort, /provider and /resume (CRAB-127), and a footer/status line (provider, model, effort,
 //! animated spinner while busy, CRAB-128). CRAB-138 adds `/skills` (list) and
-//! `/skill <name>` (load an instruction file as a user message).
+//! `/skill <name>` (load an instruction file as a user message). Dragging over
+//! the transcript highlights text; Ctrl-Y copies the selection with OSC 52.
 //!
 //! This module is split so the behavior is testable without a terminal:
 //! the pure model (`parse_slash`, `LineAction` routing, `apply_event`
@@ -20,11 +21,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crab_core::config::PROVIDERS;
+use crab_core::provider::Message;
 use crab_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
 use crab_core::theme::{Modifiers, StyleSpec, Theme, ThemeColor, Token};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+    Event as TermEvent, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -152,7 +154,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "resume",
         aliases: &[],
         args: None,
-        description: "Continue the previous session",
+        description: "Pick a previous session",
         build: |_| SlashCommand::Resume,
     },
     CommandSpec {
@@ -392,6 +394,14 @@ pub struct UiModel {
     pub completion: Option<Completion>,
     /// True while a `/model` model-list fetch is in flight (CRAB-141).
     pub model_fetch_pending: bool,
+    /// Mouse text selection over the transcript (absolute screen cells), for
+    /// Ctrl-Y copy. Cleared by scrolling and by a plain click.
+    pub selection: Option<Selection>,
+    /// The transcript viewport's inner screen rect from the last draw.
+    pub transcript_area: Rect,
+    /// The transcript viewport's visible text rows from the last draw, one
+    /// string per screen row (wrapping included), for selection extraction.
+    pub transcript_rows: Vec<String>,
 }
 
 impl UiModel {
@@ -409,6 +419,9 @@ impl UiModel {
             md_cache: None,
             completion: None,
             model_fetch_pending: false,
+            selection: None,
+            transcript_area: Rect::default(),
+            transcript_rows: Vec::new(),
         }
     }
 
@@ -530,6 +543,69 @@ impl UiModel {
         self.transcript
             .push(TranscriptLine::Notice(text.to_string()));
         self.revision += 1;
+    }
+
+    /// Replace the visible transcript with a resumed conversation. Only user
+    /// and assistant text is shown; tool traffic stays in the runtime history,
+    /// which the model still sees.
+    pub fn load_history(&mut self, history: &[Message]) {
+        self.transcript.clear();
+        self.assistant_buf.clear();
+        self.thinking_buf.clear();
+        for message in history {
+            match message {
+                Message::User(text) => {
+                    self.transcript.push(TranscriptLine::User(text.clone()));
+                }
+                Message::Assistant {
+                    text: Some(text), ..
+                } if !text.is_empty() => {
+                    self.transcript
+                        .push(TranscriptLine::Assistant(text.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.scroll.follow_tail();
+        self.revision += 1;
+    }
+
+    /// Begin a selection at a screen cell. A press outside the transcript
+    /// viewport just clears any existing selection.
+    pub fn selection_start(&mut self, col: u16, row: u16) {
+        if self.transcript_area.contains(Position { x: col, y: row }) {
+            self.selection = Some(Selection {
+                anchor: (col, row),
+                head: (col, row),
+            });
+        } else {
+            self.selection = None;
+        }
+    }
+
+    /// Extend the active selection, clamped to the transcript viewport.
+    pub fn selection_drag(&mut self, col: u16, row: u16) {
+        if let Some(sel) = &mut self.selection {
+            let area = self.transcript_area;
+            sel.head = (
+                col.clamp(area.left(), area.right().saturating_sub(1)),
+                row.clamp(area.top(), area.bottom().saturating_sub(1)),
+            );
+        }
+    }
+
+    /// Finish a selection. A click that never moved clears it; a real drag is
+    /// kept so Ctrl-Y can copy it.
+    pub fn selection_end(&mut self) {
+        if self.selection.is_some_and(|s| s.is_empty()) {
+            self.selection = None;
+        }
+    }
+
+    /// Drop the selection (used when scrolling, so the highlight never covers
+    /// text it was not made over).
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
     }
 }
 
@@ -840,7 +916,7 @@ pub fn run_tui(
     let result = (|| -> Result<i32, String> {
         // One-time editing-key hint so the line editor is discoverable.
         model.push_notice(
-            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · PgUp/PgDn/↑↓ scroll · /help commands",
+            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · PgUp/PgDn/↑↓ scroll · drag to select · Ctrl-Y copy · /help commands",
         );
         // Seed the transcript with the initial prompt, then start the turn.
         if !initial.trim().is_empty() {
@@ -912,18 +988,43 @@ pub fn run_tui(
             if event::poll(Duration::from_millis(33)).map_err(|e| e.to_string())? {
                 match event::read().map_err(|e| e.to_string())? {
                     TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
-                        handle_key(
-                            rt,
-                            &mut model,
-                            &mut input,
-                            &mut picker,
-                            &mut login_pending,
-                            &mut should_exit,
-                            session_root,
-                            key.code,
-                            key.modifiers,
-                        );
-                        refresh_completion(&mut model, &input, &picker, login_pending);
+                        // Ctrl-Y copies the transcript selection via OSC 52.
+                        // Ctrl-C stays cancel/exit (CRAB-128), so copy gets its
+                        // own chord.
+                        if key.code == KeyCode::Char('y')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            match selection_text(&model) {
+                                Some(text) => {
+                                    let chars = text.chars().count();
+                                    match osc52_copy(terminal.backend_mut(), &text) {
+                                        Ok(()) => {
+                                            model.clear_selection();
+                                            model.push_notice(&format!("copied {chars} char(s)"));
+                                        }
+                                        Err(e) => {
+                                            model.push_notice(&format!("could not copy: {e}"))
+                                        }
+                                    }
+                                }
+                                None => model.push_notice(
+                                    "nothing selected — drag over the transcript, then Ctrl-Y",
+                                ),
+                            }
+                        } else {
+                            handle_key(
+                                rt,
+                                &mut model,
+                                &mut input,
+                                &mut picker,
+                                &mut login_pending,
+                                &mut should_exit,
+                                session_root,
+                                key.code,
+                                key.modifiers,
+                            );
+                            refresh_completion(&mut model, &input, &picker, login_pending);
+                        }
                     }
                     // Bracketed paste: insert the whole pasted text at the
                     // caret (so Ctrl+Shift+V works for keys / long inputs);
@@ -932,10 +1033,24 @@ pub fn run_tui(
                         input.insert(&text);
                         refresh_completion(&mut model, &input, &picker, login_pending);
                     }
-                    // Mouse wheel scrolls the transcript (3 rows per notch).
+                    // Mouse: wheel scrolls the transcript (3 rows per notch);
+                    // a left-button drag selects text for Ctrl-Y copy.
                     TermEvent::Mouse(me) => match me.kind {
-                        MouseEventKind::ScrollUp => model.scroll.scroll_by(-3),
-                        MouseEventKind::ScrollDown => model.scroll.scroll_by(3),
+                        MouseEventKind::ScrollUp => {
+                            model.clear_selection();
+                            model.scroll.scroll_by(-3);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            model.clear_selection();
+                            model.scroll.scroll_by(3);
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            model.selection_start(me.column, me.row);
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            model.selection_drag(me.column, me.row);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => model.selection_end(),
                         _ => {}
                     },
                     _ => {}
@@ -962,7 +1077,7 @@ pub fn run_tui(
     result
 }
 
-/// A modal picker overlay (model / effort selection).
+/// A modal picker overlay (model / effort / provider / session selection).
 enum Picker {
     Effort {
         selected: usize,
@@ -975,6 +1090,12 @@ enum Picker {
     /// Provider choices from the registry (CRAB-142).
     Provider {
         selected: usize,
+    },
+    /// Saved sessions for `/resume`, newest first, with titles derived from
+    /// each session's first user message.
+    Session {
+        selected: usize,
+        sessions: Vec<crab_core::session::SessionSummary>,
     },
 }
 
@@ -999,6 +1120,7 @@ fn handle_key(
             Picker::Effort { .. } => EFFORT_CHOICES.len(),
             Picker::Model { models, .. } => models.len(),
             Picker::Provider { .. } => PROVIDERS.len(),
+            Picker::Session { sessions, .. } => sessions.len(),
         };
         match code {
             // Ctrl-C cancels the overlay (like Esc); a second Ctrl-C at the
@@ -1015,6 +1137,9 @@ fn handle_key(
                 Picker::Provider { selected } => {
                     *selected = (*selected + 1).min(max.saturating_sub(1));
                 }
+                Picker::Session { selected, .. } => {
+                    *selected = (*selected + 1).min(max.saturating_sub(1));
+                }
             },
             KeyCode::Up | KeyCode::Char('k') => match p {
                 Picker::Effort { selected } => {
@@ -1024,6 +1149,9 @@ fn handle_key(
                     *selected = selected.saturating_sub(1);
                 }
                 Picker::Provider { selected } => {
+                    *selected = selected.saturating_sub(1);
+                }
+                Picker::Session { selected, .. } => {
                     *selected = selected.saturating_sub(1);
                 }
             },
@@ -1048,6 +1176,21 @@ fn handle_key(
                         model.model_fetch_pending = true;
                     }
                     *picker = None;
+                }
+                Picker::Session { selected, sessions } => {
+                    // Clone the choice before clearing the overlay so the
+                    // borrow on `picker` ends before the assignment.
+                    let choice = sessions.get(*selected).cloned();
+                    *picker = None;
+                    if let Some(summary) = choice {
+                        match crab_core::session::load_at(&summary.path) {
+                            Ok(history) => {
+                                model.load_history(&history);
+                                rt.replace_history(history);
+                            }
+                            Err(e) => model.push_notice(&format!("could not resume: {e}")),
+                        }
+                    }
                 }
             },
             _ => {}
@@ -1246,14 +1389,20 @@ fn run_command(
             return true;
         }
         SlashCommand::Resume => {
-            match crab_core::session::load_previous(session_root, &rt.workspace_root()) {
-                Ok(Some(h)) => {
-                    rt.replace_history(h);
-                    model.transcript.clear();
-                    model.push_notice("resumed previous session");
+            // List every session for this cwd and let the user pick one, like
+            // pi's resume picker (CRAB-138 followed up). Titles are derived
+            // from the first user message; sessions store no name of their own.
+            match crab_core::session::list_sessions(session_root, &rt.workspace_root()) {
+                Ok(sessions) if sessions.is_empty() => {
+                    model.push_notice("no previous session");
                 }
-                Ok(None) => model.push_notice("no previous session"),
-                Err(e) => model.push_notice(&format!("could not resume: {e}")),
+                Ok(sessions) => {
+                    *picker = Some(Picker::Session {
+                        selected: 0,
+                        sessions,
+                    });
+                }
+                Err(e) => model.push_notice(&format!("could not list sessions: {e}")),
             }
         }
         SlashCommand::Login => {
@@ -1511,6 +1660,19 @@ fn draw(
     let transcript = transcript.scroll(((top.min(u16::MAX as usize)) as u16, 0));
     f.render_widget(transcript, chunks[0]);
 
+    // Remember the transcript viewport for mouse selection, then paint the
+    // active selection over the rendered cells (so the copy matches the
+    // screen, wrapped rows included).
+    let inner = chunks[0].inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    model.transcript_area = inner;
+    model.transcript_rows = viewport_rows(f.buffer_mut(), inner);
+    if let Some(sel) = model.selection {
+        paint_selection(f.buffer_mut(), inner, sel, theme);
+    }
+
     // Slash-command completion dropdown (CRAB-141).
     if let Some(c) = &model.completion {
         draw_completions(f, chunks[1], c, theme);
@@ -1542,6 +1704,16 @@ fn draw(
                 &names,
                 *selected,
                 " provider — ↑/↓ · Enter apply · Esc cancel ",
+                theme,
+            );
+        }
+        Some(Picker::Session { selected, sessions }) => {
+            let titles: Vec<String> = sessions.iter().map(|s| s.title.clone()).collect();
+            draw_picker(
+                f,
+                &titles,
+                *selected,
+                " resume — ↑/↓ · Enter open · Esc cancel ",
                 theme,
             );
         }
@@ -1664,6 +1836,174 @@ fn draw_picker(f: &mut Frame, items: &[String], selected: usize, title: &str, th
             .title_style(style(theme.token(Token::Title))),
     );
     f.render_widget(picker, area);
+}
+
+/// A mouse text selection over the transcript viewport. Coordinates are
+/// absolute screen cells `(column, row)`; `anchor` is where the drag began and
+/// `head` where it is now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    /// The selection ends ordered top-left to bottom-right (row first).
+    pub fn ordered(&self) -> ((u16, u16), (u16, u16)) {
+        if (self.anchor.1, self.anchor.0) <= (self.head.1, self.head.0) {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    /// True when the selection covers no cell (a plain click).
+    pub fn is_empty(&self) -> bool {
+        self.anchor == self.head
+    }
+}
+
+/// The visible text of each row in `area`, read back from the rendered buffer,
+/// so a selection copies exactly what is on screen (wrapping included).
+fn viewport_rows(buf: &ratatui::buffer::Buffer, area: Rect) -> Vec<String> {
+    (area.top()..area.bottom())
+        .map(|y| {
+            let mut row = String::new();
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell(Position { x, y }) {
+                    row.push_str(cell.symbol());
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+/// Overlay the selection style on the selected cells of the transcript view.
+fn paint_selection(buf: &mut ratatui::buffer::Buffer, area: Rect, sel: Selection, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let ((sc, sr), (ec, er)) = sel.ordered();
+    let last_row = area.bottom() - 1;
+    let last_col = area.right() - 1;
+    let sr = sr.clamp(area.top(), last_row);
+    let er = er.clamp(area.top(), last_row);
+    // Honor a themed selection color; both presets only set `bold` and leave
+    // fg/bg at the terminal default, in which case reverse video is the
+    // portable highlight (and keeps the text's own colors). `style()` must not
+    // be used here: it force-sets fg/bg to Reset, which would erase them.
+    let spec = theme.token(Token::Selection);
+    let mut style = Style::default().add_modifier(modifiers(spec.modifiers));
+    if spec.fg != ThemeColor::Default {
+        style = style.fg(color(spec.fg));
+    }
+    if spec.bg != ThemeColor::Default {
+        style = style.bg(color(spec.bg));
+    } else {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+    for y in sr..=er {
+        let left = if y == sr {
+            sc.clamp(area.left(), last_col)
+        } else {
+            area.left()
+        };
+        let right = if y == er {
+            ec.clamp(area.left(), last_col)
+        } else {
+            last_col
+        };
+        for x in left..=right {
+            if let Some(cell) = buf.cell_mut(Position { x, y }) {
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+/// Char index within `chars` for a terminal column, honoring wide characters
+/// (a CJK glyph occupies two columns). Columns past the end clamp to the end.
+fn char_index_at_col(chars: &[char], col: usize) -> usize {
+    let mut width = 0usize;
+    for (i, ch) in chars.iter().enumerate() {
+        if width >= col {
+            return i;
+        }
+        width += UnicodeWidthChar::width(*ch).unwrap_or(0);
+    }
+    chars.len()
+}
+
+/// The text of the current selection, read from the last drawn transcript
+/// viewport. `None` when nothing is selected. The end cell is inclusive.
+fn selection_text(model: &UiModel) -> Option<String> {
+    let sel = model.selection?;
+    if sel.is_empty() {
+        return None;
+    }
+    let area = model.transcript_area;
+    let rows = &model.transcript_rows;
+    if rows.is_empty() {
+        return None;
+    }
+    let ((sc, sr), (ec, er)) = sel.ordered();
+    let first = area.y;
+    let last = area.y + rows.len() as u16 - 1;
+    let sr = sr.clamp(first, last);
+    let er = er.clamp(first, last);
+    let col = |c: u16| c.saturating_sub(area.x) as usize;
+    let mut out = String::new();
+    for row in sr..=er {
+        let chars: Vec<char> = rows[(row - first) as usize].chars().collect();
+        let from = if row == sr {
+            char_index_at_col(&chars, col(sc))
+        } else {
+            0
+        };
+        let to = if row == er {
+            char_index_at_col(&chars, col(ec).saturating_add(1))
+        } else {
+            chars.len()
+        };
+        if from < to {
+            out.extend(&chars[from..to]);
+        }
+        if row < er {
+            out.push('\n');
+        }
+    }
+    let trimmed = out.trim_end();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Copy `text` to the terminal's clipboard with OSC 52. Most terminals support
+/// it (inside tmux, set `set-clipboard on`); no external tool is needed, so it
+/// also works over SSH.
+fn osc52_copy(out: &mut impl std::io::Write, text: &str) -> std::io::Result<()> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = text.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        encoded.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        encoded.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()
 }
 
 #[cfg(test)]
@@ -2275,6 +2615,251 @@ mod tests {
         assert!(picker.is_none());
         // The switch triggers a model fetch so the picker opens on results.
         assert!(model.model_fetch_pending);
+    }
+
+    #[test]
+    fn load_history_repaints_user_and_assistant_text() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.load_history(&[
+            Message::System("sys".into()),
+            Message::User("hello".into()),
+            Message::Assistant {
+                text: None,
+                tool_calls: vec![crab_core::provider::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({"command": "echo hi"}),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                result: "hi\n".into(),
+            },
+            Message::Assistant {
+                text: Some("done".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        // Tool traffic and the system prompt are not shown; text is.
+        assert_eq!(
+            model.transcript,
+            vec![
+                TranscriptLine::User("hello".into()),
+                TranscriptLine::Assistant("done".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_picker_enter_loads_and_repaints_a_session() {
+        let rt = test_rt();
+        let root = tempfile::tempdir().expect("sessions root");
+        let cwd = rt.workspace_root();
+        let history = vec![
+            Message::System("sys".into()),
+            Message::User("first question".into()),
+            Message::Assistant {
+                text: Some("first answer".into()),
+                tool_calls: vec![],
+            },
+        ];
+        crab_core::session::save_session(root.path(), &cwd, &history).unwrap();
+        let sessions = crab_core::session::list_sessions(root.path(), &cwd).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title, "first question");
+
+        let mut model = UiModel::new(rt.state());
+        let mut editor = InputEditor::default();
+        let mut picker = Some(Picker::Session {
+            selected: 0,
+            sessions,
+        });
+        let mut login_pending = false;
+        let mut should_exit = false;
+        handle_key(
+            &rt,
+            &mut model,
+            &mut editor,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            root.path(),
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(picker.is_none());
+        // History is restored into the runtime *and* painted into the
+        // transcript (the bug: resume used to leave the view blank).
+        assert_eq!(rt.history(), history);
+        assert_eq!(
+            model.transcript,
+            vec![
+                TranscriptLine::User("first question".into()),
+                TranscriptLine::Assistant("first answer".into()),
+            ]
+        );
+    }
+
+    // --- transcript selection + OSC 52 copy ---
+
+    #[test]
+    fn selection_orders_by_row_then_column() {
+        let a = Selection {
+            anchor: (5, 2),
+            head: (1, 1),
+        };
+        assert_eq!(a.ordered(), ((1, 1), (5, 2)));
+        // Same row: the column decides.
+        let c = Selection {
+            anchor: (9, 3),
+            head: (2, 3),
+        };
+        assert_eq!(c.ordered(), ((2, 3), (9, 3)));
+    }
+
+    #[test]
+    fn selection_start_outside_the_transcript_clears() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.transcript_area = Rect::new(1, 1, 10, 5);
+        model.selection = Some(Selection {
+            anchor: (2, 2),
+            head: (3, 3),
+        });
+        model.selection_start(50, 50); // outside the viewport
+        assert!(model.selection.is_none());
+
+        model.selection_start(2, 2);
+        model.selection_drag(4, 3);
+        assert_eq!(model.selection.unwrap().head, (4, 3));
+        model.selection_end();
+        // A real drag survives release; a click that never moved does not.
+        assert!(model.selection.is_some());
+        model.selection_start(2, 2);
+        model.selection_end();
+        assert!(model.selection.is_none());
+    }
+
+    #[test]
+    fn selection_text_reads_the_highlighted_rows() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.transcript_area = Rect::new(0, 0, 20, 3);
+        model.transcript_rows = vec!["hello world".into(), "second line".into(), String::new()];
+
+        // Columns 0..=4 of row 0 (the end cell is inclusive).
+        model.selection = Some(Selection {
+            anchor: (0, 0),
+            head: (4, 0),
+        });
+        assert_eq!(selection_text(&model).as_deref(), Some("hello"));
+
+        // Across rows, a reversed anchor/head still reads top-left first.
+        model.selection = Some(Selection {
+            anchor: (3, 1),
+            head: (6, 0),
+        });
+        assert_eq!(selection_text(&model).as_deref(), Some("world\nseco"));
+
+        // Nothing selected, or a zero-width selection, copies nothing.
+        model.selection = None;
+        assert_eq!(selection_text(&model), None);
+        model.selection = Some(Selection {
+            anchor: (3, 0),
+            head: (3, 0),
+        });
+        assert_eq!(selection_text(&model), None);
+    }
+
+    #[test]
+    fn selection_text_handles_wide_characters() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.transcript_area = Rect::new(0, 0, 10, 1);
+        model.transcript_rows = vec!["a字b".into()];
+        // Columns 1..=2 are the two cells of the wide glyph.
+        model.selection = Some(Selection {
+            anchor: (1, 0),
+            head: (2, 0),
+        });
+        assert_eq!(selection_text(&model).as_deref(), Some("字"));
+    }
+
+    #[test]
+    fn osc52_copy_frames_base64_payload() {
+        let mut out = Vec::new();
+        osc52_copy(&mut out, "hello").unwrap();
+        assert_eq!(out, b"\x1b]52;c;aGVsbG8=\x07");
+        // 2-byte tail pads with one '='.
+        let mut out = Vec::new();
+        osc52_copy(&mut out, "hi").unwrap();
+        assert_eq!(out, b"\x1b]52;c;aGk=\x07");
+        // Empty text still frames cleanly.
+        let mut out = Vec::new();
+        osc52_copy(&mut out, "").unwrap();
+        assert_eq!(out, b"\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn draw_captures_the_transcript_and_paints_the_selection() {
+        use ratatui::backend::TestBackend;
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.push_user("hello selection");
+        let theme = Theme::default();
+        let input = InputEditor::default();
+        let picker = None;
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, model: &mut UiModel| {
+            terminal
+                .draw(|f| draw(f, model, &theme, &input, &picker, false, ' ', "fake"))
+                .unwrap();
+        };
+        render(&mut terminal, &mut model);
+
+        // The viewport readback holds the rendered rows.
+        assert!(
+            model
+                .transcript_rows
+                .iter()
+                .any(|r| r.contains("hello selection")),
+            "{:?}",
+            model.transcript_rows
+        );
+        let area = model.transcript_area;
+        assert!(area.height > 0);
+
+        // A selection repaints cells in the rendered buffer.
+        let before = terminal.backend().buffer().content.clone();
+        model.selection = Some(Selection {
+            anchor: (area.x, area.y),
+            head: (area.x + 4, area.y),
+        });
+        render(&mut terminal, &mut model);
+        let after = terminal.backend().buffer().content.clone();
+        assert_ne!(
+            before, after,
+            "the selection highlight should repaint cells"
+        );
+        // The default theme leaves the selection fg/bg unset, so the highlight
+        // is reverse video (kept bold from the token) and must not reset the
+        // text's own color.
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell(Position {
+                x: area.x,
+                y: area.y,
+            })
+            .unwrap()
+            .clone();
+        assert!(
+            cell.modifier.contains(ratatui::style::Modifier::REVERSED),
+            "selected cell should be reversed, got {:?}",
+            cell.modifier
+        );
+        assert_ne!(cell.fg, ratatui::style::Color::Reset);
     }
 
     // --- CRAB-126: line-editing input editor ---

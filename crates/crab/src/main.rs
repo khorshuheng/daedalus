@@ -159,6 +159,9 @@ fn run(cli: Cli) -> Result<i32, String> {
     )?;
 
     let workspace = Workspace::new(config.workspace.clone())?;
+    // Session GC: keep only the newest `session_retention` sessions for this
+    // workspace (0 disables). Best-effort; a failure only warns.
+    prune_old_sessions(&config, &session::default_root(), workspace.root());
     let provider = provider::from_config(&config);
     // CRAB-133: built-ins plus configured MCP servers. Server startup is
     // non-fatal — a failure is a warning and the agent keeps the rest.
@@ -209,6 +212,22 @@ fn run(cli: Cli) -> Result<i32, String> {
             let root = session::default_root();
             tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path(), &theme)
         }
+    }
+}
+
+/// Keep only the newest `config.session_retention` sessions for `workspace`
+/// (`0` disables). Best-effort: a prune failure is a warning, never fatal.
+fn prune_old_sessions(config: &Config, session_root: &Path, workspace: &Path) {
+    if config.session_retention == 0 {
+        return;
+    }
+    match session::prune_sessions(session_root, workspace, config.session_retention) {
+        Ok(0) => {}
+        Ok(n) => eprintln!(
+            "crab: pruned {n} old session(s) (keeping {})",
+            config.session_retention
+        ),
+        Err(e) => eprintln!("crab: warning: could not prune sessions: {e}"),
     }
 }
 
