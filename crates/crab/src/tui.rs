@@ -428,6 +428,7 @@ impl UiModel {
     /// Fold a runtime Event into the model. Returns nothing; the caller just
     /// re-renders. This is the single place events become display state.
     pub fn apply_event(&mut self, event: &Event) {
+        let before = self.transcript.len();
         match event {
             Event::AgentStart { .. } => {}
             Event::TurnStart {} => {
@@ -505,18 +506,25 @@ impl UiModel {
                     .push(TranscriptLine::Notice(format!("error: {message}")));
             }
         }
-        self.revision += 1;
+        // Only a changed transcript invalidates the render cache. Streamed
+        // thinking/assistant deltas touch their buffers, not `transcript`, and
+        // the live `assistant_buf` is rendered directly each frame.
+        if self.transcript.len() != before {
+            self.revision += 1;
+        }
     }
 
-    /// Push accumulated model reasoning (if any) as a transcript line.
+    /// Push accumulated model reasoning (if any) as transcript lines.
     /// Always called before `flush_assistant`, so thinking renders before the
-    /// answer it precedes (CRAB-139).
+    /// answer it precedes (CRAB-139). Split per reasoning line so a large
+    /// block wraps line-by-line instead of as one huge paragraph every frame.
     fn flush_thinking(&mut self) {
         if !self.thinking_buf.is_empty() {
-            self.transcript
-                .push(TranscriptLine::Thinking(std::mem::take(
-                    &mut self.thinking_buf,
-                )));
+            let buffered = std::mem::take(&mut self.thinking_buf);
+            for line in buffered.lines() {
+                self.transcript
+                    .push(TranscriptLine::Thinking(line.to_string()));
+            }
         }
     }
 
@@ -1742,15 +1750,18 @@ fn draw(
     }
 
     // Footer/status.
+    let usage = model
+        .usage
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "?".to_string());
     let status = format!(
-        " {} ({}) | effort {} | {} | {} | {:?} tokens | {} turn(s){}",
+        " {} ({}) | effort {} | {} | {} | {} tokens{}",
         model.state.model,
         provider,
         model.state.effort.name(),
         model.state.workspace,
         if busy { "busy" } else { "idle" },
-        model.usage,
-        model.iterations,
+        usage,
         if model.settled { " · settled" } else { "" },
     );
     let footer = Paragraph::new(TLine::from(vec![
@@ -2433,6 +2444,37 @@ mod tests {
             m.transcript,
             vec![TranscriptLine::Thinking("reason".into())]
         );
+    }
+
+    #[test]
+    fn thinking_splits_into_one_line_per_reasoning_line() {
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ThinkingDelta {
+            text: "first\nsecond\n".into(),
+        });
+        m.apply_event(&Event::TurnEnd {});
+        assert_eq!(
+            m.transcript,
+            vec![
+                TranscriptLine::Thinking("first".into()),
+                TranscriptLine::Thinking("second".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_deltas_do_not_invalidate_the_render_cache() {
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::TurnStart {});
+        let base = m.revision;
+        m.apply_event(&Event::ThinkingDelta { text: "a".into() });
+        assert_eq!(
+            m.revision, base,
+            "buffered thinking is not a transcript line"
+        );
+        // Flushing the buffer appends a transcript line, which does invalidate.
+        m.apply_event(&Event::TextDelta { text: "b".into() });
+        assert!(m.revision > base);
     }
 
     #[test]
