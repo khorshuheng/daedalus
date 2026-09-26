@@ -1,4 +1,4 @@
-//! Offline integration tests for the CRAB-124 WebSocket server: a real axum
+//! Offline integration tests for the WebSocket server: a real axum
 //! server on an ephemeral loopback port, a real WebSocket client, and the
 //! scripted fake provider — no network, no external services.
 

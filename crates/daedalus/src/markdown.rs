@@ -1,4 +1,4 @@
-//! A small CommonMark → ratatui renderer (CRAB-145).
+//! A small CommonMark → ratatui renderer.
 //!
 //! `render` turns assistant markdown into `Line`s styled from a
 //! [`MarkdownStyle`] (which the TUI builds from the active theme). The subset

@@ -1,7 +1,7 @@
 //! Fake provider: an in-memory, scripted backend for deterministic offline
-//! tests (CRAB-103/104/106). It pops a scripted `Response` for each call and
+//! tests. It pops a scripted `Response` for each call and
 //! records every history it receives so tests can assert on result feedback.
-//! Async behind the same seam since CRAB-130; cancellation is honored the way
+//! Async behind the same seam since then; cancellation is honored the way
 //! a real provider would report it (`Completion.aborted`).
 
 use std::collections::VecDeque;
@@ -15,9 +15,9 @@ use super::{Completion, Message, Provider, ProviderError, Response, StreamDelta}
 
 pub struct FakeProvider {
     responses: Mutex<VecDeque<Response>>,
-    /// Scripted reasoning fragments, one per `complete` call (CRAB-139).
+    /// Scripted reasoning fragments, one per `complete` call.
     thinking: Mutex<VecDeque<String>>,
-    /// Model ids reported by `list_models` (CRAB-141).
+    /// Model ids reported by `list_models`.
     models: Vec<String>,
     /// History of every `complete` call, in order, for assertions.
     histories: Mutex<Vec<Vec<Message>>>,
@@ -35,14 +35,14 @@ impl FakeProvider {
         }
     }
 
-    /// Models reported by `list_models` (CRAB-141).
+    /// Models reported by `list_models`.
     pub fn with_models(mut self, models: Vec<String>) -> Self {
         self.models = models;
         self
     }
 
     /// Script one reasoning fragment per `complete` call, streamed before the
-    /// scripted response (CRAB-139).
+    /// scripted response.
     pub fn with_thinking(mut self, thinking: Vec<String>) -> Self {
         self.thinking = Mutex::new(thinking.into());
         self

@@ -1,4 +1,4 @@
-//! Session persistence (CRAB-109).
+//! Session persistence.
 //!
 //! The interactive conversation is persisted to disk so `/resume` can reload
 //! the previous session for the current working directory. Storage follows
@@ -13,7 +13,7 @@
 //! repaired in place instead of failing (pi's torn-tail recovery). Any other
 //! parse failure is real corruption and surfaces as `SessionError::Corrupt`.
 //!
-//! SQLite / full-text search is a non-goal (CRAB-111 defers it); the JSONL log
+//! SQLite / full-text search is a non-goal; the JSONL log
 //! is the source of truth.
 
 use std::fs::File;
@@ -156,7 +156,7 @@ fn session_dir(root: &Path, cwd: &Path) -> PathBuf {
 /// only the ignored `.tmp` file; the destination is untouched.
 fn write_file_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
     // A temp file in the destination directory, fsynced, then renamed over
-    // the target (tempfile, CRAB-119). A crash mid-write leaves only the
+    // the target (tempfile). A crash mid-write leaves only the
     // temp file; the destination is untouched.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(SessionError::Io)?;
@@ -535,7 +535,7 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
 
-    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    /// A unique temp dir cleaned up on drop (tempfile).
     fn tempdir(_name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let base = dir.path().to_path_buf();

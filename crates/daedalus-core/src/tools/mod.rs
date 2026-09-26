@@ -1,5 +1,5 @@
-//! The tool layer (CRAB-102): the built-in tools, plus external MCP
-//! tools (CRAB-133) registered at runtime.
+//! The tool layer: the built-in tools, plus external MCP
+//! tools registered at runtime.
 //!
 //! A shared `Tool` trait with `name()`, `schema()` (JSON Schema for arguments)
 //! and `run(&self, workspace, args) -> Result<ToolOutput, ToolError>`. The
@@ -53,8 +53,8 @@ pub enum ToolError {
     Cancelled,
 }
 /// A tool. Implementations must be cheap to construct and stateless apart
-/// from their output cap. `run` is async (CRAB-130): the built-ins wrap their
-/// blocking bodies in `spawn_blocking`; an MCP tool (CRAB-133) implements it
+/// from their output cap. `run` is async: the built-ins wrap their
+/// blocking bodies in `spawn_blocking`; an MCP tool implements it
 /// natively async behind the same trait. `name` returns `&str` (not
 /// `&'static str`) because MCP tool names are runtime data.
 pub trait Tool: Send + Sync {
@@ -70,7 +70,7 @@ pub trait Tool: Send + Sync {
 }
 
 /// Validate `args` against the small JSON-Schema subset this crate's tools
-/// declare (CRAB-107 #9): an object with `properties` (string/integer/array
+/// declare: an object with `properties` (string/integer/array
 /// of objects, optional `minimum`, or a `oneOf` of those), `required`, and a
 /// top-level `oneOf`. The tools are a
 /// closed set we author, so validating against exactly the subset we emit

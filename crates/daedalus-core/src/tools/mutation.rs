@@ -1,4 +1,4 @@
-//! Per-file mutation serialization (CRAB-146).
+//! Per-file mutation serialization.
 //!
 //! Tool calls within one assistant turn run concurrently (`runtime.rs`
 //! `join_all`), and `write`/`edit` are read-modify-write operations. Without a

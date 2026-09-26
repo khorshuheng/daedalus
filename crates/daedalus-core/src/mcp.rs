@@ -1,4 +1,4 @@
-//! MCP tool servers (CRAB-133): attach external tools over the Model Context
+//! MCP tool servers: attach external tools over the Model Context
 //! Protocol so daedalus's tool surface is no longer limited to the four built-ins.
 //!
 //! The spec originally named "rig-rmcp"; rig-core 0.42 has no MCP integration
@@ -329,7 +329,7 @@ where
         .await
         .map_err(|e| format!("initialize: {e}"))?;
 
-    // `list_all_tools` follows `next_cursor` to the end (CRAB-133 follow-up).
+    // `list_all_tools` follows `next_cursor` to the end.
     let listed = service
         .list_all_tools()
         .await

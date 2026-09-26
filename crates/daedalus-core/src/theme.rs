@@ -1,4 +1,4 @@
-//! TUI theming (CRAB-140): a data-only `Theme` resolved from `config.toml`.
+//! TUI theming: a data-only `Theme` resolved from `config.toml`.
 //!
 //! This module deliberately has no ratatui/terminal dependency: it produces
 //! plain color/style data ([`Theme`], [`StyleSpec`]) that the `daedalus` binary
@@ -53,7 +53,7 @@ pub struct StyleSpec {
     pub modifiers: Modifiers,
 }
 
-/// The role-based token set (CRAB-140). Markdown tokens are added by CRAB-145.
+/// The role-based token set. Markdown tokens are added by the frontend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Token {
     Text,

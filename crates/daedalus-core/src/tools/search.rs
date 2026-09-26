@@ -1,4 +1,4 @@
-//! The `search` tool (CRAB-144): ripgrep-style content search over the
+//! The `search` tool: ripgrep-style content search over the
 //! workspace.
 //!
 //! Traversal uses the `ignore` crate — the same walker ripgrep uses — so the

@@ -1,14 +1,14 @@
-//! Configuration (CRAB-105, revised CRAB-118).
+//! Configuration.
 //!
 //! Keys: provider, base URL, model, temperature, max_iterations, output size
 //! caps, workspace, session retention. Sources merge with documented
 //! precedence: `flags > config file > defaults` (the `DAEDALUS_*` env layer was
-//! removed in CRAB-118). API keys are **not** a config key: they are resolved
+//! removed). API keys are **not** a config key: they are resolved
 //! separately via `credential` (`--api-key` > provider-native env > OS
 //! keyring), so a secret can never be stored in the config file.
 //!
 //! Supported providers: a registry (`PROVIDERS`) grown from the original
-//! `openai`/`anthropic`/`deepseek` set in CRAB-132 — provider + model +
+//! `openai`/`anthropic`/`deepseek` — provider + model +
 //! optional base URL are config-driven strings validated against the registry,
 //! and unknown values fail fast listing the supported set. The adapter
 //! (`provider/rig.rs`) maps each registry entry onto rig-core's client for
@@ -22,8 +22,8 @@ use serde::Deserialize;
 use crate::mcp::{validate_servers, McpServerConfig};
 use crate::theme::{Theme, ThemePartial};
 
-/// How a provider's canonical `Effort` level maps to wire parameters
-/// (CRAB-116). `None` = the provider gets no effort params (unsupported or
+/// How a provider's canonical `Effort` level maps to wire parameters.
+/// `None` = the provider gets no effort params (unsupported or
 /// unknown semantics — capability honesty over guesswork).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffortStyle {
@@ -37,7 +37,7 @@ pub enum EffortStyle {
 
 /// One registry entry: the wire facts daedalus knows about a provider —
 /// endpoint, credential surface, and effort style. Deliberately **no model
-/// presets** (CRAB-132 decision): model catalogs go stale and local
+/// presets**: model catalogs go stale and local
 /// providers have no meaningful default — the user must choose a model.
 /// Adding a provider is a row here plus (if rig has a dedicated client) one
 /// match arm in the adapter.
@@ -45,13 +45,13 @@ pub enum EffortStyle {
 pub struct ProviderInfo {
     pub name: &'static str,
     pub preset_base_url: &'static str,
-    /// Provider-native env var carrying the API key (CRAB-118). `None` for
+    /// Provider-native env var carrying the API key. `None` for
     /// local providers and the fake.
     pub api_key_env: Option<&'static str>,
     pub effort: EffortStyle,
 }
 
-/// The provider registry (CRAB-132). The first row is the default provider
+/// The provider registry. The first row is the default provider
 /// (`openai`) — used when no `provider` is configured.
 pub const PROVIDERS: &[ProviderInfo] = &[
     ProviderInfo {
@@ -186,13 +186,13 @@ pub struct Config {
     pub session_retention: usize,
     /// The single root directory the agent is allowed to touch.
     pub workspace: PathBuf,
-    /// External MCP tool servers (CRAB-133), started at runtime construction.
+    /// External MCP tool servers, started at runtime construction.
     pub mcp_servers: Vec<McpServerConfig>,
-    /// Optional identity -> workspace map (CRAB-124): a request identity (e.g.
+    /// Optional identity -> workspace map: a request identity (e.g.
     /// a Tailscale login header) selects a session workspace. Empty = use
     /// `workspace` for every session.
     pub identity_workspaces: BTreeMap<String, PathBuf>,
-    /// The resolved TUI theme (CRAB-140).
+    /// The resolved TUI theme.
     pub theme: Theme,
 }
 
@@ -204,7 +204,7 @@ impl Config {
 
     /// Defaults derived from one provider's registry row. The model is
     /// deliberately empty: choosing a model is the user's decision and is
-    /// enforced by [`PartialConfig::resolve`] (CRAB-132).
+    /// enforced by [`PartialConfig::resolve`].
     pub fn from_provider(provider: &'static ProviderInfo, workspace: PathBuf) -> Self {
         Self {
             provider,
@@ -238,7 +238,7 @@ impl Config {
 /// fields are optional; unresolved fields fall back to defaults or to the
 /// next-higher-precedence source. Doubles as the schema of the TOML config
 /// file and as the flag overrides — `api_key` is deliberately absent so a
-/// secret can never be stored in the config file (CRAB-118).
+/// secret can never be stored in the config file.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct PartialConfig {
     pub provider: Option<String>,
@@ -255,13 +255,13 @@ pub struct PartialConfig {
     /// Sessions to keep per workspace at startup (default 10; `0` = keep all).
     pub session_retention: Option<usize>,
     pub workspace: Option<PathBuf>,
-    /// `[[mcp_servers]]` tables (CRAB-133).
+    /// `[[mcp_servers]]` tables.
     #[serde(default)]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
-    /// `[identities]` table: identity -> workspace directory (CRAB-124).
+    /// `[identities]` table: identity -> workspace directory.
     #[serde(default, rename = "identities")]
     pub identity_workspaces: Option<BTreeMap<String, PathBuf>>,
-    /// `[theme]` table (CRAB-140).
+    /// `[theme]` table.
     #[serde(default)]
     pub theme: Option<ThemePartial>,
 }
@@ -317,7 +317,7 @@ impl PartialConfig {
         let base_url = self
             .base_url
             .unwrap_or_else(|| provider.preset_base_url.to_string());
-        // CRAB-132: the model is the user's choice — there is no preset.
+        // The model is the user's choice — there is no preset.
         let model = match self.model.as_deref() {
             Some(m) if !m.trim().is_empty() => m.trim().to_string(),
             _ => {
@@ -393,14 +393,14 @@ impl PartialConfig {
 
 impl Config {
     /// Build a `Config` by merging the config `file`, then CLI `flags` over
-    /// defaults — `flags > config file > defaults` (CRAB-118 removes the env
-    /// layer). `api_key` is resolved separately by the caller via
+    /// defaults — `flags > config file > defaults` (the env layer was
+    /// removed). `api_key` is resolved separately by the caller via
     /// `crate::credential::resolve_api_key` and passed in; the config file
     /// cannot carry a secret. `default_workspace` is used unless an override
     /// supplies one.
     /// Build a `Config` by merging the config `file`, then CLI `flags` over
-    /// defaults — `flags > config file > defaults` (CRAB-118 removes the env
-    /// layer). `api_key_flag` feeds the resolution chain
+    /// defaults — `flags > config file > defaults` (the env layer was
+    /// removed). `api_key_flag` feeds the resolution chain
     /// (`--api-key` > provider-native env > keyring); the config file cannot
     /// carry a secret, so an `api_key` key in it is rejected. `default_workspace`
     /// is used unless an override supplies one.
@@ -487,7 +487,7 @@ mod tests {
 
     #[test]
     fn missing_model_fails_with_guidance() {
-        // CRAB-132: the model is the user's choice — there is no preset.
+        // The model is the user's choice — there is no preset.
         let err = load(ws(), None, PartialConfig::default()).unwrap_err();
         assert!(err.contains("no model configured"), "{err}");
         assert!(err.contains("openai"), "{err}");

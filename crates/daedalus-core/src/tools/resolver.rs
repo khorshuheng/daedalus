@@ -12,14 +12,14 @@ use crate::workspace::Workspace;
 
 /// A registered tool: its name, a one-line description for the provider's
 /// `tools` field, and its executor. Built-ins are fixed; MCP servers
-/// (CRAB-133) contribute additional entries at construction.
+/// contribute additional entries at construction.
 struct ToolEntry {
     name: String,
     description: String,
     tool: Box<dyn Tool>,
     /// External (MCP) tools carry server-authored JSON Schema, which is not
     /// the subset [`super::validate_args`] understands, so argument validation
-    /// is delegated to the server (CRAB-133).
+    /// is delegated to the server.
     external: bool,
 }
 
@@ -36,7 +36,7 @@ impl ToolSet {
     }
 
     /// Like [`new`](Self::new), but applies `bash_timeout_secs` as the `bash`
-    /// default when the model omits `timeout` (CRAB-139 review), so an
+    /// default when the model omits `timeout`, so an
     /// unbounded command cannot run forever.
     pub fn with_bash_timeout(max_output: usize, bash_timeout_secs: Option<u64>) -> Self {
         let mut set = Self { tools: Vec::new() };
@@ -72,7 +72,7 @@ impl ToolSet {
     }
 
     /// Build the tool set from config: the built-ins plus every enabled MCP
-    /// server (CRAB-133). Returns the set and non-fatal warnings for
+    /// server. Returns the set and non-fatal warnings for
     /// servers that failed to start — the agent runs with the tools that did.
     pub fn from_config(config: &crate::config::Config, max_output: usize) -> (Self, Vec<String>) {
         let mut set = Self::with_bash_timeout(max_output, config.bash_default_timeout());
@@ -130,9 +130,9 @@ impl ToolSet {
 
     /// Route `name`+`args` to the matching executor, or a clear error. Built-in
     /// args are validated against the tool's declared JSON Schema first
-    /// (CRAB-107 #9) so malformed model calls never reach an executor; external
+    /// so malformed model calls never reach an executor; external
     /// (MCP) tools are exempt because their server-authored schemas are not the
-    /// subset `validate_args` understands (CRAB-133) — the server validates.
+    /// subset `validate_args` understands — the server validates.
     pub async fn execute(
         &self,
         workspace: &Workspace,

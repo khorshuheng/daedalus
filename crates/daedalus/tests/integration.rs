@@ -1,4 +1,4 @@
-//! End-to-end testing with the fake provider (CRAB-106).
+//! End-to-end testing with the fake provider.
 //!
 //! No network required: drives the real agent loop with an in-memory scripted
 //! provider against a temp workspace, plus a CLI smoke test.
@@ -13,7 +13,7 @@ use daedalus_core::runtime::{AgentRuntime, RuntimeError};
 use daedalus_core::tools::resolver::ToolSet;
 use daedalus_core::workspace::Workspace;
 
-/// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+/// A unique temp dir cleaned up on drop (tempfile).
 type TempDir = tempfile::TempDir;
 fn tempdir(_name: &str) -> TempDir {
     tempfile::tempdir().expect("create temp dir")
@@ -148,7 +148,7 @@ fn cli_smoke_piped_without_mode_is_rejected() {
 }
 
 /// CLI smoke: `--mode repl` must fail at load with the migration note
-/// (CRAB-135: the REPL was removed).
+/// (the REPL was removed).
 #[test]
 fn cli_smoke_repl_mode_is_removed() {
     let tmp = tempdir("cli-repl-removed");
@@ -207,7 +207,7 @@ fn integration_path_outside_workspace_is_allowed() {
 }
 
 /// CLI smoke: `--mode rpc` drives a full session over stdin/stdout with no
-/// terminal (CRAB-120): send a prompt request with an id, expect events plus
+/// terminal: send a prompt request with an id, expect events plus
 /// a correlated response line.
 #[test]
 fn cli_rpc_mode_drives_a_session_over_stdio() {
@@ -254,7 +254,7 @@ fn cli_rpc_mode_drives_a_session_over_stdio() {
     assert!(lines.iter().any(|l| l["type"] == "agent_settled"));
 }
 
-/// CLI smoke: `--mode json` emits every Event as a JSONL line (CRAB-120).
+/// CLI smoke: `--mode json` emits every Event as a JSONL line.
 #[test]
 fn cli_json_mode_emits_events_as_jsonl() {
     let tmp = tempdir("json");
@@ -301,7 +301,7 @@ fn cli_unknown_mode_fails() {
     assert!(stderr.contains("json, rpc, tui"));
 }
 
-/// CRAB-130: the provider-reported prompt token count must flow through the
+/// The provider-reported prompt token count must flow through the
 /// adapter into the runtime's `usage` event (context budgeting's anchor).
 #[test]
 fn usage_event_carries_provider_reported_prompt_tokens() {

@@ -1,8 +1,8 @@
-//! The headless WebSocket server (CRAB-124): the same `Event`/`Command`
-//! vocabulary as stdio RPC (CRAB-120) over one JSON object per WebSocket frame.
+//! The headless WebSocket server: the same `Event`/`Command`
+//! vocabulary as stdio RPC over one JSON object per WebSocket frame.
 //!
 //! Each connection gets its own [`AgentRuntime`] on a dedicated thread (the
-//! CRAB-116 threading model), so concurrent sessions are fully isolated in
+//! threading model), so concurrent sessions are fully isolated in
 //! workspace and cancellation. The server never exposes a public listener by
 //! itself: it binds an address the operator chooses (loopback by default) and
 //! is meant to sit behind `tailscale serve`, which adds HTTPS + tailnet
@@ -40,7 +40,7 @@ use serde::Deserialize;
 pub struct AppState {
     pub config: Arc<Config>,
     pub workspace: Arc<Workspace>,
-    /// Where `/resume` sessions live (CRAB-109).
+    /// Where `/resume` sessions live.
     pub session_root: Arc<PathBuf>,
 }
 
@@ -138,7 +138,7 @@ async fn session_loop(
                     Some(Ok(Message::Text(text))) => {
                         match dispatch(&rt, &text, &state.session_root).await {
                             // An id-carrying request gets a terminal response frame,
-                            // matching the stdio RPC adapter (CRAB-120). The WS loop
+                            // matching the stdio RPC adapter. The WS loop
                             // stays concurrent so steering can arrive mid-turn, so
                             // this is an acceptance ack rather than a post-turn one.
                             Ok(Some(id)) => {
@@ -181,7 +181,7 @@ async fn session_loop(
 }
 
 /// Pick the session workspace. Precedence: mapped identity (from the proxy
-/// header, CRAB-124) > explicit `?workspace=` override > server default. When
+/// header) > explicit `?workspace=` override > server default. When
 /// an identity map is configured, an identity the proxy vouched for but the
 /// map does not cover is **rejected** rather than falling back — otherwise a
 /// tailnet user could reach the admin's default workspace. A request with no

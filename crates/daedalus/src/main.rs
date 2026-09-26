@@ -1,11 +1,11 @@
-//! Daedalus CLI binary (CRAB-101, in the `daedalus` crate of the CRAB-117 workspace).
+//! Daedalus CLI binary in the `daedalus` crate of the workspace.
 //!
 //! Takes a positional `<prompt>` and a workspace directory (`--dir`, defaulting
 //! to cwd) plus `--model`, `--provider`, `--max-iterations`, and `--config`.
-//! Builds the app from the `daedalus_core` library (config CRAB-105, runtime
-//! CRAB-116, providers CRAB-103, tools CRAB-102). Interactive use is the TUI
-//! (the default on a terminal, CRAB-121) — the line-based REPL was removed in
-//! CRAB-135. Headless/scripted use requires an explicit mode: `--mode json`
+//! Builds the app from the `daedalus_core` library (config, runtime,
+//! providers, tools). Interactive use is the TUI (the default on a
+//! terminal) — the line-based REPL has been removed. Headless/scripted
+//! use requires an explicit mode: `--mode json`
 //! (one prompt -> every Event as JSONL) or `--mode rpc` (JSONL command/event
 //! loop, no prompt needed).
 //!
@@ -163,14 +163,14 @@ fn run(cli: Cli) -> Result<i32, String> {
     // workspace (0 disables). Best-effort; a failure only warns.
     prune_old_sessions(&config, &session::default_root(), workspace.root());
     let provider = provider::from_config(&config);
-    // CRAB-133: built-ins plus configured MCP servers. Server startup is
+    // Built-ins plus configured MCP servers. Server startup is
     // non-fatal — a failure is a warning and the agent keeps the rest.
     let (tools, mcp_warnings) = ToolSet::from_config(&config, config.max_output_bytes);
     for warning in &mcp_warnings {
         eprintln!("daedalus: warning: {warning}");
     }
 
-    // No --mode: an interactive terminal gets the TUI (CRAB-135: the REPL
+    // No --mode: an interactive terminal gets the TUI (the REPL
     // was removed). Piped/non-tty stdin without an explicit mode is an
     // error: daedalus is interactive, so a scripted session must say --mode
     // json or rpc. An explicit --mode tui runs the TUI even when stdin is
@@ -231,9 +231,9 @@ fn prune_old_sessions(config: &Config, session_root: &Path, workspace: &Path) {
     }
 }
 
-/// Persist the current session history to disk (auto-save on exit, CRAB-109).
+/// Persist the current session history to disk (auto-save on exit).
 /// Failures are warnings only — quitting must never be blocked by persistence.
-/// (CRAB-137 removed the auto-reflection that used to follow the save.)
+/// (removed the auto-reflection that used to follow the save.)
 fn auto_save(rt: &AgentRuntime, root: &Path) {
     match session::save_session(root, &rt.workspace_root(), &rt.history()) {
         Ok(path) => {

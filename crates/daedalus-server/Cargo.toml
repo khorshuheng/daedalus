@@ -1,6 +1,6 @@
 [package]
 name = "daedalus-server"
-description = "Daedalus headless server (CRAB-124): the RPC protocol over a Tailscale-only WebSocket."
+description = "Daedalus headless server: the RPC protocol over a Tailscale-only WebSocket."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

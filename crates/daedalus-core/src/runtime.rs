@@ -1,4 +1,4 @@
-//! Agent runtime (CRAB-116): the stateful, UI-agnostic engine.
+//! Agent runtime: the stateful, UI-agnostic engine.
 //!
 //! Replaces the callback-driven turn loop (`Session::run_turn(emit)`) with a
 //! single `AgentRuntime` that owns the core state — config, provider, toolset,
@@ -9,7 +9,7 @@
 //!
 //! # Threading model
 //!
-//! The turn loop is async (CRAB-130) and single-threaded, driven by a tokio
+//! The turn loop is async and single-threaded, driven by a tokio
 //! current-thread runtime owned by the worker thread. Adapters hold a cheap
 //! cloneable handle and an event `Receiver`:
 //!
@@ -28,8 +28,8 @@
 //!
 //! `Event` and `Command` are serde-tagged on `type` with `snake_case`
 //! discriminators and snake_case fields (pi's RPC vocabulary), so the same
-//! objects cross stdio RPC (CRAB-120), the TUI (CRAB-121) and the WebSocket
-//! server (CRAB-122) unchanged. The vocabulary:
+//! objects cross stdio RPC, the TUI and the WebSocket
+//! server unchanged. The vocabulary:
 //!
 //! ```text
 //! Event:   agent_start, text_delta, thinking_delta, tool_start, tool_end,
@@ -55,7 +55,7 @@ use crate::skills::{self, Skill};
 use crate::tools::resolver::ToolSet;
 use crate::workspace::Workspace;
 
-/// Canonical thinking level, mapped per provider (CRAB-116). Off disables
+/// Canonical thinking level, mapped per provider. Off disables
 /// thinking; the other levels request progressively more reasoning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,7 +108,7 @@ impl Effort {
 
     /// Anthropic thinking budget in tokens for this level (`None` for `off`,
     /// which disables the thinking block). Hardcoded capability table — no
-    /// discovery endpoint, per CRAB-116.
+    /// discovery endpoint.
     pub fn anthropic_thinking_budget(self) -> Option<usize> {
         match self {
             Effort::Off => None,
@@ -126,7 +126,7 @@ impl fmt::Display for Effort {
     }
 }
 
-/// Whether a stored tool-result string represents success (CRAB-158). Failures
+/// Whether a stored tool-result string represents success. Failures
 /// are formatted as `tool error: ...`; a call cut off by the output token limit
 /// records that it "was not executed". Shared so the runtime's `tool_end`
 /// events and the TUI's resumed-transcript replay agree on the marker.
@@ -134,7 +134,7 @@ pub fn tool_result_ok(result: &str) -> bool {
     !result.starts_with("tool error:") && !result.contains("was not executed")
 }
 
-/// Hardcoded per-provider capability table (CRAB-116): maps a canonical
+/// Hardcoded per-provider capability table: maps a canonical
 /// effort level to the wire value the provider understands. No discovery.
 pub fn provider_effort(provider: &ProviderInfo, effort: Effort) -> serde_json::Value {
     match provider.effort {
@@ -177,7 +177,7 @@ pub enum Event {
         id: Option<String>,
         /// Raw model-supplied tool arguments, so a frontend can show what the
         /// call will do (e.g. the bash command). Optional and omitted on the
-        /// wire when absent, so older event consumers keep working (CRAB-139).
+        /// wire when absent, so older event consumers keep working.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         args: Option<Value>,
     },
@@ -188,8 +188,8 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
         /// The tool result text, so a frontend can render the output under the
-        /// call line (CRAB-158). Optional and omitted on the wire when empty,
-        /// so older event consumers keep working (CRAB-139). Bounded by the
+        /// call line. Optional and omitted on the wire when empty,
+        /// so older event consumers keep working. Bounded by the
         /// tool's own `max_output` (32 KB by default), so the JSON/RPC frames
         /// stay small.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,13 +210,13 @@ pub enum Event {
         model: String,
         effort: Effort,
         workspace: String,
-        /// Active provider name; defaults for older clients (CRAB-142).
+        /// Active provider name; defaults for older clients.
         #[serde(default)]
         provider: String,
     },
     /// The agent settled: a final answer (or empty when cancelled).
     AgentSettled { text: String, interrupted: bool },
-    /// The provider's available model ids, in reply to `list_models` (CRAB-141).
+    /// The provider's available model ids, in reply to `list_models`.
     ModelsListed { models: Vec<String> },
     /// A non-fatal error surfaced by the runtime.
     Error { message: String },
@@ -269,7 +269,7 @@ pub enum CommandKind {
     Abort {},
     /// Change the model used for subsequent completions.
     SetModel { model: String },
-    /// Switch the active provider at runtime (CRAB-142).
+    /// Switch the active provider at runtime.
     SetProvider { provider: String },
     /// Change the thinking level.
     SetEffort { effort: Effort },
@@ -279,7 +279,7 @@ pub enum CommandKind {
     Clear {},
     /// Ask the runtime to report its current state.
     GetState {},
-    /// Discover the configured provider's available models (CRAB-141).
+    /// Discover the configured provider's available models.
     ListModels {},
     /// Reload the previous saved session for the workspace. Handled by the
     /// adapter (the runtime does not own the session store).
@@ -324,7 +324,7 @@ impl RuntimeError {
 #[serde(rename_all = "snake_case")]
 pub struct RuntimeState {
     pub model: String,
-    /// Active provider name (CRAB-142).
+    /// Active provider name.
     pub provider: String,
     pub effort: Effort,
     pub workspace: String,
@@ -404,7 +404,7 @@ fn trim_history(
 /// adapters can snapshot it (session save) while a turn runs.
 struct Inner {
     config: Config,
-    /// The active provider; swappable at runtime (CRAB-142).
+    /// The active provider; swappable at runtime.
     provider: Mutex<Arc<dyn Provider>>,
     /// Registry row of the active provider.
     provider_info: Mutex<&'static ProviderInfo>,
@@ -415,7 +415,7 @@ struct Inner {
     /// Mutable runtime state (model/effort), guarded for adapter `get_state`.
     state: Mutex<RuntimeState>,
     /// Per-session cancel, threaded into providers and tools (replaces the
-    /// process-global `term::cancel_flag`; CRAB-130). Guarded so the worker
+    /// process-global `term::cancel_flag`). Guarded so the worker
     /// can swap in a fresh token when a turn settles (abort is one-shot:
     /// `tokio_util::sync::CancellationToken` has no reset). Callers snapshot
     /// the current token with [`AgentRuntime::cancel_token`].
@@ -436,13 +436,13 @@ struct Inner {
     commands_tx: tokio::sync::mpsc::UnboundedSender<Control>,
     commands_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Control>>,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
-    /// Cached model ids discovered for the current provider (CRAB-141).
+    /// Cached model ids discovered for the current provider.
     models: Mutex<Vec<String>>,
 }
 
 /// A cloneable handle to a running agent. Construct with `AgentRuntime::new`
 /// to get the handle plus its event `Receiver`; drive it with `run_forever`
-/// on a thread the adapter chooses (the REPL spawns one; CRAB-122 gives each
+/// on a thread the adapter chooses (the REPL spawns one; the server gives each
 /// connected session its own thread).
 #[derive(Clone)]
 pub struct AgentRuntime {
@@ -620,12 +620,12 @@ impl AgentRuntime {
     }
 
     /// The provider kind this runtime was built with (for /login and the
-    /// model picker, CRAB-121).
+    /// model picker).
     pub fn provider_kind(&self) -> &'static ProviderInfo {
         *self.inner.provider_info.lock().unwrap()
     }
 
-    /// Cached model ids discovered for the current provider (CRAB-141).
+    /// Cached model ids discovered for the current provider.
     pub fn models(&self) -> Vec<String> {
         self.inner.models.lock().unwrap().clone()
     }
@@ -639,7 +639,7 @@ impl AgentRuntime {
             .send(Control::Command(CommandKind::ListModels {}));
     }
 
-    /// Switch the active provider at runtime (CRAB-142). The worker rebuilds
+    /// Switch the active provider at runtime. The worker rebuilds
     /// the provider and emits `StateChanged` (or `Error` when it refuses).
     pub fn set_provider(&self, provider: &str) {
         let _ = self
@@ -652,7 +652,7 @@ impl AgentRuntime {
 
     /// Rebuild the active provider for `name`: resolve the registry row and
     /// key, refuse a keyless hosted provider, swap the provider (keeping the
-    /// conversation), then refresh the model list (CRAB-142).
+    /// conversation), then refresh the model list.
     async fn switch_provider(&self, name: &str) {
         let info = match crate::config::provider_by_name(name) {
             Ok(i) => i,
@@ -700,7 +700,7 @@ impl AgentRuntime {
     }
 
     /// Skills discovered for the current workspace (user + workspace levels,
-    /// workspace wins on a name clash, CRAB-138). Re-read on every call so a
+    /// workspace wins on a name clash). Re-read on every call so a
     /// file dropped into `<workspace>/.daedalus/skills/` is picked up on the next
     /// turn. Workspace skills are resolved through the sandbox, so a symlinked
     /// skill cannot smuggle content from outside the workspace.
@@ -710,7 +710,7 @@ impl AgentRuntime {
     }
 
     /// `(name, description)` for every registered tool — built-ins plus any
-    /// MCP tools (CRAB-133) — for the TUI `/tools` listing.
+    /// MCP tools — for the TUI `/tools` listing.
     pub fn tool_listing(&self) -> Vec<(String, String)> {
         self.inner.tools.listing()
     }
@@ -731,7 +731,7 @@ impl AgentRuntime {
 
     /// Drive the worker loop forever (until `shutdown`). Blocks the calling
     /// thread; adapters spawn this on a thread of their choosing (the TUI
-    /// spawns one, CRAB-122 gives each connected session its own). The thread
+    /// spawns one, the server gives each connected session its own). The thread
     /// owns a tokio current-thread runtime that drives the async turn engine.
     pub fn run_forever(&self) {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -741,7 +741,7 @@ impl AgentRuntime {
         rt.block_on(self.run_forever_async());
     }
 
-    /// The async body of the worker loop (CRAB-130).
+    /// The async body of the worker loop.
     async fn run_forever_async(&self) {
         {
             let st = self.inner.state.lock().unwrap();
@@ -799,7 +799,7 @@ impl AgentRuntime {
         rt.block_on(self.run_once_async(prompt))
     }
 
-    /// The async body of `run_once` (CRAB-130).
+    /// The async body of `run_once`.
     async fn run_once_async(&self, prompt: &str) -> Result<String, RuntimeError> {
         self.set_busy(true);
         self.cancel_clear();
@@ -864,7 +864,7 @@ impl AgentRuntime {
     }
 
     /// The seed system prompt for the current workspace, including the skills
-    /// catalog when any skills are installed (CRAB-138).
+    /// catalog when any skills are installed.
     fn system_prompt(&self) -> String {
         let base = format!(
             "You are daedalus, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
@@ -1010,8 +1010,8 @@ impl AgentRuntime {
     /// results are fed back verbatim; text deltas and tool lifecycle emit
     /// events. Runs entirely on the worker thread.
     ///
-    /// Keep `history` within `budget` tokens. Prefers **compaction**
-    /// (CRAB-107 #13): the oldest removable turn blocks are summarized via a
+    /// Keep `history` within `budget` tokens. Prefers **compaction**: the
+    /// oldest removable turn blocks are summarized via a
     /// provider call and replaced with a compact System summary, so the agent
     /// keeps a compressed memory instead of silently losing old turns. When
     /// compaction is unavailable (e.g. the provider is fake) or fails, falls
@@ -1226,7 +1226,7 @@ impl AgentRuntime {
                 Err(e) => {
                     // Auth failures carry the provider name and remediation, so a
                     // revoked or incorrect key is actionable rather than a bare
-                    // provider status (CRAB-143).
+                    // provider status.
                     let message = match &e {
                         crate::provider::ProviderError::Auth(_) => {
                             let info = *self.inner.provider_info.lock().unwrap();
@@ -1280,7 +1280,7 @@ impl AgentRuntime {
                                 text: None,
                                 tool_calls: calls.clone(),
                             });
-                            // Run tool calls in parallel (CRAB-107 #11), like
+                            // Run tool calls in parallel, like
                             // pi. Each thread locks the workspace and checks
                             // the shared cancel flag; results are collected in
                             // call order so history stays deterministic.
@@ -1461,7 +1461,7 @@ mod tests {
         (dir, ws)
     }
 
-    /// CRAB-138: a skill in `<workspace>/.daedalus/skills/` shows up in the
+    /// A skill in `<workspace>/.daedalus/skills/` shows up in the
     /// system-prompt catalog. The user-level dir is not injected here, so a
     /// real `~/.config/daedalus/skills` can only add entries, never remove the
     /// workspace one this asserts on.
@@ -1696,7 +1696,7 @@ mod tests {
         rt.prompt("first");
         collect_until_settled(&mut rx);
         // A queued /clear must emit state_changed so an rpc adapter has a
-        // deterministic ack boundary (CRAB-120).
+        // deterministic ack boundary.
         rt.clear();
         let mut seen_state = false;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1889,7 +1889,7 @@ mod tests {
         rt.prompt("run a command");
         let (events, settled) = collect_until_settled(&mut rx);
         assert!(settled);
-        // CRAB-139: the event carries the call's arguments so a frontend can
+        // The event carries the call's arguments so a frontend can
         // show the executed command.
         assert!(events.iter().any(|e| matches!(
             e,
@@ -1899,7 +1899,7 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ToolEnd { name, ok: true, .. } if name == "bash")));
-        // CRAB-158: the same event carries the result text so a frontend can
+        // The same event carries the result text so a frontend can
         // render the output under the call line.
         assert!(events.iter().any(|e| matches!(
             e,
@@ -2174,7 +2174,7 @@ mod compaction_tests {
     use super::*;
     use crate::provider::fake::FakeProvider;
 
-    /// Block on an async runtime method (tests are sync; CRAB-130).
+    /// Block on an async runtime method (tests are sync).
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2280,8 +2280,8 @@ mod effort_tests {
     use crate::provider::{Completion, ProviderError};
     use std::sync::Mutex as StdMutex;
 
-    /// CRAB-130: the runtime computes the provider-flavored effort parameters
-    /// (`provider_effort`, CRAB-116) and hands them to every completion call.
+    /// The runtime computes the provider-flavored effort parameters
+    /// (`provider_effort`) and hands them to every completion call.
     #[test]
     fn effort_params_flow_into_provider_calls() {
         struct EffortRecorder {

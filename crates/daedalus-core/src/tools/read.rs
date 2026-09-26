@@ -168,7 +168,7 @@ impl Tool for ReadTool {
 }
 
 impl ReadTool {
-    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    /// The synchronous body, executed on the blocking pool.
     fn run_sync(
         &self,
         workspace: &Workspace,
@@ -456,7 +456,7 @@ impl ReadTool {
 mod tests {
     use super::*;
 
-    /// Block on a tool future (tests are sync; CRAB-130).
+    /// Block on a tool future (tests are sync).
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -518,7 +518,7 @@ mod tests {
         ));
     }
 
-    /// CRAB-152: a pre-cancelled token stops the read before any work.
+    /// A pre-cancelled token stops the read before any work.
     #[tokio::test]
     async fn cancelled_read_returns_cancelled() {
         let (ws, _dir) = setup("cancel", "x\n");
@@ -597,7 +597,7 @@ mod tests {
         assert!(out.content.contains("sed -n '1p'"));
     }
 
-    /// CRAB-139 review: a FIFO (or any non-regular file) must be rejected
+    /// A FIFO (or any non-regular file) must be rejected
     /// instead of blocking forever on open.
     #[cfg(unix)]
     #[tokio::test]

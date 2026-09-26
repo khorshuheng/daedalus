@@ -52,8 +52,8 @@ fn fuzzy_char(c: char) -> char {
 }
 
 /// A normalized string plus, for each normalized char, the byte range it
-/// came from in the original. NFKC is applied per extended grapheme cluster
-/// (CRAB-149): it can compose across code points ("e" + U+0301 -> "é") and
+/// came from in the original. NFKC is applied per extended grapheme cluster:
+/// it can compose across code points ("e" + U+0301 -> "é") and
 /// expand one cluster into several chars (ligatures, compat forms), so a
 /// match in normalized space maps back to the original through this table.
 /// Trailing whitespace on each line is trimmed and excluded from the map
@@ -74,8 +74,8 @@ fn normalize_for_fuzzy(s: &str) -> (String, Vec<(usize, usize)>) {
     }
     // Trim trailing whitespace on each line (pi's normalizeForFuzzyMatch), so
     // a model's oldText without trailing whitespace matches file lines that
-    // have it (spaces, tabs, any Unicode whitespace — `char::is_whitespace`,
-    // CRAB-150). Trimming drops entries from the map, keeping indices aligned.
+    // have it (spaces, tabs, any Unicode whitespace — `char::is_whitespace`).
+    // Trimming drops entries from the map, keeping indices aligned.
     let mut result = String::new();
     let mut result_map: Vec<(usize, usize)> = Vec::new();
     let mut line: Vec<(char, (usize, usize))> = Vec::new();
@@ -139,7 +139,7 @@ fn locate_match(
     let exact: Vec<usize> = content.match_indices(old).map(|(i, _)| i).collect();
     match exact.len() {
         1 => {
-            // CRAB-151: uniqueness is decided in normalized space even when the
+            // Uniqueness is decided in normalized space even when the
             // exact match is unique, so an ASCII-quote oldText cannot silently
             // pick one of several curly-quote twins (pi's `countOccurrences`).
             let normalized_count = normalized_occurrences(content, old);
@@ -196,8 +196,8 @@ fn locate_match(
     }
 }
 
-/// Number of occurrences of `old` in `content` after fuzzy normalization
-/// (CRAB-151). Zero is possible when an exact byte match spans a grapheme
+/// Number of occurrences of `old` in `content` after fuzzy normalization.
+/// Zero is possible when an exact byte match spans a grapheme
 /// cluster that normalization composes away; only counts > 1 are ambiguous.
 fn normalized_occurrences(content: &str, old: &str) -> usize {
     let (fuzzy_content, _) = normalize_for_fuzzy(content);
@@ -206,7 +206,7 @@ fn normalized_occurrences(content: &str, old: &str) -> usize {
 }
 
 /// Minimal unified diff (no context) between two texts, sufficient to show the
-/// model what changed. Delegates the line diff to `similar` (CRAB-119),
+/// model what changed. Delegates the line diff to `similar`,
 /// rendered with no surrounding context.
 fn unified_diff(old: &str, new: &str) -> String {
     similar::TextDiff::from_lines(old, new)
@@ -265,7 +265,7 @@ impl Tool for EditTool {
 }
 
 impl EditTool {
-    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    /// The synchronous body, executed on the blocking pool.
     fn run_sync(
         &self,
         workspace: &Workspace,
@@ -291,7 +291,7 @@ impl EditTool {
             };
 
         let resolved = resolve(workspace, Path::new(&path))?;
-        // Serialize with any concurrent write/edit of the same file (CRAB-146).
+        // Serialize with any concurrent write/edit of the same file.
         with_file_mutation(&resolved, || edit_at(&resolved, &path, &edits, cancel))
     }
 }
@@ -304,13 +304,12 @@ fn edit_at(
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
     // Check before the read-modify-write so an aborted turn leaves the file
-    // untouched (CRAB-152).
+    // untouched.
     if cancel.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
     // Reject non-regular files before opening: a FIFO/device/socket would
-    // block the read forever, and blocking tasks cannot be cancelled
-    // (CRAB-139 review).
+    // block the read forever, and blocking tasks cannot be cancelled.
     let meta = match std::fs::metadata(resolved) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -535,7 +534,7 @@ mod tests {
         assert_eq!(read(&dir), "alpha   \ngamma   \n");
     }
 
-    /// CRAB-149: NFKC composition across a code-point boundary must match
+    /// NFKC composition across a code-point boundary must match
     /// (precomposed file text vs a decomposed model oldText).
     #[tokio::test]
     async fn fuzzy_matches_decomposed_against_precomposed() {
@@ -552,7 +551,7 @@ mod tests {
         assert_eq!(read(&dir), "tea\n");
     }
 
-    /// CRAB-149: bytes around a normalized match are preserved exactly.
+    /// Bytes around a normalized match are preserved exactly.
     #[tokio::test]
     async fn fuzzy_match_preserves_surrounding_bytes() {
         let (ws, dir) = setup("surround", "before cafe\u{0301} after\n");
@@ -567,7 +566,7 @@ mod tests {
         assert_eq!(read(&dir), "before X after\n");
     }
 
-    /// CRAB-150: trailing whitespace other than a space (tabs, etc.) is trimmed
+    /// Trailing whitespace other than a space (tabs, etc.) is trimmed
     /// in the fuzzy view too, and bytes outside the match are preserved.
     #[tokio::test]
     async fn fuzzy_trims_trailing_tabs() {
@@ -585,7 +584,7 @@ mod tests {
         assert_eq!(read(&dir), "ALPHA\nBETA\t\n");
     }
 
-    /// CRAB-151: an exact match that is ambiguous in normalized space (an ASCII
+    /// An exact match that is ambiguous in normalized space (an ASCII
     /// quote and a curly-quote twin) must be rejected, like pi.
     #[tokio::test]
     async fn exact_match_ambiguous_in_normalized_space_is_rejected() {
@@ -603,7 +602,7 @@ mod tests {
         assert!(err.to_string().contains("matched 2 times"), "{err}");
     }
 
-    /// CRAB-151: enough context makes the normalized space unique, so the edit
+    /// Enough context makes the normalized space unique, so the edit
     /// is allowed.
     #[tokio::test]
     async fn exact_match_unique_in_normalized_space_is_allowed() {
@@ -637,7 +636,7 @@ mod tests {
         assert!(matches!(err, ToolError::Invalid(_)));
     }
 
-    /// CRAB-146: concurrent edits to the same file must not lose updates.
+    /// Concurrent edits to the same file must not lose updates.
     #[tokio::test]
     async fn concurrent_edits_to_same_file_all_apply() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -671,7 +670,7 @@ mod tests {
         assert_eq!(got, expected);
     }
 
-    /// CRAB-152: a pre-cancelled token means the file is never rewritten.
+    /// A pre-cancelled token means the file is never rewritten.
     #[tokio::test]
     async fn cancelled_edit_leaves_file_unchanged() {
         let (ws, dir) = setup("cancel", "hello");
@@ -689,7 +688,7 @@ mod tests {
         assert_eq!(read(&dir), "hello");
     }
 
-    /// CRAB-139 review: a FIFO must be rejected before the read, which would
+    /// A FIFO must be rejected before the read, which would
     /// otherwise block forever.
     #[cfg(unix)]
     #[tokio::test]

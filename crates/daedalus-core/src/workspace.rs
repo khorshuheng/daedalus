@@ -1,4 +1,4 @@
-//! Workspace scoping (CRAB-105).
+//! Workspace scoping.
 //!
 //! The workspace is the default root that relative `read`/`write`/`edit` paths
 //! and `bash` commands resolve against. Absolute paths and `..` are allowed:
@@ -32,7 +32,7 @@ fn normalize_path(rel: &Path, home: Option<&Path>) -> PathBuf {
     PathBuf::from(expand_tilde(&normalized, home))
 }
 
-/// Expand a leading `~` or `~/…` to `home` (CRAB-148). `~user` and interior
+/// Expand a leading `~` or `~/…` to `home`. `~user` and interior
 /// `~` are left untouched; when no home directory is known the path is returned
 /// unchanged, so a missing home never turns a relative path absolute.
 fn expand_tilde(s: &str, home: Option<&Path>) -> String {
@@ -48,7 +48,7 @@ fn expand_tilde(s: &str, home: Option<&Path>) -> String {
     }
 }
 
-/// The user's home directory, if it can be determined (CRAB-148). `BaseDirs`
+/// The user's home directory, if it can be determined. `BaseDirs`
 /// handles the platform conventions; `$HOME` is the Unix fallback.
 fn home_dir() -> Option<PathBuf> {
     directories::BaseDirs::new()
@@ -88,8 +88,7 @@ impl Workspace {
     }
 
     /// Like [`resolve`](Self::resolve) but with an explicit home directory, so
-    /// the `~` expansion is testable without touching the process `$HOME`
-    /// (CRAB-148).
+    /// the `~` expansion is testable without touching the process `$HOME`.
     fn resolve_with_home(&self, rel: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
         let normalized = normalize_path(rel, home);
         let joined = if normalized.is_absolute() {
@@ -130,7 +129,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    /// A unique temp dir cleaned up on drop (tempfile).
     fn tempdir(_name: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let base = dir.path().to_path_buf();
@@ -197,7 +196,7 @@ mod tests {
         assert_eq!(p, dir.join("a b.txt"));
     }
 
-    /// CRAB-148: a leading `~`/`~/` expands to the home directory; `~user` and
+    /// A leading `~`/`~/` expands to the home directory; `~user` and
     /// interior `~` are left alone, and an unknown home leaves the path as-is.
     #[test]
     fn expands_leading_tilde_only() {
@@ -210,7 +209,7 @@ mod tests {
         assert_eq!(expand_tilde("~/a", None), "~/a");
     }
 
-    /// CRAB-148: resolution honors the expanded home and canonicalizes it.
+    /// Resolution honors the expanded home and canonicalizes it.
     #[test]
     fn expands_tilde_to_home_when_resolving() {
         let (_guard, dir) = tempdir("tilde");

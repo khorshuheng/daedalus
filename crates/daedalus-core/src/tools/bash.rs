@@ -1,13 +1,12 @@
 //! The `bash` tool: run a shell command in the workspace directory.
 //!
 //! The shell runs in its own process group (Unix) so a timeout or cancel can
-//! kill the whole tree — including grandchildren — not just the direct child
-//! (CRAB-107 #14).
+//! kill the whole tree — including grandchildren — not just the direct child.
 //!
 //! stdout/stderr are drained on reader threads. A command that leaves a
 //! background process holding the pipes open (`sh -c "sleep 100 &"`) does not
 //! block the tool: after the direct child exits the readers get a short grace
-//! to drain, then are stopped (CRAB-147, mirroring pi's `EXIT_STDIO_GRACE_MS`).
+//! to drain, then are stopped (mirroring pi's `EXIT_STDIO_GRACE_MS`).
 
 use futures::future::BoxFuture;
 use std::ffi::OsStr;
@@ -34,18 +33,17 @@ pub struct BashTool {
 }
 
 /// How long after the direct child exits to let the stdout/stderr readers reach
-/// EOF before proceeding without them (CRAB-147). A descendant that keeps a
+/// EOF before proceeding without them. A descendant that keeps a
 /// pipe write end open must not hold the tool hostage.
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(150);
 
 /// Upper bound for a model-supplied `timeout`, matching pi's `MAX_TIMEOUT_MS`
 /// (2_147_483_647 ms). Keeps `Instant + Duration` far from overflow and rejects
-/// nonsense values with a clear error instead of a panic in the blocking task
-/// (CRAB-153).
+/// nonsense values with a clear error instead of a panic in the blocking task.
 const MAX_TIMEOUT_SECS: u64 = i32::MAX as u64;
 
 /// State shared between `run_command` and its reader threads. stdout and
-/// stderr append to one buffer in arrival order (CRAB-155), matching pi's
+/// stderr append to one buffer in arrival order, matching pi's
 /// single `OutputAccumulator`.
 struct StreamCapture {
     buf: Mutex<Vec<u8>>,
@@ -66,8 +64,8 @@ impl StreamCapture {
     }
 }
 
-/// Drain `pipe` into the shared buffer until EOF or the `stop` flag is set
-/// (CRAB-147/155). The thread exits on EOF; a descendant that keeps the pipe
+/// Drain `pipe` into the shared buffer until EOF or the `stop` flag is set.
+/// The thread exits on EOF; a descendant that keeps the pipe
 /// open can leave it blocked in `read`, which is deliberate — the parent never
 /// joins it.
 fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCapture>) {
@@ -94,7 +92,7 @@ fn drain(mut pipe: impl std::io::Read + Send + 'static, capture: Arc<StreamCaptu
 }
 
 /// Resolve the shell used by the `bash` tool, mirroring pi: `/bin/bash`, then
-/// `bash` on `PATH`, then `sh` (CRAB-154). Cached because it is pure.
+/// `bash` on `PATH`, then `sh`. Cached because it is pure.
 fn resolve_shell() -> PathBuf {
     static SHELL: OnceLock<PathBuf> = OnceLock::new();
     SHELL
@@ -163,7 +161,7 @@ fn run_command(
     }
 
     // `checked_add` so an absurd timeout is a bad argument, not a panic
-    // (defense in depth behind the argument/schema clamp in CRAB-153).
+    // (defense in depth behind the argument/schema clamp).
     let deadline = match timeout_secs {
         Some(s) => Some(
             Instant::now()
@@ -198,8 +196,7 @@ fn run_command(
 
     let _ = child.wait();
     // Let the readers drain what the child already wrote, then stop them, so a
-    // descendant holding the pipe cannot block the join or grow the buffer
-    // (CRAB-147).
+    // descendant holding the pipe cannot block the join or grow the buffer.
     let drain_deadline = Instant::now() + EXIT_STDIO_GRACE;
     while capture.done.load(Ordering::SeqCst) < 2 && Instant::now() < drain_deadline {
         std::thread::sleep(Duration::from_millis(5));
@@ -288,7 +285,7 @@ impl Tool for BashTool {
 }
 
 impl BashTool {
-    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    /// The synchronous body, executed on the blocking pool.
     fn run_sync(
         &self,
         workspace: &Workspace,
@@ -309,7 +306,7 @@ impl BashTool {
 
         let output = run_command(&command, workspace.root(), timeout, &cancel)?;
 
-        // stdout and stderr are merged in arrival order (CRAB-155); no stream
+        // stdout and stderr are merged in arrival order; no stream
         // labels, matching pi's single accumulator.
         let text = String::from_utf8_lossy(&output.stdout).to_string();
 
@@ -353,7 +350,7 @@ mod tests {
         (Workspace::new(root).unwrap(), dir)
     }
 
-    /// Block on a tool future (tests are sync; CRAB-130).
+    /// Block on a tool future (tests are sync).
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -366,7 +363,7 @@ mod tests {
         CancellationToken::new()
     }
 
-    /// CRAB-154: shell resolution prefers /bin/bash, then bash on PATH, then sh.
+    /// Shell resolution prefers /bin/bash, then bash on PATH, then sh.
     #[test]
     fn shell_resolution_order() {
         use std::ffi::OsStr;
@@ -389,7 +386,7 @@ mod tests {
         assert_eq!(super::pick_shell(false, Some(dir.path().as_os_str())), bash);
     }
 
-    /// CRAB-154: the tool now runs bash, so a bash-only construct works.
+    /// The tool now runs bash, so a bash-only construct works.
     #[cfg(unix)]
     #[tokio::test]
     async fn runs_bash_only_syntax() {
@@ -437,7 +434,7 @@ mod tests {
         assert!(msg.contains("Command exited with code 3"));
     }
 
-    /// CRAB-155: stdout and stderr share one buffer, so their relative order is
+    /// Stdout and stderr share one buffer, so their relative order is
     /// preserved and no `stdout:`/`stderr:` labels are emitted.
     #[tokio::test]
     async fn interleaves_stdout_and_stderr_in_arrival_order() {
@@ -500,7 +497,7 @@ mod tests {
     }
 
     /// The configured default timeout applies when the model omits `timeout`,
-    /// so an unbounded command cannot run forever (CRAB-139 review).
+    /// so an unbounded command cannot run forever.
     #[tokio::test]
     async fn default_timeout_applies_when_omitted() {
         let (ws, _dir) = setup("default-timeout");
@@ -515,7 +512,7 @@ mod tests {
         assert!(matches!(err, ToolError::Timeout(_)));
     }
 
-    /// CRAB-153: an absurd timeout is a bad argument, not an `Instant` overflow
+    /// An absurd timeout is a bad argument, not an `Instant` overflow
     /// panic inside the blocking task.
     #[tokio::test]
     async fn huge_timeout_is_a_bad_argument() {
@@ -550,7 +547,7 @@ mod tests {
         assert!(matches!(err, ToolError::Timeout(_)));
     }
 
-    /// CRAB-147: a backgrounded descendant that keeps the pipes open must not
+    /// A backgrounded descendant that keeps the pipes open must not
     /// hang the tool when no default timeout applies.
     #[cfg(unix)]
     #[tokio::test]

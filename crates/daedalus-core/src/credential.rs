@@ -1,4 +1,4 @@
-//! API-key credentials (CRAB-118): secrets never live in the config file.
+//! API-key credentials: secrets never live in the config file.
 //!
 //! Resolution order, applied when building the config:
 //!
@@ -100,7 +100,7 @@ mod keyring_tests {
     /// A synthetic provider so these tests can never read, overwrite, or
     /// delete a real provider's stored key. They previously used `openai` and
     /// `deepseek`, so `cargo test` destroyed a developer's credentials on
-    /// every run (CRAB-143). Each test gets its own account so the parallel
+    /// every run. Each test gets its own account so the parallel
     /// test runner cannot race on a shared entry.
     fn probe(name: &'static str) -> ProviderInfo {
         ProviderInfo {

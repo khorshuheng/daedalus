@@ -44,7 +44,7 @@ impl Tool for WriteTool {
 }
 
 impl WriteTool {
-    /// The synchronous body, executed on the blocking pool (CRAB-130).
+    /// The synchronous body, executed on the blocking pool.
     fn run_sync(
         &self,
         workspace: &Workspace,
@@ -58,7 +58,7 @@ impl WriteTool {
             .ok_or_else(|| ToolError::Argument("'content' must be a string".into()))?;
 
         let resolved = resolve(workspace, Path::new(&path))?;
-        // Serialize with any concurrent write/edit of the same file (CRAB-146).
+        // Serialize with any concurrent write/edit of the same file.
         with_file_mutation(&resolved, || write_at(&resolved, &path, content, cancel))
     }
 }
@@ -71,14 +71,14 @@ fn write_at(
     content: &str,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, ToolError> {
-    // Check before touching the filesystem so an aborted turn cannot write
-    // (CRAB-152); the single `fs::write` below cannot be interrupted anyway.
+    // Check before touching the filesystem so an aborted turn cannot write;
+    // the single `fs::write` below cannot be interrupted anyway.
     if cancel.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
     // A FIFO/device/socket at this path would block `fs::write` on open, so
     // reject an existing non-regular file. A missing path is a normal
-    // create (CRAB-139 review).
+    // create.
     if let Ok(meta) = std::fs::metadata(resolved) {
         if !meta.is_file() {
             return Err(ToolError::Invalid(format!(
@@ -162,7 +162,7 @@ mod tests {
         );
     }
 
-    /// CRAB-152: a pre-cancelled token means the write never happens.
+    /// A pre-cancelled token means the write never happens.
     #[tokio::test]
     async fn cancelled_write_leaves_no_file() {
         let (ws, dir) = setup("cancel");
@@ -176,7 +176,7 @@ mod tests {
         assert!(!dir.path().join("b.txt").exists());
     }
 
-    /// CRAB-139 review: writing to an existing FIFO would block on open.
+    /// Writing to an existing FIFO would block on open.
     #[cfg(unix)]
     #[tokio::test]
     async fn rejects_writing_to_non_regular_files() {

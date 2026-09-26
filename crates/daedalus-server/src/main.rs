@@ -1,4 +1,4 @@
-//! The `daedalus-server` binary (CRAB-124): parse flags, load config, and serve the
+//! The `daedalus-server` binary: parse flags, load config, and serve the
 //! WebSocket RPC protocol.
 //!
 //! Binds a loopback address by default. Remote/mobile use is intended to sit

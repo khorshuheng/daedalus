@@ -1,6 +1,6 @@
-//! Skills (CRAB-138): pi-style load-on-demand instruction files.
+//! Skills: pi-style load-on-demand instruction files.
 //!
-//! With the memory/self-improving loop gone (CRAB-137), skills are the one
+//! With the memory/self-improving loop gone, skills are the one
 //! mechanism for users to extend the agent's instructions without touching
 //! code. A skill is a markdown file `<name>.md` discovered in two places:
 //!

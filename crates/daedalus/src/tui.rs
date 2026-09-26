@@ -1,12 +1,12 @@
-//! Ratatui TUI (CRAB-121), modeled on pi's interactive mode.
+//! Ratatui TUI, modeled on pi's interactive mode.
 //!
 //! The TUI is a **client of `AgentRuntime`** — it never owns the agent loop.
 //! It sends commands (`prompt`/`steer`/`abort`/`set_model`/`set_effort`/
 //! `switch_workspace`/`clear`/`resume`) and renders the runtime's Event
 //! stream. Layout: transcript on top, a line-editing input with a visible
-//! caret at the bottom (CRAB-126), a centered picker overlay for /model,
-//! /effort, /provider and /resume (CRAB-127), and a footer/status line (provider, model, effort,
-//! animated spinner while busy, CRAB-128). CRAB-138 adds `/skills` (list) and
+//! caret at the bottom, a centered picker overlay for /model,
+//! /effort, /provider and /resume, and a footer/status line (provider, model, effort,
+//! animated spinner while busy). `/skills` lists skills and
 //! `/skill <name>` (load an instruction file as a user message). Dragging over
 //! the transcript highlights text; Ctrl-Y copies the selection with OSC 52.
 //!
@@ -69,7 +69,7 @@ pub enum SlashCommand {
     Skills,
     /// Load a skill's content into the conversation as a user message.
     Skill(String),
-    /// List the registered tools (built-ins + MCP servers, CRAB-133).
+    /// List the registered tools (built-ins + MCP servers).
     Tools,
     /// Continue the previous session for this workspace.
     Resume,
@@ -82,7 +82,7 @@ pub enum SlashCommand {
 }
 
 /// Metadata for one slash command: the single source of truth for the parser,
-/// `/help`, and the completion dropdown (CRAB-141).
+/// `/help`, and the completion dropdown.
 pub struct CommandSpec {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
@@ -180,7 +180,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-/// Slash-command candidates for the input's leading `/token` (CRAB-141).
+/// Slash-command candidates for the input's leading `/token`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     /// Indexes into [`COMMANDS`].
@@ -241,7 +241,7 @@ pub fn parse_line(line: &str) -> LineAction {
 }
 
 /// One-line, human-readable summary of a tool call's arguments, shown after
-/// the tool name in the transcript (CRAB-139). Returns `None` when there is no
+/// the tool name in the transcript. Returns `None` when there is no
 /// useful single-line summary, so the call line stays just `⚙ <name>`.
 pub fn tool_detail(name: &str, args: Option<&serde_json::Value>) -> Option<String> {
     let args = args?;
@@ -360,11 +360,11 @@ impl TranscriptScroll {
 pub enum TranscriptLine {
     User(String),
     Assistant(String),
-    /// Streamed model reasoning (CRAB-139), rendered dim and italic.
+    /// Streamed model reasoning, rendered dim and italic.
     Thinking(String),
     Tool(String),
-    /// A finished tool call: the `✓`/`✗` marker line (CRAB-140 tokens),
-    /// followed by the result text when present (CRAB-158).
+    /// A finished tool call: the `✓`/`✗` marker line (theme tokens),
+    /// followed by the result text when present.
     ToolResult {
         name: String,
         ok: bool,
@@ -379,7 +379,7 @@ pub enum TranscriptLine {
 pub struct UiModel {
     pub transcript: Vec<TranscriptLine>,
     pub assistant_buf: String,
-    /// Streamed model reasoning, flushed as a `Thinking` line (CRAB-139).
+    /// Streamed model reasoning, flushed as a `Thinking` line.
     pub thinking_buf: String,
     pub state: RuntimeState,
     pub usage: Option<usize>,
@@ -388,7 +388,7 @@ pub struct UiModel {
     pub settled: bool,
     /// Transcript scrollback (follow the tail unless the user scrolled up).
     pub scroll: TranscriptScroll,
-    /// Global tool-output expansion (Ctrl+O, CRAB-158). When false, tool
+    /// Global tool-output expansion (Ctrl+O). When false, tool
     /// results render as a collapsed preview. Private so it is only ever
     /// changed through `toggle_verbose`, which invalidates the render cache.
     verbose: bool,
@@ -396,9 +396,9 @@ pub struct UiModel {
     pub revision: u64,
     /// Cache of the rendered transcript, keyed by (revision, area width).
     pub md_cache: Option<(u64, u16, Vec<ratatui::text::Line<'static>>)>,
-    /// Active slash-command completion, if any (CRAB-141).
+    /// Active slash-command completion, if any.
     pub completion: Option<Completion>,
-    /// True while a `/model` model-list fetch is in flight (CRAB-141).
+    /// True while a `/model` model-list fetch is in flight.
     pub model_fetch_pending: bool,
     /// Mouse text selection over the transcript (absolute screen cells), for
     /// Ctrl-Y copy. Cleared by scrolling and by a plain click.
@@ -508,7 +508,7 @@ impl UiModel {
                 }
                 self.flush_assistant();
             }
-            Event::ModelsListed { .. } => {} // handled by the shell (CRAB-141)
+            Event::ModelsListed { .. } => {} // handled by the shell
             Event::Error { message } => {
                 self.flush_thinking();
                 self.flush_assistant();
@@ -526,7 +526,7 @@ impl UiModel {
 
     /// Push accumulated model reasoning (if any) as transcript lines.
     /// Always called before `flush_assistant`, so thinking renders before the
-    /// answer it precedes (CRAB-139). Split per reasoning line so a large
+    /// answer it precedes. Split per reasoning line so a large
     /// block wraps line-by-line instead of as one huge paragraph every frame.
     fn flush_thinking(&mut self) {
         if !self.thinking_buf.is_empty() {
@@ -563,7 +563,7 @@ impl UiModel {
         self.revision += 1;
     }
 
-    /// Flip the global tool-output expansion (Ctrl+O, CRAB-158) and invalidate
+    /// Flip the global tool-output expansion (Ctrl+O) and invalidate
     /// the cached transcript so the change is visible on the next frame.
     pub fn toggle_verbose(&mut self) {
         self.verbose = !self.verbose;
@@ -578,8 +578,7 @@ impl UiModel {
         self.assistant_buf.clear();
         self.thinking_buf.clear();
         // Tool results carry only the call id; map ids back to names so a
-        // resumed session renders `✓ bash` rather than an anonymous marker
-        // (CRAB-158).
+        // resumed session renders `✓ bash` rather than an anonymous marker.
         let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for message in history {
             match message {
@@ -663,7 +662,7 @@ pub const EFFORT_CHOICES: &[Effort] = &[
     Effort::High,
 ];
 
-/// A single-line text editor for the input box (CRAB-126): the text plus a
+/// A single-line text editor for the input box: the text plus a
 /// byte cursor that always sits on a UTF-8 char boundary. Pure logic — no
 /// terminal I/O — so cursor movement, insertion, deletion and the visible
 /// window are unit-testable. Insert-style (arrow keys); vim modal editing is
@@ -701,7 +700,7 @@ impl InputEditor {
         std::mem::take(&mut self.text)
     }
 
-    /// Replace the whole text; the cursor moves to the end (CRAB-141).
+    /// Replace the whole text; the cursor moves to the end.
     pub fn set_text(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
@@ -873,7 +872,7 @@ impl InputEditor {
     }
 }
 
-/// Braille spinner frames, advanced by elapsed time (CRAB-128) so the
+/// Braille spinner frames, advanced by elapsed time so the
 /// animation runs at a steady cadence independent of the render loop.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -882,8 +881,8 @@ fn spinner_frame(elapsed: Duration) -> char {
     SPINNER_FRAMES[(elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len()]
 }
 
-/// First visible row of a picker list so `selected` stays inside the viewport
-/// (CRAB-127): the list only scrolls when the selection leaves the window.
+/// First visible row of a picker list so `selected` stays inside the viewport.
+/// The list only scrolls when the selection leaves the window.
 fn picker_offset(selected: usize, viewport: usize) -> usize {
     if viewport == 0 {
         return selected;
@@ -908,7 +907,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 /// Recompute the slash-command completion for the current input, preserving
-/// the highlighted row when the candidate set is unchanged (CRAB-141).
+/// the highlighted row when the candidate set is unchanged.
 fn refresh_completion(
     model: &mut UiModel,
     input: &InputEditor,
@@ -978,7 +977,7 @@ pub fn run_tui(
             // Drain runtime events into the model.
             while let Ok(ev) = rx.try_recv() {
                 // A pending `/model` fetch resolves into the model picker, or a
-                // notice explaining why it failed (CRAB-141).
+                // notice explaining why it failed.
                 if model.model_fetch_pending {
                     match &ev {
                         Event::ModelsListed { models } if !models.is_empty() => {
@@ -1034,7 +1033,7 @@ pub fn run_tui(
                 match event::read().map_err(|e| e.to_string())? {
                     TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
                         // Ctrl-Y copies the transcript selection via OSC 52.
-                        // Ctrl-C stays cancel/exit (CRAB-128), so copy gets its
+                        // Ctrl-C stays cancel/exit, so copy gets its
                         // own chord.
                         if key.code == KeyCode::Char('y')
                             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1114,7 +1113,7 @@ pub fn run_tui(
     )
     .ok();
     terminal.show_cursor().ok();
-    // Auto-save at session end (CRAB-109) *after* the terminal is restored,
+    // Auto-save at session end *after* the terminal is restored,
     // so its stderr output lands on the normal screen. Failures are warnings
     // only — quitting must never be blocked by persistence.
     crate::auto_save(rt, session_root);
@@ -1127,12 +1126,12 @@ enum Picker {
     Effort {
         selected: usize,
     },
-    /// Model choices fetched from the provider (CRAB-141).
+    /// Model choices fetched from the provider.
     Model {
         selected: usize,
         models: Vec<String>,
     },
-    /// Provider choices from the registry (CRAB-142).
+    /// Provider choices from the registry.
     Provider {
         selected: usize,
     },
@@ -1243,7 +1242,7 @@ fn handle_key(
         return;
     }
 
-    // Slash-command completion (CRAB-141): only navigation/accept keys are
+    // Slash-command completion: only navigation/accept keys are
     // intercepted, so typing still edits the input (which the shell then
     // re-filters). Up/Down no longer scroll the transcript while it is open.
     if model.completion.is_some() {
@@ -1339,7 +1338,7 @@ fn handle_key(
                 *should_exit = true;
             }
         }
-        // Line editing at the caret (CRAB-126): movement, insert, delete,
+        // Line editing at the caret: movement, insert, delete,
         // word/line kill. Insert-style; no vim modal editing.
         KeyCode::Left => input.left(),
         KeyCode::Right => input.right(),
@@ -1350,7 +1349,7 @@ fn handle_key(
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => input.home(),
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => input.end(),
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => input.delete(),
-        // Ctrl+O expands/collapses every tool result (CRAB-158).
+        // Ctrl+O expands/collapses every tool result.
         KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => model.toggle_verbose(),
         KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_prev_word(),
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_to_start(),
@@ -1381,7 +1380,7 @@ fn submit_line(
         let provider = rt.provider_kind();
         match daedalus_core::credential::store_api_key(provider, key) {
             // The running runtime built its provider at startup, so the stored
-            // key applies from the next launch (CRAB-143 review).
+            // key applies from the next launch.
             Ok(()) => model.push_notice(&format!(
                 "stored API key for {} (restart daedalus to use it)",
                 provider.name
@@ -1440,7 +1439,7 @@ fn run_command(
         }
         SlashCommand::Resume => {
             // List every session for this cwd and let the user pick one, like
-            // pi's resume picker (CRAB-138 followed up). Titles are derived
+            // pi's resume picker. Titles are derived
             // from the first user message; sessions store no name of their own.
             match daedalus_core::session::list_sessions(session_root, &rt.workspace_root()) {
                 Ok(sessions) if sessions.is_empty() => {
@@ -1461,7 +1460,7 @@ fn run_command(
         }
         SlashCommand::Model(arg) => {
             if arg.is_empty() {
-                // CRAB-141: pick from the provider's live model list; fetch it
+                // Pick from the provider's live model list; fetch it
                 // on first use (the result arrives as `Event::ModelsListed`).
                 let models = rt.models();
                 if models.is_empty() {
@@ -1485,7 +1484,7 @@ fn run_command(
             } else {
                 rt.set_provider(&arg);
                 // The new provider lists its models; open the picker when they
-                // arrive (CRAB-142).
+                // arrive.
                 model.model_fetch_pending = true;
             }
         }
@@ -1590,7 +1589,7 @@ fn modifiers(m: Modifiers) -> Modifier {
     out
 }
 
-/// Markdown styles pulled from the active theme (CRAB-145).
+/// Markdown styles pulled from the active theme.
 fn markdown_style(theme: &Theme) -> crate::markdown::MarkdownStyle {
     crate::markdown::MarkdownStyle {
         text: style(theme.token(Token::Assistant)),
@@ -1603,7 +1602,7 @@ fn markdown_style(theme: &Theme) -> crate::markdown::MarkdownStyle {
     }
 }
 
-/// Tool results render collapsed to a preview by default (CRAB-158): at most
+/// Tool results render collapsed to a preview by default: at most
 /// this many lines...
 const TOOL_PREVIEW_LINES: usize = 5;
 /// ...and at most this many characters, before the "Ctrl+O to expand" hint.
@@ -1649,7 +1648,7 @@ impl ToolPreview {
 }
 
 /// Collapse a tool result to a preview, tracking both the lines dropped and
-/// whether the character cap cut the text short (CRAB-158, mirroring
+/// whether the character cap cut the text short (mirroring
 /// ICARUS-113). Either kind of hiding must surface the expand hint.
 fn tool_preview(content: &str) -> ToolPreview {
     let norm = normalize_tool_output(content);
@@ -1684,8 +1683,8 @@ fn tool_output_lines(content: &str, spec: StyleSpec) -> Vec<TLine<'static>> {
 }
 
 /// Build the ratatui lines for the flushed transcript, rendering assistant
-/// messages as markdown (CRAB-145) and tool output under its call line,
-/// collapsed unless `verbose` (Ctrl+O, CRAB-158).
+/// messages as markdown and tool output under its call line,
+/// collapsed unless `verbose` (Ctrl+O).
 fn transcript_lines(
     transcript: &[TranscriptLine],
     theme: &Theme,
@@ -1743,7 +1742,7 @@ fn transcript_lines(
 
 /// Render a frame: transcript on top, input editor (with a visible caret) at
 /// the bottom, footer with an animated spinner while busy. The model/effort
-/// picker renders as a centered overlay sized to its choices (CRAB-127).
+/// picker renders as a centered overlay sized to its choices.
 #[allow(clippy::too_many_arguments)] // shell glue: one call site
 fn draw(
     f: &mut Frame,
@@ -1775,7 +1774,7 @@ fn draw(
         .split(area);
 
     // Transcript: markdown-rendered and cached by (revision, width), plus the
-    // live streaming answer as a trailing block (CRAB-145).
+    // live streaming answer as a trailing block.
     let inner_w = chunks[0].width.saturating_sub(2);
     if !matches!(&model.md_cache, Some((r, w, _)) if *r == model.revision && *w == chunks[0].width)
     {
@@ -1820,7 +1819,7 @@ fn draw(
         paint_selection(f.buffer_mut(), inner, sel, theme);
     }
 
-    // Slash-command completion dropdown (CRAB-141).
+    // Slash-command completion dropdown.
     if let Some(c) = &model.completion {
         draw_completions(f, chunks[1], c, theme);
     }
@@ -1866,7 +1865,7 @@ fn draw(
         }
         None => {
             // Show the window of the text that contains the caret so long
-            // lines stay editable (CRAB-126), and place the terminal cursor
+            // lines stay editable, and place the terminal cursor
             // on the caret so typing position is visible.
             let inner_w = chunks[2].width.saturating_sub(2) as usize;
             let (window, cursor_col) = input.window(inner_w);
@@ -1911,7 +1910,7 @@ fn draw(
 }
 
 /// Render the slash-command completion dropdown: a bordered list directly above
-/// the input, scrolled to keep the selection visible (CRAB-141).
+/// the input, scrolled to keep the selection visible.
 fn draw_completions(f: &mut Frame, area: Rect, completion: &Completion, theme: &Theme) {
     use ratatui::widgets::{Block, Borders, Paragraph};
     if area.height == 0 {
@@ -2298,7 +2297,7 @@ mod tests {
         );
     }
 
-    /// CRAB-133: `/tools` lists the registered toolset (the built-ins
+    /// `/tools` lists the registered toolset (the built-ins
     /// when no MCP servers are configured).
     #[test]
     fn tools_command_lists_builtins() {
@@ -2325,7 +2324,7 @@ mod tests {
         }
     }
 
-    /// CRAB-138: `/skills` lists discovered skills and `/skill <name>` loads
+    /// `/skills` lists discovered skills and `/skill <name>` loads
     /// one as a user message (unknown names get a notice instead).
     #[test]
     fn skill_command_loads_body_and_lists_catalog() {
@@ -2513,7 +2512,7 @@ mod tests {
         // CRLF is normalized.
         assert_eq!(tool_preview("a\r\nb").text, "a\nb");
         // One very long line: the character cap stops it on a boundary, but
-        // the truncation must still surface a hint (CRAB-158 review).
+        // the truncation must still surface a hint.
         let p = tool_preview(&"é".repeat(1000));
         assert_eq!(p.text.chars().count(), 600);
         assert!(p.char_truncated);
@@ -2849,7 +2848,7 @@ mod tests {
         assert_eq!(m.transcript[1], TranscriptLine::Notice("resumed".into()));
     }
 
-    // --- CRAB-141: slash-command dropdown + model picker ---
+    // --- slash-command dropdown + model picker ---
 
     #[test]
     fn completions_filter_by_prefix() {
@@ -2999,7 +2998,7 @@ mod tests {
             },
         ]);
         // The system prompt is not shown; user/assistant text and the resumed
-        // tool result (with its call name, CRAB-158) are.
+        // tool result (with its call name) are.
         assert_eq!(
             model.transcript,
             vec![
@@ -3307,7 +3306,7 @@ mod tests {
         assert_ne!(cell.fg, ratatui::style::Color::Reset);
     }
 
-    // --- CRAB-126: line-editing input editor ---
+    // --- line-editing input editor ---
 
     #[test]
     fn input_editor_inserts_at_cursor_and_moves() {
@@ -3434,7 +3433,7 @@ mod tests {
         assert_eq!((w, col), (String::new(), 0));
     }
 
-    // --- CRAB-127: picker overlay helpers ---
+    // --- picker overlay helpers ---
 
     #[test]
     fn picker_offset_keeps_selection_visible() {
@@ -3446,7 +3445,7 @@ mod tests {
         assert_eq!(picker_offset(9, 0), 9);
     }
 
-    // --- CRAB-140: theme → ratatui style mapping ---
+    // --- theme → ratatui style mapping ---
 
     #[test]
     fn theme_style_maps_colors_and_modifiers() {
@@ -3471,7 +3470,7 @@ mod tests {
         );
     }
 
-    // --- CRAB-128: animated spinner ---
+    // --- animated spinner ---
 
     #[test]
     fn spinner_frame_advances_with_elapsed_time() {

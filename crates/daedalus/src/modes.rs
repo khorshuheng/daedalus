@@ -1,12 +1,12 @@
-//! Headless frontends (CRAB-120): synchronous adapters over AgentRuntime for
+//! Headless frontends: synchronous adapters over AgentRuntime for
 //! scripted/non-interactive use, selected with `--mode`. Interactive use is
-//! the TUI (default on a terminal; the REPL was removed in CRAB-135). Each
+//! the TUI (default on a terminal; the REPL was removed). Each
 //! adapter consumes only the runtime's Event stream and Command surface — no
 //! loop internals.
 //!
 //! - `json`: one-shot; runs one prompt and emits **every** runtime Event as
 //!   a JSONL object to stdout (the same serialization the TUI and server
-//!   will use, CRAB-121/124) — a headless diagnostic view.
+//!   will use) — a headless diagnostic view.
 //! - `rpc`: a JSONL command/event loop over stdin/stdout. Each request is a
 //!   `Command` JSON object on its own line; the runtime's events stream back
 //!   as JSONL. When a request carries an `id`, the adapter emits a terminal
@@ -19,7 +19,7 @@ use std::path::Path;
 
 use daedalus_core::runtime::{AgentRuntime, Command, CommandKind, Event};
 
-/// The runtime's event receiver type (tokio unbounded channel, CRAB-130).
+/// The runtime's event receiver type (tokio unbounded channel).
 type EventRx = tokio::sync::mpsc::UnboundedReceiver<Event>;
 
 /// Blocking receive with a timeout (tokio receivers have no
@@ -47,15 +47,15 @@ pub enum Mode {
 }
 
 impl Mode {
-    /// Parse a `--mode` value. `repl` gets its own migration note (CRAB-135:
-    /// the REPL was removed; the TUI is the interactive frontend).
+    /// Parse a `--mode` value. `repl` gets its own migration note:
+    /// the REPL was removed and the TUI is the interactive frontend.
     pub fn parse(s: &str) -> Result<Mode, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "json" => Ok(Mode::Json),
             "rpc" => Ok(Mode::Rpc),
             "tui" => Ok(Mode::Tui),
             "repl" => Err(
-                "the REPL was removed in CRAB-135; the TUI is the interactive \
+                "the REPL was removed; the TUI is the interactive \
                  frontend and the default on a terminal"
                     .into(),
             ),
@@ -306,7 +306,7 @@ mod tests {
     use std::io::Cursor;
     use std::path::PathBuf;
 
-    /// A unique temp dir cleaned up on drop (tempfile, CRAB-119).
+    /// A unique temp dir cleaned up on drop (tempfile).
     type TempDir = tempfile::TempDir;
 
     fn setup(

@@ -1,4 +1,4 @@
-//! The rig-core adapter (CRAB-130): the only module in daedalus-core that names
+//! The rig-core adapter: the only module in daedalus-core that names
 //! rig. Maps daedalus's canonical message/response types to rig's provider
 //! contracts and back, for the OpenAI chat-completions wire (serving both the
 //! OpenAI and DeepSeek presets, as before) and the Anthropic Messages wire.
@@ -7,9 +7,9 @@
 //! - `prompt_tokens` from provider-reported usage anchors context budgeting;
 //!   missing usage degrades explicitly to `None` (rig's zero-valued sentinel).
 //! - Quota/billing errors are never retried; transient statuses back off
-//!   (the CRAB-107 #14 classification, now over rig errors).
+//!   (the error classification, now over rig errors).
 //! - Truncated tool calls (`finish_reason: length`) must not be executed.
-//! - Effort/thinking wire parameters (`provider_effort`, CRAB-116) flow into
+//! - Effort/thinking wire parameters (`provider_effort`) flow into
 //!   the request via `additional_params`.
 
 use std::collections::HashSet;
@@ -35,7 +35,7 @@ use super::{
 };
 
 /// How many times a transient failure is retried with exponential backoff
-/// (same policy as the old hand-written client, CRAB-103).
+/// (same policy as the old hand-written client).
 const MAX_RETRIES: usize = 3;
 
 enum Backend {
@@ -67,7 +67,7 @@ pub struct RigProvider {
 }
 
 impl RigProvider {
-    /// Build the backend for `config.provider` (CRAB-132). Each registry name
+    /// Build the backend for `config.provider`. Each registry name
     /// maps onto rig's client for that provider; the configured `base_url` is
     /// always forwarded so a user override wins. Names with no dedicated rig
     /// client ride the OpenAI-compatible transport.
@@ -255,7 +255,7 @@ impl RigProvider {
         }
     }
 
-    /// Classify a rig completion error, preserving the CRAB-107 #14 policy:
+    /// Classify a rig completion error, preserving that policy:
     /// quota/billing is never retried, auth is auth, timeouts are timeouts,
     /// transient statuses (and bare transport failures) stay retryable.
     fn map_error(err: &CompletionError) -> (ProviderError, bool) {
@@ -351,7 +351,7 @@ fn tool_name_for_call(history: &[Message], tool_call_id: &str) -> Option<String>
 
 /// The displayable text of a rig reasoning block: concatenated `Text` and
 /// `Summary` content. Encrypted and redacted payloads carry no displayable
-/// text (CRAB-139).
+/// text.
 fn reasoning_text(reasoning: &Reasoning) -> String {
     let mut out = String::new();
     for content in &reasoning.content {
@@ -375,7 +375,7 @@ impl Provider for RigProvider {
     ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
         Box::pin(async move {
             // Never send an empty bearer token: refuse with an actionable
-            // message when a key-requiring provider has no key (CRAB-143).
+            // message when a key-requiring provider has no key.
             // Enforced at request time, not at startup, so the interactive
             // frontends still launch and `/login` stays reachable.
             if self.provider.requires_key() && self.api_key.is_empty() {
@@ -477,7 +477,7 @@ impl Provider for RigProvider {
     }
 
     /// Discover model ids via rig's `ModelListingClient`. Providers without a
-    /// listing client return `Unsupported` (CRAB-141).
+    /// listing client return `Unsupported`.
     fn list_models<'a>(
         &'a self,
     ) -> futures::future::BoxFuture<'a, Result<Vec<String>, ProviderError>> {

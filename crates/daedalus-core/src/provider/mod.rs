@@ -1,4 +1,4 @@
-//! LLM provider integration (CRAB-103), async on rig-core (CRAB-130).
+//! LLM provider integration, async on rig-core.
 //!
 //! Providers implement the `Provider` trait; the agent loop is
 //! provider-agnostic. The real HTTP clients live in `provider/rig.rs`, a thin
@@ -82,14 +82,14 @@ pub enum ProviderError {
 /// A chat + tool-calling backend. Implementations must be `Send + Sync` so the
 /// loop can hold them behind `Box<dyn Provider>`.
 ///
-/// `complete` is async (CRAB-130) but the trait stays object-safe: it returns
+/// `complete` is async but the trait stays object-safe: it returns
 /// a boxed future rather than using `async_trait`. `cancel` is checked
 /// between streamed chunks (via `select!`); when cancelled, the request is
 /// aborted and `Completion.aborted` is set. `on_delta` receives streamed
 /// fragments — assistant text and, for providers that surface it, model
-/// reasoning (`StreamDelta`, CRAB-139). `effort_params` carries the
+/// reasoning (`StreamDelta`). `effort_params` carries the
 /// provider-flavored wire parameters for the current thinking level
-/// (`provider_effort`, CRAB-116) — an empty object means "nothing to add".
+/// (`provider_effort`) — an empty object means "nothing to add".
 pub trait Provider: Send + Sync {
     fn complete<'a>(
         &'a self,
@@ -102,7 +102,7 @@ pub trait Provider: Send + Sync {
 
     /// Discover the provider's available model ids. The default reports the
     /// capability as unsupported, so only providers that can list need to
-    /// implement it (CRAB-141).
+    /// implement it.
     fn list_models<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>, ProviderError>> {
         Box::pin(async {
             Err(ProviderError::Unsupported(
@@ -113,8 +113,7 @@ pub trait Provider: Send + Sync {
 }
 
 /// A streamed fragment of a completion: assistant `Text` or model `Thinking`
-/// (reasoning). Providers that do not surface reasoning only emit `Text`
-/// (CRAB-139).
+/// (reasoning). Providers that do not surface reasoning only emit `Text`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamDelta {
     Text(String),
@@ -126,7 +125,7 @@ pub enum StreamDelta {
 /// uses its own Messages client; `fake` is the scripted offline provider.
 ///
 /// A missing API key is not rejected here: the real provider refuses to make a
-/// request without one (CRAB-143), so the interactive frontends still start
+/// request without one, so the interactive frontends still start
 /// and `/login` stays reachable.
 pub fn from_config(config: &Config) -> Box<dyn Provider> {
     match config.provider.name {

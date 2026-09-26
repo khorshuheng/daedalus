@@ -1,4 +1,4 @@
-//! XDG base directories (CRAB-119): one source of truth for where daedalus keeps
+//! XDG base directories: one source of truth for where daedalus keeps
 //! its config, sessions, and memory, replacing hand-rolled `$HOME/.config/...`
 //! and `$HOME/.local/share/...` joins with the `directories` crate.
 //!
