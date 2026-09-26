@@ -513,7 +513,8 @@ impl UiModel {
         }
         // Only a changed transcript invalidates the render cache. Streamed
         // thinking/assistant deltas touch their buffers, not `transcript`, and
-        // the live `assistant_buf` is rendered directly each frame.
+        // the live `thinking_buf`/`assistant_buf` are rendered directly each
+        // frame.
         if self.transcript.len() != before {
             self.revision += 1;
         }
@@ -1831,10 +1832,7 @@ fn transcript_lines(
                 style(theme.token(Token::User)),
             ))),
             TranscriptLine::Assistant(t) => out.extend(crate::markdown::render(t, width, &md)),
-            TranscriptLine::Thinking(t) => out.push(TLine::from(Span::styled(
-                format!("  {t}"),
-                style(theme.token(Token::Thinking)),
-            ))),
+            TranscriptLine::Thinking(t) => out.push(thinking_line(t, theme)),
             TranscriptLine::Tool(t) => out.push(TLine::from(Span::styled(
                 format!("  {t}"),
                 style(theme.token(Token::Tool)),
@@ -1869,6 +1867,15 @@ fn transcript_lines(
         }
     }
     out
+}
+
+/// One indented, dimmed line of streamed or flushed model reasoning. Shared by
+/// `transcript_lines` and the live streaming block in `draw` so both match.
+fn thinking_line(text: &str, theme: &Theme) -> TLine<'static> {
+    TLine::from(Span::styled(
+        format!("  {text}"),
+        style(theme.token(Token::Thinking)),
+    ))
 }
 
 /// Render a frame: transcript on top, input editor (with a visible caret) at
@@ -1912,6 +1919,15 @@ fn draw(
         model.md_cache = Some((model.revision, chunks[0].width, rendered));
     }
     let mut lines: Vec<TLine> = model.md_cache.as_ref().unwrap().2.clone();
+    // Live reasoning streams as a trailing block until `flush_thinking` moves
+    // it into the transcript (on the first text/tool delta or turn end).
+    // Rendering it here keeps a long reasoning phase from looking like a
+    // frozen spinner.
+    if !model.thinking_buf.is_empty() {
+        for line in model.thinking_buf.lines() {
+            lines.push(thinking_line(line, theme));
+        }
+    }
     if !model.assistant_buf.is_empty() {
         lines.extend(crate::markdown::render(
             &model.assistant_buf,
@@ -3657,6 +3673,51 @@ mod tests {
             cell.modifier
         );
         assert_ne!(cell.fg, ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn live_reasoning_renders_while_streaming_and_moves_to_the_transcript() {
+        use ratatui::backend::TestBackend;
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let theme = Theme::default();
+        let input = InputEditor::default();
+        let picker = None;
+        let mut terminal = Terminal::new(TestBackend::new(48, 10)).unwrap();
+        let render = |terminal: &mut Terminal<TestBackend>, model: &mut UiModel| {
+            terminal
+                .draw(|f| draw(f, model, &theme, &input, &picker, ' ', "fake"))
+                .unwrap();
+        };
+
+        // Reasoning still streams into the live block: it is visible on screen
+        // before the transcript has flushed anything.
+        model.apply_event(&Event::ThinkingDelta {
+            text: "pondering the answer".into(),
+        });
+        assert!(model.transcript.is_empty());
+        render(&mut terminal, &mut model);
+        let shown = |rows: &[String]| rows.iter().filter(|r| r.contains("pondering")).count();
+        assert_eq!(
+            shown(&model.transcript_rows),
+            1,
+            "{:?}",
+            model.transcript_rows
+        );
+
+        // The first text delta flushes reasoning into the transcript; it must
+        // stay visible exactly once, with no leftover live copy.
+        model.apply_event(&Event::TextDelta {
+            text: "the answer".into(),
+        });
+        assert!(model.thinking_buf.is_empty());
+        render(&mut terminal, &mut model);
+        assert_eq!(
+            shown(&model.transcript_rows),
+            1,
+            "{:?}",
+            model.transcript_rows
+        );
     }
 
     // --- line-editing input editor ---
