@@ -952,12 +952,14 @@ fn refresh_completion(
     };
 }
 
-/// The model/provider the run started with — the baseline `remember_choice`
-/// diffs against, so only a change the runtime actually adopted is saved.
+/// The model/provider/effort the run started with — the baseline
+/// `remember_choice` diffs against, so only a change the runtime actually
+/// adopted is saved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Remembered {
     provider: String,
     model: String,
+    effort: Effort,
 }
 
 impl Remembered {
@@ -965,18 +967,19 @@ impl Remembered {
         Self {
             provider: state.provider.clone(),
             model: state.model.clone(),
+            effort: state.effort,
         }
     }
 }
 
-/// Remember a model/provider the runtime **actually adopted**, once per
+/// Remember a model/provider/effort the runtime **actually adopted**, once per
 /// change, by writing it into the config file at `persist`.
 ///
 /// Diffing against the run's starting values (rather than hooking the pickers)
 /// is what makes this correct for providers: a switch the runtime refused — an
 /// unknown name, or no API key — never reaches `StateChanged`, so a refused
 /// choice is never written back and the next run cannot start broken. The same
-/// single hook covers the picker, `/model`, and `/provider`.
+/// single hook covers the picker, `/model`, `/provider`, and `/effort`.
 ///
 /// A failed write is a notice, never fatal: a read-only config must not take
 /// the session down.
@@ -984,7 +987,10 @@ fn remember_choice(model: &mut UiModel, remembered: &mut Remembered) {
     let Some(path) = model.persist.clone() else {
         return;
     };
-    if model.state.provider == remembered.provider && model.state.model == remembered.model {
+    if model.state.provider == remembered.provider
+        && model.state.model == remembered.model
+        && model.state.effort == remembered.effort
+    {
         return;
     }
     let mut edit = ConfigEdit::default();
@@ -994,10 +1000,14 @@ fn remember_choice(model: &mut UiModel, remembered: &mut Remembered) {
     if model.state.model != remembered.model {
         edit.model = Some(model.state.model.clone());
     }
+    if model.state.effort != remembered.effort {
+        edit.effort = Some(model.state.effort);
+    }
     // Move the baseline either way: the user has been told once, and a config
     // that keeps failing must not repeat the same notice on every event.
     remembered.provider = model.state.provider.clone();
     remembered.model = model.state.model.clone();
+    remembered.effort = model.state.effort;
     let saved = edit_summary(&edit);
     match persist_edit(&path, &edit) {
         Ok(()) => model.push_notice(&format!("{saved} saved to {}", path.display())),
@@ -1005,8 +1015,8 @@ fn remember_choice(model: &mut UiModel, remembered: &mut Remembered) {
     }
 }
 
-/// Render an edit as the TOML it wrote: `model = "m"`, `provider = "p"`, or
-/// `provider = "p", model = "m"`.
+/// Render an edit as the TOML it wrote: `model = "m"`, `provider = "p"`,
+/// `effort = "high"`, or a comma-joined combination.
 fn edit_summary(edit: &ConfigEdit) -> String {
     let mut parts = Vec::new();
     if let Some(provider) = &edit.provider {
@@ -1015,15 +1025,18 @@ fn edit_summary(edit: &ConfigEdit) -> String {
     if let Some(model) = &edit.model {
         parts.push(format!("model = {model:?}"));
     }
+    if let Some(effort) = edit.effort {
+        parts.push(format!("effort = {:?}", effort.name()));
+    }
     parts.join(", ")
 }
 
 /// Ratatui rendering + event loop shell. Owns the screen (crossterm raw
 /// mode + alternate screen); all *state* lives in the pure model above.
 /// Never prints to stdout directly — ratatui owns the terminal. On exit the
-/// session is auto-saved via `crate::auto_save`. A model/provider the user
-/// changes at runtime is remembered in `persist` (the config file), or nowhere
-/// when that is `None`.
+/// session is auto-saved via `crate::auto_save`. A model/provider/effort the
+/// user changes at runtime is remembered in `persist` (the config file), or
+/// nowhere when that is `None`.
 pub fn run_tui(
     rt: &AgentRuntime,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
@@ -2839,6 +2852,23 @@ mod tests {
             said[0].contains("deepseek-chat") && said[0].contains("config.toml"),
             "{said:?}"
         );
+    }
+
+    #[test]
+    fn an_adopted_effort_is_remembered_in_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (mut m, mut remembered) = persistent(state(), &path);
+        m.state.effort = Effort::High;
+        remember_choice(&mut m, &mut remembered);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("effort = \"high\""), "{text}");
+        let said = notices(&m);
+        assert_eq!(said.len(), 1, "one change, one notice: {said:?}");
+        assert!(said[0].contains("effort = \"high\""), "{said:?}");
+        // Re-seeing the same state is not news, so nothing is re-written.
+        remember_choice(&mut m, &mut remembered);
+        assert_eq!(notices(&m).len(), 1);
     }
 
     #[test]

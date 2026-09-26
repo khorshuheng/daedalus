@@ -541,7 +541,7 @@ impl AgentRuntime {
         let provider_name = config.provider.name.to_string();
         let provider_info = config.provider;
         let provider_config = config.clone();
-        let effort = Effort::Medium;
+        let effort = config.effort;
         let ws_path = workspace.root().to_string_lossy().into_owned();
         let runtime = AgentRuntime {
             inner: Arc::new(Inner {
@@ -2553,74 +2553,113 @@ mod effort_tests {
     use crate::provider::{Completion, ProviderError};
     use std::sync::Mutex as StdMutex;
 
-    /// The runtime computes the provider-flavored effort parameters
-    /// (`provider_effort`) and hands them to every completion call.
-    #[test]
-    fn effort_params_flow_into_provider_calls() {
-        struct EffortRecorder {
-            seen: StdMutex<Vec<serde_json::Value>>,
-        }
-        impl Provider for EffortRecorder {
-            fn complete<'a>(
-                &'a self,
-                _history: &'a [Message],
-                _tools: &'a [serde_json::Value],
-                effort_params: &'a serde_json::Value,
-                _cancel: tokio_util::sync::CancellationToken,
-                _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
-            ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
-                Box::pin(async move {
-                    self.seen.lock().unwrap().push(effort_params.clone());
-                    Ok(Completion {
-                        response: Response::Text("done".into()),
-                        prompt_tokens: None,
-                        aborted: false,
-                    })
-                })
-            }
+    /// Records the provider-flavored effort params of every completion call.
+    struct EffortRecorder {
+        seen: StdMutex<Vec<serde_json::Value>>,
+    }
+
+    impl EffortRecorder {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                seen: StdMutex::new(Vec::new()),
+            })
         }
 
+        fn seen(&self) -> Vec<serde_json::Value> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Provider for EffortRecorder {
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            effort_params: &'a serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                self.seen.lock().unwrap().push(effort_params.clone());
+                Ok(Completion {
+                    response: Response::Text("done".into()),
+                    prompt_tokens: None,
+                    aborted: false,
+                })
+            })
+        }
+    }
+
+    /// `AgentRuntime::new` takes `Box<dyn Provider>`, so hand it a shared
+    /// handle to the one recorder the test keeps inspecting.
+    struct SharedRecorder(Arc<EffortRecorder>);
+
+    impl Provider for SharedRecorder {
+        fn complete<'a>(
+            &'a self,
+            history: &'a [Message],
+            tools: &'a [serde_json::Value],
+            effort_params: &'a serde_json::Value,
+            cancel: tokio_util::sync::CancellationToken,
+            on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            self.0
+                .complete(history, tools, effort_params, cancel, on_delta)
+        }
+    }
+
+    fn runtime_with_effort(
+        effort: Effort,
+    ) -> (AgentRuntime, Arc<EffortRecorder>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
-        let tools = ToolSet::new(1000);
+        let workspace = Workspace::new(dir.path().to_path_buf()).unwrap();
         let cfg = Config {
             provider: crate::config::default_provider(),
             max_iterations: 5,
             workspace: dir.path().to_path_buf(),
+            effort,
             ..Config::defaults(dir.path().to_path_buf())
         };
-        let recorder = Arc::new(EffortRecorder {
-            seen: StdMutex::new(Vec::new()),
-        });
-        let recorder_for_runtime = Arc::clone(&recorder);
-        struct SharedRecorder(Arc<EffortRecorder>);
-        impl Provider for SharedRecorder {
-            fn complete<'a>(
-                &'a self,
-                history: &'a [Message],
-                tools: &'a [serde_json::Value],
-                effort_params: &'a serde_json::Value,
-                cancel: tokio_util::sync::CancellationToken,
-                on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
-            ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
-                self.0
-                    .complete(history, tools, effort_params, cancel, on_delta)
-            }
-        }
+        let recorder = EffortRecorder::new();
         let (rt, _rx) = AgentRuntime::new(
             cfg,
-            Box::new(SharedRecorder(recorder_for_runtime)),
-            tools,
-            ws,
+            Box::new(SharedRecorder(Arc::clone(&recorder))),
+            ToolSet::new(1000),
+            workspace,
         );
+        (rt, recorder, dir)
+    }
+
+    /// The runtime computes the provider-flavored effort parameters
+    /// (`provider_effort`) and hands them to every completion call.
+    #[test]
+    fn effort_params_flow_into_provider_calls() {
+        let (rt, recorder, _dir) = runtime_with_effort(Effort::Medium);
         rt.set_effort(Effort::High);
         rt.run_once("task").unwrap();
-        let seen = recorder.seen.lock().unwrap();
+        let seen = recorder.seen();
         assert_eq!(seen.len(), 1, "one completion call expected");
         assert_eq!(
             seen[0],
             serde_json::json!({ "reasoning_effort": "high" }),
             "openai effort mapping must reach the provider"
+        );
+    }
+
+    /// A configured effort (persisted by the TUI, read back at startup) seeds
+    /// the runtime state and reaches the first completion — the level must not
+    /// reset to the default on restart.
+    #[test]
+    fn configured_effort_is_used_without_a_runtime_set() {
+        let (rt, recorder, _dir) = runtime_with_effort(Effort::High);
+        assert_eq!(rt.state().effort, Effort::High);
+        rt.run_once("task").unwrap();
+        let seen = recorder.seen();
+        assert_eq!(seen.len(), 1, "one completion call expected");
+        assert_eq!(
+            seen[0],
+            serde_json::json!({ "reasoning_effort": "high" }),
+            "the configured effort must be sent, not the Medium default"
         );
     }
 }

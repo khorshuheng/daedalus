@@ -1,6 +1,7 @@
 //! Configuration.
 //!
-//! Keys: provider, base URL, model, temperature, max_iterations, output size
+//! Keys: provider, base URL, model, thinking effort, temperature,
+//! max_iterations, output size
 //! caps, workspace, session retention. Sources merge with documented
 //! precedence: `flags > config file > defaults` (the `DAEDALUS_*` env layer was
 //! removed). API keys are **not** a config key: they are resolved
@@ -21,6 +22,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::mcp::{validate_servers, McpServerConfig};
+use crate::runtime::Effort;
 use crate::theme::{Theme, ThemePartial};
 
 /// How a provider's canonical `Effort` level maps to wire parameters.
@@ -166,6 +168,8 @@ pub struct Config {
     pub base_url: String,
     pub api_key: Option<String>,
     pub model: String,
+    /// Thinking level for completions; persisted so a restart keeps it.
+    pub effort: Effort,
     pub temperature: f32,
     pub max_iterations: usize,
     /// Cap for any single tool result / file read, in bytes.
@@ -212,6 +216,7 @@ impl Config {
             base_url: provider.preset_base_url.to_string(),
             api_key: None,
             model: String::new(),
+            effort: Effort::Medium,
             temperature: 0.7,
             max_iterations: 30,
             max_output_bytes: 32_000,
@@ -245,6 +250,8 @@ pub struct PartialConfig {
     pub provider: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// Canonical thinking level (`off|minimal|low|medium|high`).
+    pub effort: Option<Effort>,
     pub temperature: Option<f32>,
     pub max_iterations: Option<usize>,
     pub max_output_bytes: Option<usize>,
@@ -281,6 +288,7 @@ impl PartialConfig {
         take!(provider);
         take!(base_url);
         take!(model);
+        take!(effort);
         take!(temperature);
         take!(max_iterations);
         take!(max_output_bytes);
@@ -375,6 +383,7 @@ impl PartialConfig {
             base_url,
             api_key,
             model,
+            effort: self.effort.unwrap_or_default(),
             temperature: self.temperature.unwrap_or(0.7),
             max_iterations: self.max_iterations.unwrap_or(30),
             max_output_bytes: self.max_output_bytes.unwrap_or(32_000),
@@ -442,6 +451,7 @@ impl Config {
 pub struct ConfigEdit {
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<Effort>,
 }
 
 impl ConfigEdit {
@@ -449,7 +459,7 @@ impl ConfigEdit {
     pub fn model(name: impl Into<String>) -> Self {
         Self {
             model: Some(name.into()),
-            provider: None,
+            ..Self::default()
         }
     }
 
@@ -457,13 +467,22 @@ impl ConfigEdit {
     pub fn provider(name: impl Into<String>) -> Self {
         Self {
             provider: Some(name.into()),
-            model: None,
+            ..Self::default()
+        }
+    }
+
+    /// An edit remembering a chosen thinking level, written to the `effort`
+    /// key as its canonical lowercase name.
+    pub fn effort(effort: Effort) -> Self {
+        Self {
+            effort: Some(effort),
+            ..Self::default()
         }
     }
 
     /// True when the edit would change nothing.
     pub fn is_empty(&self) -> bool {
-        self.provider.is_none() && self.model.is_none()
+        self.provider.is_none() && self.model.is_none() && self.effort.is_none()
     }
 }
 
@@ -508,6 +527,9 @@ pub fn persist_edit(path: &Path, edit: &ConfigEdit) -> Result<(), String> {
     }
     if let Some(model) = &edit.model {
         set_top_level(&mut doc, "model", model.trim());
+    }
+    if let Some(effort) = edit.effort {
+        set_top_level(&mut doc, "effort", effort.name());
     }
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -560,6 +582,30 @@ mod tests {
         assert_eq!(c.max_iterations, 30);
         assert_eq!(c.max_context_tokens, DEFAULT_CONTEXT_WINDOW - 4_096);
         assert_eq!(c.session_retention, 10);
+    }
+
+    #[test]
+    fn effort_defaults_to_medium_and_is_overridable() {
+        let flags = PartialConfig {
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        assert_eq!(load(ws(), None, flags).unwrap().effort, Effort::Medium);
+
+        let dir = std::env::temp_dir().join("daedalus-config-effort");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"m\"\neffort = \"high\"\n").unwrap();
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.effort, Effort::High);
+        // A flag still outranks the file.
+        let flags = PartialConfig {
+            effort: Some(Effort::Off),
+            ..Default::default()
+        };
+        let c = load(ws(), Some(&path), flags).unwrap();
+        assert_eq!(c.effort, Effort::Off);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -893,6 +939,22 @@ command = "npx"
         let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
         assert_eq!(c.provider.name, "deepseek");
         assert_eq!(c.base_url, "http://localhost:9999/v1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_writes_the_effort_key() {
+        let dir = tmpdir("effort");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"m\"\n").unwrap();
+
+        persist_edit(&path, &ConfigEdit::effort(Effort::High)).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("effort = \"high\""), "{text}");
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.effort, Effort::High);
+        assert_eq!(c.model, "m");
         std::fs::remove_dir_all(&dir).ok();
     }
 
