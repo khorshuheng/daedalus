@@ -384,8 +384,6 @@ pub struct UiModel {
     pub state: RuntimeState,
     pub usage: Option<usize>,
     pub iterations: usize,
-    /// True when the last event was a turn end (used to reset stats display).
-    pub settled: bool,
     /// Transcript scrollback (follow the tail unless the user scrolled up).
     pub scroll: TranscriptScroll,
     /// Global tool-output expansion (Ctrl+O). When false, tool
@@ -422,7 +420,6 @@ impl UiModel {
             state,
             usage: None,
             iterations: 0,
-            settled: false,
             scroll: TranscriptScroll::default(),
             verbose: false,
             revision: 0,
@@ -443,7 +440,6 @@ impl UiModel {
         match event {
             Event::AgentStart { .. } => {}
             Event::TurnStart {} => {
-                self.settled = false;
                 self.iterations += 1;
             }
             Event::TextDelta { text } => {
@@ -495,7 +491,6 @@ impl UiModel {
                 text,
                 interrupted: _,
             } => {
-                self.settled = true;
                 self.flush_thinking();
                 // `turn_end` already flushed streamed text, so `assistant_buf`
                 // is empty here even when the answer streamed — the previous
@@ -1139,7 +1134,6 @@ pub fn run_tui(
                             theme,
                             &input,
                             &picker,
-                            rt.is_busy(),
                             spinner,
                             provider.name,
                         )
@@ -1877,7 +1871,6 @@ fn draw(
     theme: &Theme,
     input: &InputEditor,
     picker: &Option<Picker>,
-    busy: bool,
     spinner: char,
     provider: &str,
 ) {
@@ -2024,14 +2017,12 @@ fn draw(
         .map(|t| t.to_string())
         .unwrap_or_else(|| "?".to_string());
     let status = format!(
-        " {} ({}) | effort {} | {} | {} | {} tokens{}",
+        " {} ({}) | effort {} | {} | {} tokens",
         model.state.model,
         provider,
         model.state.effort.name(),
         model.state.workspace,
-        if busy { "busy" } else { "idle" },
         usage,
-        if model.settled { " · settled" } else { "" },
     );
     let footer = Paragraph::new(TLine::from(vec![
         Span::styled(spinner.to_string(), style(theme.token(Token::Spinner))),
@@ -2947,7 +2938,6 @@ mod tests {
             text: "answer".into(),
             interrupted: false,
         });
-        assert!(m.settled);
         assert_eq!(
             m.transcript.last(),
             Some(&TranscriptLine::Assistant("answer".into()))
@@ -3267,7 +3257,7 @@ mod tests {
         // Wide enough that the title is not clipped.
         let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
         terminal
-            .draw(|f| draw(f, &mut model, &theme, &input, &picker, false, ' ', "fake"))
+            .draw(|f| draw(f, &mut model, &theme, &input, &picker, ' ', "fake"))
             .unwrap();
         // Flatten the screen so the model name and its title can be searched.
         let screen: String = terminal
@@ -3589,7 +3579,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         let render = |terminal: &mut Terminal<TestBackend>, model: &mut UiModel| {
             terminal
-                .draw(|f| draw(f, model, &theme, &input, &picker, false, ' ', "fake"))
+                .draw(|f| draw(f, model, &theme, &input, &picker, ' ', "fake"))
                 .unwrap();
         };
         render(&mut terminal, &mut model);
