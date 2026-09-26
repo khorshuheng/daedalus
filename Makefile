@@ -3,7 +3,7 @@
 # `make` builds both release binaries and points the symlinks in ~/.local/bin
 # at them, matching the existing layout:
 #
-#   ~/.local/bin/dd              -> target/release/dd              (crates/daedalus)
+#   ~/.local/bin/dl              -> target/release/dd              (crates/daedalus)
 #   ~/.local/bin/daedalus-server -> target/release/daedalus-server (crates/daedalus-server)
 #
 # Override as needed, e.g. `make BINDIR=/usr/local/bin` or
@@ -14,7 +14,7 @@ PREFIX      ?= $(HOME)/.local
 BINDIR      ?= $(PREFIX)/bin
 CARGO_FLAGS ?=
 RELEASE_DIR := target/release
-BINS        := dd daedalus-server
+BINS        := dl daedalus-server
 
 .PHONY: all build link unlink clean test check fmt
 

@@ -451,6 +451,10 @@ fn trim_history(
 /// adapters can snapshot it (session save) while a turn runs.
 struct Inner {
     config: Config,
+    /// Config of the *live* provider. `switch_provider`/`SetModel` rewrite and
+    /// rebuild from this, so a runtime model change actually reaches the wire:
+    /// the provider bakes `model` into its backend at construction.
+    provider_config: Mutex<Config>,
     /// The active provider; swappable at runtime.
     provider: Mutex<Arc<dyn Provider>>,
     /// Registry row of the active provider.
@@ -536,11 +540,13 @@ impl AgentRuntime {
         let model = config.model.clone();
         let provider_name = config.provider.name.to_string();
         let provider_info = config.provider;
+        let provider_config = config.clone();
         let effort = Effort::Medium;
         let ws_path = workspace.root().to_string_lossy().into_owned();
         let runtime = AgentRuntime {
             inner: Arc::new(Inner {
                 config,
+                provider_config: Mutex::new(provider_config),
                 provider: Mutex::new(Arc::from(provider)),
                 provider_info: Mutex::new(provider_info),
                 tools,
@@ -747,7 +753,7 @@ impl AgentRuntime {
             });
             return;
         }
-        let mut new_config = self.inner.config.clone();
+        let mut new_config = self.inner.provider_config.lock().unwrap().clone();
         new_config.provider = info;
         new_config.base_url = info.preset_base_url.to_string();
         new_config.api_key = key;
@@ -755,6 +761,7 @@ impl AgentRuntime {
         let provider = crate::provider::from_config(&new_config);
         *self.inner.provider.lock().unwrap() = Arc::from(provider);
         *self.inner.provider_info.lock().unwrap() = info;
+        *self.inner.provider_config.lock().unwrap() = new_config;
         {
             let mut st = self.inner.state.lock().unwrap();
             st.provider = info.name.to_string();
@@ -986,7 +993,15 @@ impl AgentRuntime {
     async fn apply_state_command(&self, kind: CommandKind) {
         match kind {
             CommandKind::SetModel { model } => {
-                self.inner.state.lock().unwrap().model = model;
+                self.inner.state.lock().unwrap().model = model.clone();
+                // The provider captures the model id at construction, so a
+                // runtime switch must rebuild it; otherwise the request (and
+                // the error that names it) keeps reporting the old model.
+                let mut cfg = self.inner.provider_config.lock().unwrap().clone();
+                cfg.model = model;
+                let provider = crate::provider::from_config(&cfg);
+                *self.inner.provider.lock().unwrap() = Arc::from(provider);
+                *self.inner.provider_config.lock().unwrap() = cfg;
                 self.emit_state_changed();
             }
             CommandKind::SetEffort { effort } => {
@@ -1903,6 +1918,39 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::StateChanged { .. })));
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn set_model_rebuilds_the_provider_so_the_new_id_reaches_the_wire() {
+        // The rig provider bakes the model id into its backend at construction,
+        // so a state-only `SetModel` would keep sending the old model (and a
+        // rejected one would be re-sent forever). The provider must be swapped.
+        let (rt, mut rx, handle, _ws) = runtime_with(
+            "set-model",
+            Box::new(GateProvider::new(vec![Response::Text(text("ok"))])),
+        );
+        let before = rt.provider();
+        rt.set_model("deepseek-flash");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut applied = false;
+        while !applied && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Event::StateChanged { model, .. }) if model == "deepseek-flash" => {
+                    applied = true
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(applied, "set_model must ack with state_changed");
+        assert_eq!(rt.state().model, "deepseek-flash");
+        let after = rt.provider();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the provider must be rebuilt so the new model id is what gets sent"
+        );
         rt.shutdown();
         handle.join().unwrap_or(());
     }
