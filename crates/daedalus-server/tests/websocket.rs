@@ -127,6 +127,68 @@ async fn health_reports_ok() {
 }
 
 #[tokio::test]
+async fn server_starts_with_an_mcp_server_configured() {
+    // Regression: the tool set (and MCP connect) used to be built inline on the
+    // axum worker, panicking with "Cannot start a runtime from within a runtime"
+    // for every connection once any `[[mcp_servers]]` entry was enabled.
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = Workspace::new(dir.path().to_path_buf()).unwrap();
+    let mut config = fake_config(dir.path());
+    config
+        .mcp_servers
+        .push(daedalus_core::mcp::McpServerConfig {
+            name: "missing".into(),
+            enabled: true,
+            command: Some("daedalus-no-such-mcp-binary".into()),
+            ..Default::default()
+        });
+    let state = AppState::new(config, workspace, dir.path().join("sessions"));
+    let addr = start_state(state).await;
+
+    let mut ws = connect(addr).await;
+    send(&mut ws, json!({"type": "prompt", "text": "hello"})).await;
+    let events = until(&mut ws, "agent_settled").await;
+    assert!(events.iter().any(|e| e["type"] == "turn_start"));
+}
+
+#[tokio::test]
+async fn settled_session_is_persisted_for_resume() {
+    // Regression DAE-108: the server used to never save, so `resume` could only
+    // ever find sessions the TUI happened to write.
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    let mut ws = connect(addr).await;
+
+    send(&mut ws, json!({"type": "prompt", "text": "hello"})).await;
+    let _ = until(&mut ws, "agent_settled").await;
+
+    let root = dir.path().join("sessions");
+    let cwd = Workspace::new(dir.path().to_path_buf())
+        .unwrap()
+        .root()
+        .to_path_buf();
+    // The save runs right after the settled frame is written, so poll briefly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let loaded = daedalus_core::session::load_previous(&root, &cwd).unwrap();
+        if let Some(history) = loaded {
+            assert!(
+                history
+                    .iter()
+                    .any(|m| matches!(m, daedalus_core::provider::Message::Assistant { .. })),
+                "the saved session must contain the answer: {history:?}"
+            );
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never persisted the settled session"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
 async fn prompt_streams_events_and_settles() {
     let dir = tempfile::tempdir().unwrap();
     let addr = start(dir.path()).await;
@@ -265,6 +327,49 @@ async fn unmapped_identity_is_rejected_when_a_map_exists() {
         .as_str()
         .unwrap()
         .contains("no workspace mapped"));
+}
+
+#[tokio::test]
+async fn mapped_identity_cannot_switch_workspace() {
+    // DAE-107: the identity map is not a filesystem sandbox, but a mapped
+    // session must not be able to repoint its workspace at will.
+    let server_dir = tempfile::tempdir().unwrap();
+    let alice = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let config = fake_config_with(server_dir.path(), &[("alice@example.com", alice.path())]);
+    let workspace = Workspace::new(server_dir.path().to_path_buf()).unwrap();
+    let state = AppState::new(config, workspace, server_dir.path().join("sessions"));
+    let addr = start_state(state).await;
+
+    let mut ws = connect_raw(
+        addr,
+        "/ws",
+        &[("tailscale-user-login", "alice@example.com")],
+    )
+    .await;
+    assert_eq!(
+        state_workspace(&mut ws).await,
+        alice.path().canonicalize().unwrap()
+    );
+
+    send(
+        &mut ws,
+        json!({"type": "switch_workspace", "path": other.path().to_string_lossy(), "id": "sw"}),
+    )
+    .await;
+    let events = until(&mut ws, "error").await;
+    assert!(
+        events.last().unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("fixed"),
+        "{events:?}"
+    );
+    assert_eq!(
+        state_workspace(&mut ws).await,
+        alice.path().canonicalize().unwrap(),
+        "the mapped workspace must not change"
+    );
 }
 
 #[tokio::test]

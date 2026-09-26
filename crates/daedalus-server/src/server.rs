@@ -15,6 +15,16 @@
 //! injects the `Tailscale-User-Login` header. Configure `[identities]` in the
 //! daedalus config to map those logins to workspaces; when a map is configured, an
 //! unmapped identity is rejected rather than given another user's workspace.
+//!
+//! # Scope of the identity map
+//!
+//! The map fixes each mapped identity's *default* workspace and forbids
+//! `switch_workspace` for it. It is **not** a filesystem isolation boundary:
+//! every session runs as the server user, and the built-in tools deliberately
+//! accept absolute paths and `..` (the workspace is not a sandbox), while
+//! `bash` can reach anywhere the server user can. Run the server as a
+//! dedicated user or inside a sandbox if sessions must not read the rest of
+//! the host.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -42,6 +52,10 @@ pub struct AppState {
     pub workspace: Arc<Workspace>,
     /// Where `/resume` sessions live.
     pub session_root: Arc<PathBuf>,
+    /// Built once per server, lazily and off the async executor: the built-ins
+    /// plus every configured MCP server. Shared by all sessions so MCP child
+    /// processes are spawned once, not per connection.
+    tools: Arc<tokio::sync::OnceCell<Arc<ToolSet>>>,
 }
 
 impl AppState {
@@ -50,6 +64,7 @@ impl AppState {
             config: Arc::new(config),
             workspace: Arc::new(workspace),
             session_root: Arc::new(session_root),
+            tools: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 }
@@ -120,28 +135,66 @@ async fn session_loop(
     let mut config = (*state.config).clone();
     config.workspace = workspace.root().to_path_buf();
     let provider = provider::from_config(&config);
-    let (tools, _mcp_warnings) = ToolSet::from_config(&config, config.max_output_bytes);
-    let (rt, mut events) = AgentRuntime::new(config, provider, tools, workspace);
+    // Build the tool set (and any MCP servers) once per server, off the async
+    // executor: connecting an MCP server blocks on a dedicated runtime, which
+    // tokio forbids on a worker thread. Every session shares the result, so MCP
+    // child processes are not spawned per connection.
+    let tools = state
+        .tools
+        .get_or_init(|| {
+            let tools_config = (*state.config).clone();
+            async move {
+                let fallback_max = tools_config.max_output_bytes;
+                tokio::task::spawn_blocking(move || {
+                    let (set, warnings) =
+                        ToolSet::from_config(&tools_config, tools_config.max_output_bytes);
+                    for warning in &warnings {
+                        eprintln!("daedalus-server: warning: {warning}");
+                    }
+                    Arc::new(set)
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("daedalus-server: warning: could not build tools: {e}");
+                    Arc::new(ToolSet::new(fallback_max))
+                })
+            }
+        })
+        .await
+        .clone();
+    let (rt, mut events) = AgentRuntime::new_with_tools(config, provider, tools, workspace);
+    // A mapped identity has a fixed workspace; `switch_workspace` is refused
+    // for it so the mapping cannot be trivially escaped.
+    let identity_pinned = identity
+        .as_deref()
+        .is_some_and(|id| state.config.identity_workspaces.contains_key(id));
 
     let worker = rt.clone();
     let handle = std::thread::spawn(move || worker.run_forever());
     rt.get_state(); // emit the initial state_changed
 
+    // Persist after every settled turn and again on disconnect (see below); a
+    // long server session is no longer lost when the client goes away.
+    let mut saver = session::SessionSaver::new();
     loop {
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
+                let settled = matches!(event, Event::AgentSettled { .. });
                 let text = serde_json::to_string(&event).unwrap_or_else(|e| {
                     format!("{{\"type\":\"error\",\"message\":\"serialize: {e}\"}}")
                 });
                 if sink.send(Message::Text(text.into())).await.is_err() {
                     break;
                 }
+                if settled {
+                    save_session(&rt, &state.session_root, &mut saver);
+                }
             }
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        match dispatch(&rt, &text, &state.session_root).await {
+                        match dispatch(&rt, &text, &state.session_root, identity_pinned).await {
                             // An id-carrying request gets a terminal response frame,
                             // matching the stdio RPC adapter. The WS loop
                             // stays concurrent so steering can arrive mid-turn, so
@@ -185,7 +238,22 @@ async fn session_loop(
     // waiting for the turn to settle.
     rt.abort();
     rt.shutdown();
-    let _ = handle.join();
+    // Join off the async executor: a long, uncancellable step (a blocking tool,
+    // `list_models`, an MCP call) must not stall a tokio worker shared with
+    // other connections.
+    let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+    // Final save on disconnect: keep whatever the closed session produced.
+    save_session(&rt, &state.session_root, &mut saver);
+}
+
+/// Persist the runtime's current history through `saver` when there is a
+/// conversation worth keeping. Best-effort: a save failure must never break a
+/// session.
+fn save_session(rt: &AgentRuntime, root: &Path, saver: &mut session::SessionSaver) {
+    let history = rt.history();
+    if session::has_conversation(&history) {
+        let _ = saver.save(root, &rt.workspace_root(), &history);
+    }
 }
 
 /// Pick the session workspace. Precedence: mapped identity (from the proxy
@@ -223,6 +291,7 @@ async fn dispatch(
     rt: &AgentRuntime,
     text: &str,
     session_root: &Path,
+    identity_pinned: bool,
 ) -> Result<Option<String>, String> {
     let command: Command =
         serde_json::from_str(text).map_err(|e| format!("malformed command: {e}"))?;
@@ -235,7 +304,15 @@ async fn dispatch(
         CommandKind::SetModel { model } => rt.set_model(&model),
         CommandKind::SetProvider { provider } => rt.set_provider(&provider),
         CommandKind::SetEffort { effort } => rt.set_effort(effort),
-        CommandKind::SwitchWorkspace { path } => rt.switch_workspace(&path),
+        CommandKind::SwitchWorkspace { path } => {
+            if identity_pinned {
+                return Err(
+                    "workspace is fixed for the mapped identity; switch_workspace is not allowed"
+                        .to_string(),
+                );
+            }
+            rt.switch_workspace(&path)
+        }
         CommandKind::Clear {} => rt.clear(),
         CommandKind::GetState {} => rt.get_state(),
         CommandKind::ListModels {} => rt.refresh_models(),

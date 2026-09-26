@@ -27,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use rmcp::model::{
@@ -259,10 +260,56 @@ impl ConnectedServer {
     }
 }
 
+/// How long a single MCP server gets to initialize and list its tools before
+/// the connection is abandoned. Without it, a server that accepts the transport
+/// but never completes the handshake blocks tool-set construction forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Owns the dedicated MCP runtime that drives the rmcp service tasks.
+///
+/// Dropping a `tokio::runtime::Runtime` directly on a runtime worker panics
+/// ("Cannot drop a runtime in a context where blocking is not allowed"). The
+/// MCP runtime outlives [`connect_all`] inside the returned tools, so it can be
+/// dropped from any frontend thread — including an axum worker. `Drop` calls
+/// `shutdown_background`, which is explicitly safe from an async context.
+struct McpRuntime {
+    // `Option` so `Drop` can take the runtime out instead of dropping it as a
+    // field (which would run `Runtime::drop` in place).
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl McpRuntime {
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.runtime
+            .as_ref()
+            .expect("MCP runtime is alive until drop")
+            .block_on(future)
+    }
+}
+
+impl Drop for McpRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                // Inside a runtime: dropping would panic, so shut down without
+                // blocking. Not inside one (the CLI): drop normally so the
+                // service tasks get a graceful shutdown.
+                runtime.shutdown_background();
+            } else {
+                drop(runtime);
+            }
+        }
+    }
+}
+
 /// Connect every enabled server in `configs`, blocking on a dedicated
 /// single-worker tokio runtime that stays alive for the returned tools (the
 /// rmcp service tasks run on it). Connection failures are non-fatal: returned
 /// as human-readable warnings, and the rest of the toolset is unaffected.
+///
+/// Must not be called from inside a tokio runtime: it uses `block_on`
+/// internally. Frontends that are already async (the server) run this in
+/// `spawn_blocking`.
 pub fn connect_all(configs: &[McpServerConfig], max_output: usize) -> (Vec<McpTool>, Vec<String>) {
     let enabled: Vec<&McpServerConfig> = configs.iter().filter(|c| c.enabled).collect();
     if enabled.is_empty() {
@@ -273,16 +320,25 @@ pub fn connect_all(configs: &[McpServerConfig], max_output: usize) -> (Vec<McpTo
         .enable_all()
         .build()
     {
-        Ok(rt) => Arc::new(rt),
+        Ok(rt) => Arc::new(McpRuntime { runtime: Some(rt) }),
         Err(e) => return (Vec::new(), vec![format!("cannot start MCP runtime: {e}")]),
     };
 
     let mut tools = Vec::new();
     let mut warnings = Vec::new();
     for cfg in enabled {
-        match runtime.block_on(connect_one(cfg, Arc::clone(&runtime), max_output)) {
-            Ok(server) => tools.extend(server.into_tools()),
-            Err(e) => warnings.push(format!("mcp server '{}' unavailable: {e}", cfg.name)),
+        let attempt = runtime.block_on(tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_one(cfg, Arc::clone(&runtime), max_output),
+        ));
+        match attempt {
+            Ok(Ok(server)) => tools.extend(server.into_tools()),
+            Ok(Err(e)) => warnings.push(format!("mcp server '{}' unavailable: {e}", cfg.name)),
+            Err(_) => warnings.push(format!(
+                "mcp server '{}' unavailable: timed out after {}s",
+                cfg.name,
+                CONNECT_TIMEOUT.as_secs()
+            )),
         }
     }
     (tools, warnings)
@@ -291,7 +347,7 @@ pub fn connect_all(configs: &[McpServerConfig], max_output: usize) -> (Vec<McpTo
 /// Connect one server and list its tools. Async: the caller owns the runtime.
 async fn connect_one(
     config: &McpServerConfig,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<McpRuntime>,
     max_output: usize,
 ) -> Result<ConnectedServer, String> {
     match config.transport {
@@ -318,7 +374,7 @@ async fn connect_one(
 async fn connect_transport<T, E, A>(
     name: &str,
     transport: T,
-    runtime: Option<Arc<tokio::runtime::Runtime>>,
+    runtime: Option<Arc<McpRuntime>>,
     max_output: usize,
 ) -> Result<ConnectedServer, String>
 where
@@ -363,7 +419,7 @@ struct RmcpClient {
     service: Arc<RunningService<RoleClient, ()>>,
     /// Keeps the runtime (and thus the service task) alive. `None` when the
     /// caller already owns the driving runtime (in-process tests).
-    _runtime: Option<Arc<tokio::runtime::Runtime>>,
+    _runtime: Option<Arc<McpRuntime>>,
 }
 
 impl McpClient for RmcpClient {
@@ -498,6 +554,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
         (dir, ws)
+    }
+
+    /// Regression: an async frontend (the server) must be able to build the
+    /// tool set from within a task, and drop it there, without panicking.
+    #[tokio::test]
+    async fn connect_all_is_safe_from_async_context_via_spawn_blocking() {
+        let cfg = McpServerConfig {
+            name: "missing".into(),
+            enabled: true,
+            command: Some("daedalus-no-such-mcp-binary".into()),
+            ..Default::default()
+        };
+        let (tools, warnings) = tokio::task::spawn_blocking(move || {
+            let result = connect_all(std::slice::from_ref(&cfg), 1000);
+            result
+        })
+        .await
+        .expect("connect_all must not panic on a blocking thread");
+        assert!(tools.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // Dropping the (empty) tool set here runs `McpRuntime::drop` on the
+        // async worker; it must shut the runtime down in the background rather
+        // than panic.
+        drop(tools);
     }
 
     #[test]
