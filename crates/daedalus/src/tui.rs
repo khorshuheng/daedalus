@@ -685,7 +685,7 @@ pub const EFFORT_CHOICES: &[Effort] = &[
 
 /// The built-in theme presets offered by the `/theme` picker, in display
 /// order. Names match `Theme::builtin`.
-pub const THEME_CHOICES: &[&str] = &["dark", "light"];
+pub const THEME_CHOICES: &[&str] = &["dark", "light", "solarized-dark", "solarized-light"];
 
 /// A single-line text editor for the input box: the text plus a
 /// byte cursor that always sits on a UTF-8 char boundary. Pure logic — no
@@ -1058,7 +1058,9 @@ fn apply_theme(theme: &mut Theme, model: &mut UiModel, name: &str) {
         return;
     }
     let Some(next) = Theme::builtin(name) else {
-        model.push_notice(&format!("unknown theme '{name}' (dark|light)"));
+        model.push_notice(&format!(
+            "unknown theme '{name}' (dark, light, solarized-dark, solarized-light)"
+        ));
         return;
     };
     *theme = next;
@@ -3588,6 +3590,16 @@ mod tests {
         let mut theme = Theme::default();
         apply_theme(&mut theme, &mut model, "neon");
         assert_eq!(theme.name, "dark", "an unknown preset changes nothing");
+    }
+
+    #[test]
+    fn every_theme_choice_names_a_builtin_preset() {
+        for name in THEME_CHOICES {
+            assert!(
+                Theme::builtin(name).is_some(),
+                "THEME_CHOICES lists '{name}' but no preset answers to it"
+            );
+        }
     }
 
     #[test]

@@ -9,7 +9,8 @@
 //!
 //! ```toml
 //! [theme]
-//! name = "dark"                 # dark | light (default: COLORFGBG detection)
+//! name = "dark"                 # dark | light | solarized-dark | solarized-light
+//!                               # (default: COLORFGBG detection)
 //! [theme.vars]
 //! accent = "#00aaff"
 //! [theme.colors]
@@ -138,6 +139,8 @@ impl Theme {
         match name {
             "dark" => Some(Theme::dark()),
             "light" => Some(Theme::light()),
+            "solarized-dark" => Some(Theme::solarized_dark()),
+            "solarized-light" => Some(Theme::solarized_light()),
             _ => None,
         }
     }
@@ -187,7 +190,68 @@ impl Theme {
         t.set(Token::MdBullet, fg(8));
         t
     }
+
+    /// The `solarized-dark` preset — Ethan Schoonover's Solarized palette on
+    /// the base03 background. Foregrounds are explicit 24-bit RGB, so it keeps
+    /// its identity on a non-Solarized terminal too.
+    pub fn solarized_dark() -> Theme {
+        let mut t = Theme {
+            name: "solarized-dark".to_string(),
+            tokens: [StyleSpec::default(); Token::COUNT],
+        };
+        t.set(Token::User, rgb(S_CYAN));
+        t.set(Token::Assistant, rgb(S_BASE1));
+        t.set(Token::Thinking, rgb_italic(S_BASE01));
+        t.set(Token::Tool, rgb(S_BASE01));
+        t.set(Token::ToolOk, rgb(S_GREEN));
+        t.set(Token::ToolErr, rgb(S_RED));
+        t.set(Token::Notice, rgb(S_YELLOW));
+        t.set(Token::Selection, bold());
+        t.set(Token::MdHeading, bold());
+        t.set(Token::MdCode, rgb(S_YELLOW));
+        t.set(Token::MdCodeBlock, rgb(S_YELLOW));
+        t.set(Token::MdLink, rgb_underlined(S_BLUE));
+        t.set(Token::MdQuote, rgb_italic(S_BASE01));
+        t.set(Token::MdBullet, rgb(S_BASE01));
+        t
+    }
+
+    /// The `solarized-light` preset — the Solarized palette on the base3
+    /// background, with darker foregrounds for contrast.
+    pub fn solarized_light() -> Theme {
+        let mut t = Theme {
+            name: "solarized-light".to_string(),
+            tokens: [StyleSpec::default(); Token::COUNT],
+        };
+        t.set(Token::User, rgb(S_BLUE));
+        t.set(Token::Assistant, rgb(S_BASE00));
+        t.set(Token::Thinking, rgb_italic(S_BASE1));
+        t.set(Token::Tool, rgb(S_BASE1));
+        t.set(Token::ToolOk, rgb(S_GREEN));
+        t.set(Token::ToolErr, rgb(S_RED));
+        t.set(Token::Notice, rgb(S_MAGENTA));
+        t.set(Token::Selection, bold());
+        t.set(Token::MdHeading, bold());
+        t.set(Token::MdCode, rgb(S_MAGENTA));
+        t.set(Token::MdCodeBlock, rgb(S_MAGENTA));
+        t.set(Token::MdLink, rgb_underlined(S_BLUE));
+        t.set(Token::MdQuote, rgb_italic(S_BASE1));
+        t.set(Token::MdBullet, rgb(S_BASE1));
+        t
+    }
 }
+
+/// The Solarized palette (Ethan Schoonover), as `(r, g, b)`.
+type Rgb8 = (u8, u8, u8);
+const S_BASE01: Rgb8 = (0x58, 0x6e, 0x75);
+const S_BASE00: Rgb8 = (0x65, 0x7b, 0x83);
+const S_BASE1: Rgb8 = (0x93, 0xa1, 0xa1);
+const S_YELLOW: Rgb8 = (0xb5, 0x89, 0x00);
+const S_RED: Rgb8 = (0xdc, 0x32, 0x2f);
+const S_MAGENTA: Rgb8 = (0xd3, 0x36, 0x82);
+const S_BLUE: Rgb8 = (0x26, 0x8b, 0xd2);
+const S_CYAN: Rgb8 = (0x2a, 0xa1, 0x98);
+const S_GREEN: Rgb8 = (0x85, 0x99, 0x00);
 
 fn fg(index: u8) -> StyleSpec {
     StyleSpec {
@@ -220,6 +284,35 @@ fn bold() -> StyleSpec {
 fn fg_underlined(index: u8) -> StyleSpec {
     StyleSpec {
         fg: ThemeColor::Indexed(index),
+        modifiers: Modifiers {
+            underlined: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn rgb((r, g, b): Rgb8) -> StyleSpec {
+    StyleSpec {
+        fg: ThemeColor::Rgb(r, g, b),
+        ..Default::default()
+    }
+}
+
+fn rgb_italic(c: Rgb8) -> StyleSpec {
+    StyleSpec {
+        fg: rgb(c).fg,
+        modifiers: Modifiers {
+            italic: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn rgb_underlined(c: Rgb8) -> StyleSpec {
+    StyleSpec {
+        fg: rgb(c).fg,
         modifiers: Modifiers {
             underlined: true,
             ..Default::default()
@@ -418,8 +511,9 @@ impl ThemePartial {
 /// Resolve a partial theme against a base preset.
 pub fn resolve(partial: &ThemePartial, detected: &str) -> Result<Theme, String> {
     let name = partial.name.clone().unwrap_or_else(|| detected.to_string());
-    let mut theme = Theme::builtin(&name)
-        .ok_or_else(|| format!("unknown theme '{name}' (supported: dark, light)"))?;
+    let mut theme = Theme::builtin(&name).ok_or_else(|| {
+        format!("unknown theme '{name}' (supported: dark, light, solarized-dark, solarized-light)")
+    })?;
 
     let mut vars: BTreeMap<String, ThemeColor> = BTreeMap::new();
     for (k, v) in &partial.vars {
@@ -538,6 +632,40 @@ mod tests {
         assert!(dark.token(Token::Thinking).modifiers.italic);
         assert!(Theme::builtin("light").is_some());
         assert!(Theme::builtin("nope").is_none());
+    }
+
+    #[test]
+    fn solarized_presets_use_the_palette() {
+        let dark = Theme::solarized_dark();
+        assert_eq!(dark.name, "solarized-dark");
+        assert_eq!(
+            dark.token(Token::User).fg,
+            ThemeColor::Rgb(0x2a, 0xa1, 0x98)
+        ); // cyan
+        assert_eq!(
+            dark.token(Token::Notice).fg,
+            ThemeColor::Rgb(0xb5, 0x89, 0x00)
+        ); // yellow
+        assert_eq!(
+            dark.token(Token::ToolErr).fg,
+            ThemeColor::Rgb(0xdc, 0x32, 0x2f)
+        ); // red
+        assert!(dark.token(Token::MdLink).modifiers.underlined);
+
+        let light = Theme::solarized_light();
+        assert_eq!(light.name, "solarized-light");
+        assert_eq!(
+            light.token(Token::User).fg,
+            ThemeColor::Rgb(0x26, 0x8b, 0xd2)
+        ); // blue
+        assert_eq!(
+            light.token(Token::Notice).fg,
+            ThemeColor::Rgb(0xd3, 0x36, 0x82)
+        ); // magenta
+        assert_eq!(
+            Theme::builtin("solarized-dark").map(|t| t.name),
+            Some("solarized-dark".to_string())
+        );
     }
 
     #[test]

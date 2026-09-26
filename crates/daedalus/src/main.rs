@@ -74,7 +74,8 @@ struct Cli {
     #[arg(long, value_name = "MODE", value_parser = parse_mode)]
     mode: Option<Mode>,
 
-    /// TUI theme preset: dark | light (default: detected from the terminal).
+    /// TUI theme preset: dark | light | solarized-dark | solarized-light
+    /// (default: detected from the terminal).
     #[arg(long, value_name = "NAME", value_parser = parse_theme)]
     theme: Option<String>,
 }
@@ -96,7 +97,9 @@ fn parse_theme(s: &str) -> Result<String, String> {
     if daedalus_core::theme::Theme::builtin(s).is_some() {
         Ok(s.to_string())
     } else {
-        Err(format!("invalid --theme '{s}' (supported: dark, light)"))
+        Err(format!(
+            "invalid --theme '{s}' (supported: dark, light, solarized-dark, solarized-light)"
+        ))
     }
 }
 

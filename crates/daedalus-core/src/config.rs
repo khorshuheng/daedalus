@@ -535,7 +535,9 @@ pub fn persist_edit(path: &Path, edit: &ConfigEdit) -> Result<(), String> {
     }
     if let Some(name) = &edit.theme {
         if crate::theme::Theme::builtin(name).is_none() {
-            return Err(format!("unknown theme '{name}' (dark|light)"));
+            return Err(format!(
+                "unknown theme '{name}' (dark, light, solarized-dark, solarized-light)"
+            ));
         }
     }
     let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(path) {
