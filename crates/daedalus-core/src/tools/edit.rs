@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-use super::mutation::with_file_mutation;
+use super::mutation::{with_file_mutation, write_atomic};
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
 
@@ -31,11 +31,48 @@ fn normalize_lf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn restore_line_endings(s: &str, ending: &str) -> String {
+/// Normalize line endings to LF while recording, for every normalized byte,
+/// the byte offset it came from in the original. `map` has `out.len() + 1`
+/// entries; `map[i]` is the original start of the char at normalized byte `i`,
+/// and the final entry is `s.len()`. A match found in normalized space maps
+/// back to original bytes through this table, so only the replaced span is
+/// rewritten and lone `\r` bytes elsewhere are left untouched.
+fn normalize_lf_mapped(s: &str) -> (String, Vec<usize>) {
+    let mut out = String::with_capacity(s.len());
+    let mut map = Vec::with_capacity(s.len() + 1);
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\r' {
+            out.push('\n');
+            map.push(i);
+            i += if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                2
+            } else {
+                1
+            };
+        } else {
+            let ch = s[i..].chars().next().expect("char boundary");
+            let len = ch.len_utf8();
+            out.push(ch);
+            for _ in 0..len {
+                map.push(i);
+            }
+            i += len;
+        }
+    }
+    map.push(s.len());
+    (out, map)
+}
+
+/// Convert the newline style of replacement text to the file's dominant
+/// ending, without touching the file's existing bytes.
+fn with_line_ending(s: &str, ending: &str) -> String {
+    let lf = normalize_lf(s);
     if ending == "\r\n" {
-        s.replace('\n', "\r\n")
+        lf.replace('\n', "\r\n")
     } else {
-        s.to_string()
+        lf
     }
 }
 
@@ -119,6 +156,16 @@ fn describe_edit(idx: usize, total: usize) -> String {
     }
 }
 
+/// True when fuzzy normalization could change `s`: it contains a non-ASCII
+/// character (smart quotes, NFKC-compatible forms) or trailing whitespace on a
+/// line (which the fuzzy view trims). Pure ASCII with no trailing whitespace is
+/// already normalized, so the expensive grapheme+NFKC pass can be skipped.
+fn needs_fuzzy(s: &str) -> bool {
+    !s.is_ascii()
+        || s.lines()
+            .any(|line| line.chars().last().is_some_and(char::is_whitespace))
+}
+
 /// Locate `old` in `content`, trying an exact match first and then a fuzzy
 /// match, returning the byte range in `content`. Errors on empty, missing, or
 /// ambiguous matches.
@@ -142,12 +189,15 @@ fn locate_match(
             // Uniqueness is decided in normalized space even when the
             // exact match is unique, so an ASCII-quote oldText cannot silently
             // pick one of several curly-quote twins (pi's `countOccurrences`).
-            let normalized_count = normalized_occurrences(content, old);
-            if normalized_count > 1 {
-                return Err(ToolError::Invalid(format!(
-                    "{} matched {normalized_count} times in '{path}' (expected exactly 1)",
-                    describe_edit(idx, total)
-                )));
+            // Skip the normalization entirely when it cannot change anything.
+            if needs_fuzzy(content) || needs_fuzzy(old) {
+                let normalized_count = normalized_occurrences(content, old);
+                if normalized_count > 1 {
+                    return Err(ToolError::Invalid(format!(
+                        "{} matched {normalized_count} times in '{path}' (expected exactly 1)",
+                        describe_edit(idx, total)
+                    )));
+                }
             }
             let start = exact[0];
             return Ok((start, start + old.len()));
@@ -345,14 +395,17 @@ fn edit_at(
     };
 
     let ending = detect_line_ending(&content);
-    let lf = normalize_lf(&content);
+    let (lf, lf_map) = normalize_lf_mapped(&content);
 
     let mut replacements: Vec<(usize, usize, String)> = Vec::with_capacity(edits.len());
     for (idx, (old, new)) in edits.iter().enumerate() {
         let old_lf = normalize_lf(old);
-        let new_lf = normalize_lf(new);
         let (start, end) = locate_match(&lf, &old_lf, path, idx, edits.len())?;
-        replacements.push((start, end, new_lf));
+        // Translate the normalized match back to original-byte offsets and
+        // adapt only the replacement text to the file's ending.
+        let orig_start = lf_map.get(start).copied().unwrap_or(content.len());
+        let orig_end = lf_map.get(end).copied().unwrap_or(content.len());
+        replacements.push((orig_start, orig_end, with_line_ending(new, ending)));
     }
 
     replacements.sort_by_key(|r| r.0);
@@ -364,28 +417,31 @@ fn edit_at(
         }
     }
 
-    let mut new_lf = lf.clone();
+    // Splice into the original buffer so unchanged bytes (including lone `\r`)
+    // survive verbatim.
+    let mut new_content = content.clone();
     for (start, end, new) in replacements.iter().rev() {
-        new_lf.replace_range(*start..*end, new);
+        new_content.replace_range(*start..*end, new);
     }
-    if new_lf == lf {
+    if new_content == content {
         return Err(ToolError::Invalid(format!(
             "no change made to '{path}': replacements produced identical content"
         )));
     }
 
-    let diff = unified_diff(&lf, &new_lf);
+    // The diff is line-based, so comparing in LF space is enough (and keeps a
+    // pure line-ending change from appearing as a whole-file rewrite).
+    let diff = unified_diff(&normalize_lf(&content), &normalize_lf(&new_content));
 
-    let restored = restore_line_endings(&new_lf, ending);
-    let mut out = Vec::with_capacity(restored.len() + 3);
+    let mut out = Vec::with_capacity(new_content.len() + 3);
     if has_bom {
         out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
     }
-    out.extend_from_slice(restored.as_bytes());
+    out.extend_from_slice(new_content.as_bytes());
     if cancel.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
-    std::fs::write(resolved, &out).map_err(|e| ToolError::Io(e.to_string()))?;
+    write_atomic(resolved, &out).map_err(|e| ToolError::Io(e.to_string()))?;
 
     Ok(ToolOutput {
         content: format!(
@@ -409,6 +465,16 @@ mod tests {
 
     fn read(dir: &tempfile::TempDir) -> String {
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap()
+    }
+
+    /// The fuzzy path is only entered when normalization could change
+    /// something; plain ASCII with no trailing whitespace skips it (DAE-117).
+    #[test]
+    fn needs_fuzzy_skips_plain_ascii() {
+        assert!(!needs_fuzzy("let x = 1;\nlet y = 2;\n"));
+        assert!(needs_fuzzy("caf\u{00E9}\n"));
+        assert!(needs_fuzzy("trailing \n"));
+        assert!(needs_fuzzy("tab\t\n"));
     }
 
     #[tokio::test]
@@ -484,6 +550,70 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(read(&dir), "line one\r\nLINE TWO\r\nline three\r\n");
+    }
+
+    #[tokio::test]
+    async fn mixed_line_endings_are_preserved() {
+        // Dominant ending is CRLF (first newline), but the lone-LF line must
+        // keep its LF instead of being rewritten (DAE-109).
+        let (ws, dir) = setup("mixed", "a\r\nb\nc\r\n");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "b", "newText": "B"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&dir), "a\r\nB\nc\r\n");
+    }
+
+    #[tokio::test]
+    async fn lone_cr_bytes_are_not_treated_as_line_breaks() {
+        let (ws, dir) = setup("lonecr", "x\ry");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "x", "newText": "A"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&dir), "A\ry");
+    }
+
+    #[tokio::test]
+    async fn new_text_newlines_follow_the_file_ending() {
+        let (ws, dir) = setup("newlines", "a\r\nb\r\nc\r\n");
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "b", "newText": "B1\nB2"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read(&dir), "a\r\nB1\r\nB2\r\nc\r\n");
+    }
+
+    /// The atomic write must preserve an existing file's mode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_preserves_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (ws, dir) = setup("perms", "hello\n");
+        let path = dir.path().join("a.txt");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let tool = EditTool;
+        tool.run(
+            &ws,
+            &json!({"path": "a.txt", "oldText": "hello", "newText": "bye"}),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode was {:o}", mode);
     }
 
     #[tokio::test]

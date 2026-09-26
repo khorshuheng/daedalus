@@ -31,6 +31,40 @@ fn mutation_key(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Write `contents` to `path` atomically: a sibling temp file is written,
+/// fsynced, and renamed over the target. A crash, kill or ENOSPC leaves the
+/// original file intact instead of a truncated one. An existing file's
+/// permissions are preserved; a new file gets the conventional `0644`.
+pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let existing = std::fs::metadata(path).ok().map(|m| m.permissions());
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".daedalus-write-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(
+            existing
+                .clone()
+                .unwrap_or_else(|| std::fs::Permissions::from_mode(0o644)),
+        );
+    }
+    let mut tmp = builder.tempfile_in(parent)?;
+    #[cfg(not(unix))]
+    if let Some(permissions) = existing {
+        tmp.as_file().set_permissions(permissions)?;
+    }
+    std::io::Write::write_all(&mut tmp, contents)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    // Best-effort directory fsync so the rename itself is durable.
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
 /// Run `f` while holding the mutation lock for `path`.
 ///
 /// Serializes read-modify-write operations targeting the same file; operations

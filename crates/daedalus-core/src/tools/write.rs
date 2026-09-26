@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
-use super::mutation::with_file_mutation;
+use super::mutation::{with_file_mutation, write_atomic};
 use super::{arg_string, resolve, Tool, ToolError, ToolOutput};
 use crate::workspace::Workspace;
 
@@ -92,7 +92,7 @@ fn write_at(
     if cancel.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
-    std::fs::write(resolved, content).map_err(|e| ToolError::Io(e.to_string()))?;
+    write_atomic(resolved, content.as_bytes()).map_err(|e| ToolError::Io(e.to_string()))?;
 
     Ok(ToolOutput {
         content: format!("wrote {} bytes to {}", content.len(), path),
