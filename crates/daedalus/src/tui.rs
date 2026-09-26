@@ -1078,6 +1078,10 @@ pub fn run_tui(
     .map_err(|e| format!("cannot enter alt screen: {e}"))?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
+    // Restore the terminal and persist the session if a panic unwinds out of
+    // the TUI: raw mode and the alternate screen would otherwise be left
+    // behind, and the in-flight turn lost.
+    install_panic_hook(rt.clone(), session_root.to_path_buf());
 
     let mut model = UiModel::new(rt.state());
     model.persist = persist;
@@ -1280,6 +1284,34 @@ pub fn run_tui(
     crate::auto_save(rt, session_root, &mut session_saver);
     rt.shutdown();
     result
+}
+
+/// Install a panic hook that restores the terminal and saves the session
+/// before delegating to the previous hook. The TUI owns the terminal, so a
+/// panic on any thread would otherwise leave it in raw mode on the alternate
+/// screen.
+fn install_panic_hook(rt: AgentRuntime, session_root: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            std::io::stdout(),
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        // A panic may have poisoned the history lock; never let the save turn
+        // a panic into a double-panic abort.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let history = rt.history();
+            if daedalus_core::session::has_conversation(&history) {
+                let mut saver = daedalus_core::session::SessionSaver::new();
+                let _ = saver.save(&session_root, &rt.workspace_root(), &history);
+            }
+        }));
+        previous(info);
+    }));
 }
 
 /// A modal picker overlay (model / effort / provider / session selection).
