@@ -876,6 +876,22 @@ fn spinner_frame(elapsed: Duration) -> char {
     SPINNER_FRAMES[(elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len()]
 }
 
+/// Footer label for the last completion's prompt tokens, with the percentage
+/// of the configured history budget when both are known. The budget is a
+/// conservative stand-in for the model's context window (daedalus does not
+/// know the latter), so the percentage is "percent of budget", not of the
+/// model's advertised window.
+fn context_usage(used: Option<usize>, limit: usize) -> String {
+    match used {
+        Some(tokens) if limit > 0 => {
+            let pct = tokens.saturating_mul(100) / limit;
+            format!("{tokens} tokens ({pct}%)")
+        }
+        Some(tokens) => format!("{tokens} tokens"),
+        None => "? tokens".to_string(),
+    }
+}
+
 /// First visible row of a picker list so `selected` stays inside the viewport.
 /// The list only scrolls when the selection leaves the window.
 fn picker_offset(selected: usize, viewport: usize) -> usize {
@@ -2008,12 +2024,9 @@ fn draw(
     }
 
     // Footer/status.
-    let usage = model
-        .usage
-        .map(|t| t.to_string())
-        .unwrap_or_else(|| "?".to_string());
+    let usage = context_usage(model.usage, model.state.max_context_tokens);
     let status = format!(
-        " {} ({}) | effort {} | {} | {} tokens",
+        " {} ({}) | effort {} | {} | {}",
         model.state.model,
         provider,
         model.state.effort.name(),
@@ -2530,6 +2543,7 @@ mod tests {
             effort: Effort::Medium,
             workspace: "/ws".into(),
             busy: false,
+            max_context_tokens: 28_000,
         }
     }
 
@@ -3089,6 +3103,16 @@ mod tests {
             prompt_tokens: Some(1200),
         });
         assert_eq!(m.usage, Some(1200));
+    }
+
+    #[test]
+    fn context_usage_includes_the_budget_percentage() {
+        assert_eq!(context_usage(Some(1200), 28_000), "1200 tokens (4%)");
+        assert_eq!(context_usage(Some(0), 28_000), "0 tokens (0%)");
+        // Without a limit the raw count is still useful; without a count the
+        // footer keeps its existing placeholder.
+        assert_eq!(context_usage(Some(1200), 0), "1200 tokens");
+        assert_eq!(context_usage(None, 28_000), "? tokens");
     }
 
     #[test]
