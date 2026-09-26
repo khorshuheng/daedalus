@@ -457,6 +457,8 @@ pub struct ConfigEdit {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub effort: Option<Effort>,
+    /// A built-in theme preset name, written to `[theme].name`.
+    pub theme: Option<String>,
 }
 
 impl ConfigEdit {
@@ -485,9 +487,21 @@ impl ConfigEdit {
         }
     }
 
+    /// An edit remembering a chosen theme preset, written to `name` under the
+    /// `[theme]` table.
+    pub fn theme(name: impl Into<String>) -> Self {
+        Self {
+            theme: Some(name.into()),
+            ..Self::default()
+        }
+    }
+
     /// True when the edit would change nothing.
     pub fn is_empty(&self) -> bool {
-        self.provider.is_none() && self.model.is_none() && self.effort.is_none()
+        self.provider.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.theme.is_none()
     }
 }
 
@@ -519,6 +533,11 @@ pub fn persist_edit(path: &Path, edit: &ConfigEdit) -> Result<(), String> {
             return Err("refusing to save an empty model".into());
         }
     }
+    if let Some(name) = &edit.theme {
+        if crate::theme::Theme::builtin(name).is_none() {
+            return Err(format!("unknown theme '{name}' (dark|light)"));
+        }
+    }
     let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(path) {
         Ok(text) => text
             .parse()
@@ -535,6 +554,9 @@ pub fn persist_edit(path: &Path, edit: &ConfigEdit) -> Result<(), String> {
     }
     if let Some(effort) = edit.effort {
         set_top_level(&mut doc, "effort", effort.name());
+    }
+    if let Some(name) = &edit.theme {
+        set_theme_name(&mut doc, name);
     }
     let dir = match path.parent() {
         Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -559,6 +581,18 @@ fn set_top_level(doc: &mut toml_edit::DocumentMut, key: &str, value: &str) {
         *new.decor_mut() = old.decor().clone();
     }
     doc[key] = toml_edit::Item::Value(new);
+}
+
+/// Set `name` inside the `[theme]` table, creating the table when absent. The
+/// table is merged rather than replaced, so hand-written token overrides under
+/// `[theme.colors]` survive a preset switch.
+fn set_theme_name(doc: &mut toml_edit::DocumentMut, name: &str) {
+    if !matches!(doc.get("theme"), Some(toml_edit::Item::Table(_))) {
+        doc["theme"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    if let Some(table) = doc["theme"].as_table_mut() {
+        table["name"] = toml_edit::value(name);
+    }
 }
 
 #[cfg(test)]
@@ -922,6 +956,59 @@ command = "npx"
         let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
         assert_eq!(c.model, "m");
         assert_eq!(c.provider.name, "openai");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_writes_the_theme_name_into_the_existing_table() {
+        let dir = tmpdir("theme");
+        let path = dir.join("config.toml");
+        // A hand-tuned accent the user set: switching the preset must keep it.
+        std::fs::write(
+            &path,
+            "# My config.\nmodel = \"m\"\n[theme]\nname = \"dark\"\n[theme.colors]\nuser = \"red\"\n",
+        )
+        .unwrap();
+
+        persist_edit(&path, &ConfigEdit::theme("light")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# My config."), "comments survive");
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.theme.name, "light");
+        assert_eq!(c.model, "m");
+        // The per-token override is merged under the new preset, not dropped.
+        assert_eq!(
+            c.theme.token(crate::theme::Token::User).fg,
+            crate::theme::ThemeColor::Indexed(1)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_creates_the_theme_table_when_absent() {
+        let dir = tmpdir("theme-new");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"m\"\n").unwrap();
+
+        persist_edit(&path, &ConfigEdit::theme("light")).unwrap();
+
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.theme.name, "light");
+        // The unrelated top-level key is untouched.
+        assert_eq!(c.model, "m");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_rejects_an_unknown_theme_without_rewriting() {
+        let dir = tmpdir("theme-bad");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "model = \"m\"\n").unwrap();
+
+        assert!(persist_edit(&path, &ConfigEdit::theme("neon")).is_err());
+        // A rejected edit must leave the file byte-for-byte.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "model = \"m\"\n");
         std::fs::remove_dir_all(&dir).ok();
     }
 
