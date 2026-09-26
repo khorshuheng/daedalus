@@ -362,6 +362,11 @@ pub struct RuntimeState {
     /// uses for its context-usage percentage. `0` when unknown.
     #[serde(default)]
     pub max_context_tokens: usize,
+    /// The active model's context window (input tokens), for a context-usage
+    /// percentage. `0` when daedalus has no figure for the model, in which
+    /// case frontends omit the percentage rather than invent a denominator.
+    #[serde(default)]
+    pub context_window: usize,
 }
 
 /// Classify a provider failure for `Event::Error.kind`, so frontends can react
@@ -547,6 +552,7 @@ impl AgentRuntime {
         let provider_config = config.clone();
         let effort = config.effort;
         let max_context_tokens = config.max_context_tokens;
+        let context_window = crate::catalog::context_window(&provider_name, &model).unwrap_or(0);
         let ws_path = workspace.root().to_string_lossy().into_owned();
         let runtime = AgentRuntime {
             inner: Arc::new(Inner {
@@ -563,6 +569,7 @@ impl AgentRuntime {
                     workspace: ws_path,
                     busy: false,
                     max_context_tokens,
+                    context_window,
                 }),
                 cancel: Mutex::new(CancellationToken::new()),
                 interactive: AtomicBool::new(false),
@@ -771,6 +778,9 @@ impl AgentRuntime {
         {
             let mut st = self.inner.state.lock().unwrap();
             st.provider = info.name.to_string();
+            // A different provider can change whether the window is known.
+            st.context_window =
+                crate::catalog::context_window(&st.provider, &st.model).unwrap_or(0);
         }
         // A different provider has a different model catalog.
         *self.inner.models.lock().unwrap() = Vec::new();
@@ -999,7 +1009,14 @@ impl AgentRuntime {
     async fn apply_state_command(&self, kind: CommandKind) {
         match kind {
             CommandKind::SetModel { model } => {
-                self.inner.state.lock().unwrap().model = model.clone();
+                {
+                    let mut st = self.inner.state.lock().unwrap();
+                    st.model = model.clone();
+                    // The window is a property of the model, so switching the
+                    // model re-derives it; an unknown model clears it.
+                    st.context_window =
+                        crate::catalog::context_window(&st.provider, &model).unwrap_or(0);
+                }
                 // The provider captures the model id at construction, so a
                 // runtime switch must rebuild it; otherwise the request (and
                 // the error that names it) keeps reporting the old model.
@@ -1956,6 +1973,51 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&before, &after),
             "the provider must be rebuilt so the new model id is what gets sent"
+        );
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn state_tracks_the_active_models_context_window() {
+        // The footer percentage needs a real denominator: the model's window
+        // when daedalus knows it, and no denominator at all otherwise.
+        let (dir, ws) = workspace("context-window");
+        let mut cfg = Config::defaults(dir.path().to_path_buf());
+        cfg.provider = crate::config::provider_by_name("deepseek").unwrap();
+        cfg.model = "deepseek-chat".into();
+        let tools = ToolSet::new(1000);
+        let (rt, mut rx) = AgentRuntime::new(
+            cfg,
+            Box::new(GateProvider::new(vec![Response::Text(text("ok"))])),
+            tools,
+            ws,
+        );
+        assert_eq!(
+            rt.state().context_window,
+            64_000,
+            "a known model reports its window"
+        );
+
+        let worker = rt.clone();
+        let handle = std::thread::spawn(move || worker.run_forever());
+        rt.set_model("deepseek-unlisted");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut applied = false;
+        while !applied && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Event::StateChanged { model, .. }) if model == "deepseek-unlisted" => {
+                    applied = true
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+        assert!(applied, "set_model must ack with state_changed");
+        assert_eq!(
+            rt.state().context_window,
+            0,
+            "an unknown model clears the window instead of guessing one"
         );
         rt.shutdown();
         handle.join().unwrap_or(());
