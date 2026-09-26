@@ -36,7 +36,7 @@ use clap::Parser;
 
 /// Daedalus — a minimal coding agent.
 #[derive(Parser, Debug)]
-#[command(name = "dd", version, about, disable_help_flag = false)]
+#[command(name = "dl", version, about, disable_help_flag = false)]
 struct Cli {
     /// The instruction to give the model (not needed in --mode rpc, which
     /// reads commands from stdin).

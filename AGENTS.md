@@ -11,7 +11,7 @@ a headless server.
 - `crates/daedalus-core` — the library `daedalus_core`: config, workspace,
   credential, the built-in tools, the provider layer, session persistence,
   the `AgentRuntime` engine, skills, MCP, and paths.
-- `crates/daedalus` — the CLI binary `dd`: argument parsing, the headless
+- `crates/daedalus` — the CLI binary `dl`: argument parsing, the headless
   `--mode json` / `--mode rpc` adapters, and the ratatui TUI.
 - `crates/daedalus-server` — the headless WebSocket server frontend over the
   same `AgentRuntime` protocol.
@@ -23,7 +23,7 @@ a headless server.
 make check     # cargo check --workspace --all-targets
 make test      # cargo test --workspace
 make fmt       # cargo fmt --all
-make build     # release binaries; `make link` symlinks dd + daedalus-server into ~/.local/bin
+make build     # release binaries; `make link` symlinks dl + daedalus-server into ~/.local/bin
 ```
 
 Run `cargo fmt --all` and `cargo check --workspace --all-targets` before

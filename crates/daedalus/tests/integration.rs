@@ -131,7 +131,7 @@ fn integration_iteration_cap() {
 #[test]
 fn cli_smoke_piped_without_mode_is_rejected() {
     let tmp = tempdir("cli-no-mode");
-    let out = Command::new(env!("CARGO_BIN_EXE_dd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_dl"))
         .args(["hello", "--provider", "fake", "--model", "test", "--dir"])
         .arg(tmp.path())
         .stdin(std::process::Stdio::null())
@@ -152,7 +152,7 @@ fn cli_smoke_piped_without_mode_is_rejected() {
 #[test]
 fn cli_smoke_repl_mode_is_removed() {
     let tmp = tempdir("cli-repl-removed");
-    let out = Command::new(env!("CARGO_BIN_EXE_dd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_dl"))
         .args(["hello", "--mode", "repl", "--provider", "fake", "--dir"])
         .arg(tmp.path())
         .stdin(std::process::Stdio::null())
@@ -168,7 +168,7 @@ fn cli_smoke_repl_mode_is_removed() {
 #[test]
 fn cli_smoke_unknown_provider_fails() {
     let tmp = tempdir("cli-bad");
-    let out = Command::new(env!("CARGO_BIN_EXE_dd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_dl"))
         .args(["hi", "--provider", "nope", "--dir"])
         .arg(tmp.path())
         .stdin(std::process::Stdio::null())
@@ -214,7 +214,7 @@ fn cli_rpc_mode_drives_a_session_over_stdio() {
     let tmp = tempdir("rpc");
     let script = r#"{"id":"1","type":"prompt","text":"say hi"}
 "#;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dd"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dl"))
         .args([
             "--mode",
             "rpc",
@@ -258,7 +258,7 @@ fn cli_rpc_mode_drives_a_session_over_stdio() {
 #[test]
 fn cli_json_mode_emits_events_as_jsonl() {
     let tmp = tempdir("json");
-    let out = Command::new(env!("CARGO_BIN_EXE_dd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_dl"))
         .args([
             "hello",
             "--mode",
@@ -289,7 +289,7 @@ fn cli_json_mode_emits_events_as_jsonl() {
 #[test]
 fn cli_unknown_mode_fails() {
     let tmp = tempdir("mode-bad");
-    let out = Command::new(env!("CARGO_BIN_EXE_dd"))
+    let out = Command::new(env!("CARGO_BIN_EXE_dl"))
         .args(["hi", "--mode", "nope", "--dir"])
         .arg(tmp.path())
         .stdin(std::process::Stdio::null())

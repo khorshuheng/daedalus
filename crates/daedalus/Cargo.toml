@@ -6,7 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "dd"
+name = "dl"
 path = "src/main.rs"
 
 [dependencies]
