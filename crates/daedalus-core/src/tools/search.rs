@@ -16,7 +16,7 @@
 use futures::future::BoxFuture;
 use ignore::overrides::OverrideBuilder;
 use ignore::types::TypesBuilder;
-use ignore::{DirEntry, Error as IgnoreError, WalkBuilder};
+use ignore::{WalkBuilder, WalkState};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
@@ -357,46 +357,61 @@ impl SearchTool {
         let mut skipped_large = 0usize;
         let mut truncated = false;
 
-        // `--sort` buffers the (ignore-filtered) file list; otherwise stream.
-        let entries: Box<dyn Iterator<Item = Result<DirEntry, IgnoreError>> + '_> =
-            match sort.as_str() {
-                "none" | "" => Box::new(wb.build()),
-                "path" => {
-                    let mut v: Vec<DirEntry> = wb.build().filter_map(Result::ok).collect();
-                    v.sort_by(|a, b| a.path().cmp(b.path()));
-                    if sort_reverse {
-                        v.reverse();
+        // Parallel directory walk: collect the candidate file paths (respecting
+        // every ignore/glob/type setting), then process them in a deterministic
+        // order. Only paths are buffered, so memory is bounded by the file
+        // count, not content.
+        let collected: std::sync::Mutex<Vec<std::path::PathBuf>> =
+            std::sync::Mutex::new(Vec::new());
+        let walker = wb.build_parallel();
+        walker.run(|| {
+            let collected = &collected;
+            Box::new(move |result| {
+                if cancel.is_cancelled() {
+                    return WalkState::Quit;
+                }
+                if let Ok(entry) = result {
+                    if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                        collected
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(entry.into_path());
                     }
-                    Box::new(v.into_iter().map(Ok))
                 }
-                "modified" | "accessed" | "created" => {
-                    let mut v: Vec<DirEntry> = wb.build().filter_map(Result::ok).collect();
-                    v.sort_by_key(|e| match sort.as_str() {
-                        "modified" => e.metadata().ok().and_then(|m| m.modified().ok()),
-                        "accessed" => e.metadata().ok().and_then(|m| m.accessed().ok()),
-                        _ => e.metadata().ok().and_then(|m| m.created().ok()),
-                    });
-                    if sort_reverse {
-                        v.reverse();
-                    }
-                    Box::new(v.into_iter().map(Ok))
+                WalkState::Continue
+            })
+        });
+        let mut paths = collected.into_inner().unwrap_or_else(|e| e.into_inner());
+        if cancel.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        match sort.as_str() {
+            // `none` sorts too, so the output does not depend on the parallel
+            // walk order.
+            "none" | "" | "path" => paths.sort(),
+            "modified" | "accessed" | "created" => paths.sort_by_key(|p| {
+                let meta = std::fs::metadata(p).ok();
+                match sort.as_str() {
+                    "modified" => meta.and_then(|m| m.modified().ok()),
+                    "accessed" => meta.and_then(|m| m.accessed().ok()),
+                    _ => meta.and_then(|m| m.created().ok()),
                 }
-                other => {
-                    return Err(ToolError::Argument(format!(
-                        "unknown sort '{other}' (none|path|modified|accessed|created)"
-                    )))
-                }
-            };
+            }),
+            other => {
+                return Err(ToolError::Argument(format!(
+                    "unknown sort '{other}' (none|path|modified|accessed|created)"
+                )))
+            }
+        }
+        if sort_reverse {
+            paths.reverse();
+        }
 
-        'walk: for result in entries {
+        'walk: for path in paths {
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
-            let Ok(entry) = result else { continue };
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            let meta = match entry.metadata() {
+            let meta = match std::fs::metadata(&path) {
                 Ok(m) => m,
                 Err(_) => continue,
             };
@@ -409,7 +424,7 @@ impl SearchTool {
                 truncated = true;
                 break 'walk;
             }
-            let bytes = match std::fs::read(entry.path()) {
+            let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
@@ -419,10 +434,9 @@ impl SearchTool {
             }
             let text = String::from_utf8_lossy(&bytes);
 
-            let display = entry
-                .path()
+            let display = path
                 .strip_prefix(workspace.root())
-                .unwrap_or(entry.path())
+                .unwrap_or(&path)
                 .display()
                 .to_string();
 
@@ -665,6 +679,18 @@ mod tests {
         write(dir.path(), "a.txt", "hello\nworld\nhello again\n");
         let out = run(&ws, json!({"pattern": "hello"})).await.unwrap();
         assert_eq!(out.content, "a.txt:1:hello\na.txt:3:hello again");
+    }
+
+    /// The parallel walk must yield a deterministic (path-sorted) order even
+    /// when no `sort` is requested.
+    #[tokio::test]
+    async fn default_order_is_deterministic_across_files() {
+        let (ws, dir) = setup("deterministic");
+        write(dir.path(), "b.txt", "x\n");
+        write(dir.path(), "a.txt", "x\n");
+        write(dir.path(), "c.txt", "x\n");
+        let out = run(&ws, json!({"pattern": "x"})).await.unwrap();
+        assert_eq!(out.content, "a.txt:1:x\nb.txt:1:x\nc.txt:1:x");
     }
 
     /// The whole-buffer prefilter must not reject a file whose `^`-anchored
