@@ -876,20 +876,18 @@ fn spinner_frame(elapsed: Duration) -> char {
     SPINNER_FRAMES[(elapsed.as_millis() / 100) as usize % SPINNER_FRAMES.len()]
 }
 
-/// Footer label for the last completion's prompt tokens, with the percentage
-/// of the configured history budget when both are known. The budget is a
-/// conservative stand-in for the model's context window (daedalus does not
-/// know the latter), so the percentage is "percent of budget", not of the
-/// model's advertised window.
-fn context_usage(used: Option<usize>, limit: usize) -> String {
-    match used {
-        Some(tokens) if limit > 0 => {
-            let pct = tokens.saturating_mul(100) / limit;
-            format!("{tokens} tokens ({pct}%)")
-        }
-        Some(tokens) => format!("{tokens} tokens"),
-        None => "? tokens".to_string(),
+/// Footer label for the last completion's prompt tokens and its share of the
+/// active model's context window. `None` when the token count is unknown, or
+/// when daedalus has no window for the model (`window == 0`): without a real
+/// window there is no percentage, and a budget-derived stand-in would
+/// misreport consumption, so the footer drops the segment entirely.
+fn context_usage(used: Option<usize>, window: usize) -> Option<String> {
+    let tokens = used?;
+    if window == 0 {
+        return None;
     }
+    let pct = tokens.saturating_mul(100) / window;
+    Some(format!("{tokens} tokens ({pct}%)"))
 }
 
 /// First visible row of a picker list so `selected` stays inside the viewport.
@@ -2024,15 +2022,18 @@ fn draw(
     }
 
     // Footer/status.
-    let usage = context_usage(model.usage, model.state.max_context_tokens);
-    let status = format!(
-        " {} ({}) | effort {} | {} | {}",
+    let usage = context_usage(model.usage, model.state.context_window);
+    let mut status = format!(
+        " {} ({}) | effort {} | {}",
         model.state.model,
         provider,
         model.state.effort.name(),
         model.state.workspace,
-        usage,
     );
+    if let Some(usage) = usage {
+        status.push_str(" | ");
+        status.push_str(&usage);
+    }
     let footer = Paragraph::new(TLine::from(vec![
         Span::styled(spinner.to_string(), style(theme.token(Token::Spinner))),
         Span::styled(status, style(theme.token(Token::Text))),
@@ -2544,6 +2545,7 @@ mod tests {
             workspace: "/ws".into(),
             busy: false,
             max_context_tokens: 28_000,
+            context_window: 64_000,
         }
     }
 
@@ -3106,13 +3108,23 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_includes_the_budget_percentage() {
-        assert_eq!(context_usage(Some(1200), 28_000), "1200 tokens (4%)");
-        assert_eq!(context_usage(Some(0), 28_000), "0 tokens (0%)");
-        // Without a limit the raw count is still useful; without a count the
-        // footer keeps its existing placeholder.
-        assert_eq!(context_usage(Some(1200), 0), "1200 tokens");
-        assert_eq!(context_usage(None, 28_000), "? tokens");
+    fn context_usage_is_the_share_of_the_model_window() {
+        assert_eq!(
+            context_usage(Some(1200), 64_000).as_deref(),
+            Some("1200 tokens (1%)")
+        );
+        assert_eq!(
+            context_usage(Some(0), 64_000).as_deref(),
+            Some("0 tokens (0%)")
+        );
+    }
+
+    #[test]
+    fn context_usage_is_skipped_without_a_window_or_a_count() {
+        // No window for the model, or no token count yet: show nothing rather
+        // than a percentage divided by a made-up denominator.
+        assert_eq!(context_usage(Some(1200), 0), None);
+        assert_eq!(context_usage(None, 64_000), None);
     }
 
     #[test]

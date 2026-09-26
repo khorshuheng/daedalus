@@ -358,8 +358,10 @@ pub struct RuntimeState {
     pub effort: Effort,
     pub workspace: String,
     pub busy: bool,
-    /// Token budget for the conversation history: the denominator a frontend
-    /// uses for its context-usage percentage. `0` when unknown.
+    /// Token budget for the conversation history: the oldest turns are dropped
+    /// once it is exceeded. `0` when unknown. This is a trimming budget, not
+    /// the model's window; frontends show context usage against
+    /// `context_window` instead.
     #[serde(default)]
     pub max_context_tokens: usize,
     /// The active model's context window (input tokens), for a context-usage
