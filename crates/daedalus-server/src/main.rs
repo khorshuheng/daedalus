@@ -1,0 +1,137 @@
+//! The `daedalus-server` binary (CRAB-124): parse flags, load config, and serve the
+//! WebSocket RPC protocol.
+//!
+//! Binds a loopback address by default. Remote/mobile use is intended to sit
+//! behind `tailscale serve` (HTTPS + tailnet identity); binding a
+//! non-loopback address prints a warning. No public exposure is provided.
+
+use std::path::{Path, PathBuf};
+
+use clap::Parser;
+use daedalus_core::config::{Config, PartialConfig, PROVIDERS};
+use daedalus_core::session;
+use daedalus_core::workspace::Workspace;
+use daedalus_server::{build_router, AppState};
+
+/// Daedalus headless server — RPC over WebSocket for remote clients.
+#[derive(Parser, Debug)]
+#[command(name = "daedalus-server", version, about)]
+struct Cli {
+    /// Address to bind. Defaults to loopback; put `tailscale serve` in front
+    /// for a tailnet-only HTTPS endpoint.
+    #[arg(long, default_value = "127.0.0.1:8787", value_name = "ADDR")]
+    bind: String,
+
+    /// Default workspace for sessions (default: current directory).
+    #[arg(long, value_name = "PATH")]
+    dir: Option<PathBuf>,
+
+    /// Provider name from the registry (openai, anthropic, ollama, fake, …).
+    #[arg(long, value_name = "NAME", value_parser = parse_provider)]
+    provider: Option<&'static daedalus_core::config::ProviderInfo>,
+
+    /// Model identifier (required unless the config file sets one).
+    #[arg(long, value_name = "NAME")]
+    model: Option<String>,
+
+    /// Iteration cap per turn (default: 30).
+    #[arg(long, value_name = "N", value_parser = parse_max_iterations)]
+    max_iterations: Option<usize>,
+
+    /// Config file (default: ~/.config/daedalus/config.toml).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+}
+
+fn parse_provider(s: &str) -> Result<&'static daedalus_core::config::ProviderInfo, String> {
+    daedalus_core::config::provider_by_name(s)
+}
+
+fn parse_max_iterations(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|_| format!("'{s}' is not a number"))?;
+    if n == 0 {
+        return Err("max_iterations must be >= 1".into());
+    }
+    Ok(n)
+}
+
+/// Prune `workspace`'s sessions to `keep`, returning how many were removed.
+/// Best-effort: a failure warns and counts as zero.
+fn prune_sessions(root: &Path, workspace: &Path, keep: usize) -> usize {
+    match session::prune_sessions(root, workspace, keep) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("daedalus-server: warning: could not prune sessions: {e}");
+            0
+        }
+    }
+}
+
+/// Print the supported providers for `--help` clarity when none match.
+fn provider_names() -> String {
+    PROVIDERS
+        .iter()
+        .map(|p| p.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let cli = Cli::parse();
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
+    let default_workspace = cli.dir.clone().unwrap_or(cwd);
+
+    let flags = PartialConfig {
+        provider: cli.provider.map(|p| p.name.to_string()),
+        model: cli.model.clone(),
+        max_iterations: cli.max_iterations,
+        ..Default::default()
+    };
+    let config = Config::load(default_workspace, cli.config.as_deref(), flags, None)
+        .map_err(|e| format!("{e}\n(supported providers: {})", provider_names()))?;
+    let workspace = Workspace::new(config.workspace.clone())?;
+
+    // Session GC: keep only the newest `session_retention` sessions for the
+    // default workspace and every identity-mapped workspace (0 disables).
+    // `?workspace=` overrides are only known per request, so they are not
+    // swept here. Best-effort: failures only warn.
+    if config.session_retention > 0 {
+        let root = session::default_root();
+        let mut removed = prune_sessions(&root, workspace.root(), config.session_retention);
+        for path in config.identity_workspaces.values() {
+            match Workspace::new(path.clone()) {
+                Ok(ws) => removed += prune_sessions(&root, ws.root(), config.session_retention),
+                Err(e) => eprintln!("daedalus-server: warning: identity workspace invalid: {e}"),
+            }
+        }
+        if removed > 0 {
+            eprintln!(
+                "daedalus-server: pruned {removed} old session(s) (keeping {})",
+                config.session_retention
+            );
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind(&cli.bind)
+        .await
+        .map_err(|e| format!("cannot bind {}: {e}", cli.bind))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read bound address: {e}"))?;
+    eprintln!(
+        "daedalus-server listening on {addr} (workspace {})",
+        workspace.root().display()
+    );
+    if !addr.ip().is_loopback() {
+        eprintln!(
+            "daedalus-server: warning: bound to a non-loopback address ({addr}); \
+             exposure should be tailnet-only via `tailscale serve` (no funnel)"
+        );
+    }
+
+    let state = AppState::new(config, workspace, session::default_root());
+    axum::serve(listener, build_router(state))
+        .await
+        .map_err(|e| format!("server error: {e}"))
+}

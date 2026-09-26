@@ -465,63 +465,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crab"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "crab-core",
- "crossterm",
- "futures",
- "pulldown-cmark",
- "ratatui",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "unicode-width 0.2.0",
-]
-
-[[package]]
-name = "crab-core"
-version = "0.1.0"
-dependencies = [
- "directories",
- "futures",
- "ignore",
- "keyring",
- "libc",
- "regex",
- "rig-core",
- "rmcp",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "toml",
- "unicode-normalization",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "crab-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "clap",
- "crab-core",
- "futures-util",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite 0.30.0",
-]
-
-[[package]]
 name = "crossbeam-deque"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,6 +531,63 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "daedalus"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "crossterm",
+ "daedalus-core",
+ "futures",
+ "pulldown-cmark",
+ "ratatui",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "daedalus-core"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "futures",
+ "ignore",
+ "keyring",
+ "libc",
+ "regex",
+ "rig-core",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "unicode-normalization",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "daedalus-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "daedalus-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]

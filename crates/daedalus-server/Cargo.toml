@@ -1,0 +1,34 @@
+[package]
+name = "daedalus-server"
+description = "Daedalus headless server (CRAB-124): the RPC protocol over a Tailscale-only WebSocket."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "daedalus_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "daedalus-server"
+path = "src/main.rs"
+
+[dependencies]
+daedalus-core = { path = "../daedalus-core" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "time",
+    "signal",
+] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.30"
+tempfile = "3"

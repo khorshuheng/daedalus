@@ -1,0 +1,57 @@
+[package]
+name = "daedalus-core"
+description = "Daedalus core library: async agent engine, tools, providers, persistence and skills (CRAB-117 workspace split)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "daedalus_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# CRAB-130: the provider layer moved to rig-core (async); the hand-written
+# HTTP/SSE clients and their MSRV-era pins are gone.
+rig-core = "=0.42.0"
+# CRAB-130: daedalus-core is async — tokio drives the turn loop (current-thread
+# runtime owned by the worker thread), tokio-util provides CancellationToken.
+# CRAB-133: rt-multi-thread gives MCP servers a small background runtime.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros", "process"] }
+tokio-util = "0.7"
+futures = "0.3"
+thiserror = "2"
+directories = "6"
+tempfile = "3"
+similar = "2"
+keyring = { version = "3", features = ["sync-secret-service"] }
+# bash process-group kill (CRAB-107 #14) uses libc setsid/kill on Unix.
+libc = "0.2"
+# NFKC normalization for fuzzy edit matching (CRAB-107 #15).
+unicode-normalization = "0.1"
+# CRAB-149: extended grapheme clusters so fuzzy NFKC composes across code
+# points (e.g. "e" + U+0301 -> "é") while keeping an exact source mapping.
+unicode-segmentation = "1"
+# CRAB-144: the native search tool walks like ripgrep (`ignore`) and matches
+# with `regex`.
+ignore = "0.4"
+regex = "1"
+# CRAB-133: MCP client (official Rust SDK). The spec originally named
+# "rig-rmcp"; rig-core 0.42 has no MCP integration, so this uses `rmcp`
+# directly. Client + stdio child-process + streamable-http transports.
+rmcp = { version = "3.3.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+
+# CRAB-130: the crate is async now (tokio). The runtime stays runtime-agnostic
+# (no #[tokio::main]); the worker thread owns a current-thread runtime.
+
+[dev-dependencies]
+# CRAB-133: the server half of rmcp, used only by the in-process end-to-end
+# test (real client <-> real server over a duplex transport, no child process).
+rmcp = { version = "3.3.0", default-features = false, features = ["server"] }

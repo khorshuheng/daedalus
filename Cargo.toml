@@ -1,20 +1,20 @@
 # Cargo workspace (CRAB-117).
 #
-# The split keeps the synchronous core (crab-core) free of any async or
+# The split keeps the synchronous core (daedalus-core) free of any async or
 # frontend dependency, and gives each frontend its own dependency tree.
 # Members:
-#   crates/crab-core — the async library (config, tools, provider, session,
+#   crates/daedalus-core — the async library (config, tools, provider, session,
 #                      runtime, workspace).
-#   crates/crab     — the CLI binary (main + stdio modes + TUI frontend; the
+#   crates/daedalus     — the CLI binary (main + stdio modes + TUI frontend; the
 #                     interactive REPL was removed in CRAB-135).
-#   crates/crab-server — the headless WebSocket server (CRAB-124), a frontend
+#   crates/daedalus-server — the headless WebSocket server (CRAB-124), a frontend
 #                     over the same AgentRuntime protocol.
 #
-# CRAB-122 adds crates/crab-server (axum/tokio/tungstenite) later.
+# CRAB-122 adds crates/daedalus-server (axum/tokio/tungstenite) later.
 
 [workspace]
 resolver = "2"
-members = ["crates/crab-core", "crates/crab", "crates/crab-server"]
+members = ["crates/daedalus-core", "crates/daedalus", "crates/daedalus-server"]
 
 [workspace.package]
 version = "0.1.0"
