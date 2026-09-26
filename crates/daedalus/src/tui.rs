@@ -1159,7 +1159,12 @@ pub fn run_tui(
                     remember_choice(&mut model, &mut remembered);
                 }
                 if settled {
-                    crate::auto_save(rt, session_root, &mut session_saver);
+                    // Never write to stderr here: the TUI owns the alternate
+                    // screen, so a raw line would smear the input row. Report
+                    // the (rare) failure through the transcript instead.
+                    if let Some(Err(e)) = crate::auto_save(rt, session_root, &mut session_saver) {
+                        model.push_notice(&format!("could not save session: {e}"));
+                    }
                 }
             }
             if got_event {
@@ -1281,7 +1286,11 @@ pub fn run_tui(
     // Auto-save at session end *after* the terminal is restored,
     // so its stderr output lands on the normal screen. Failures are warnings
     // only — quitting must never be blocked by persistence.
-    crate::auto_save(rt, session_root, &mut session_saver);
+    match crate::auto_save(rt, session_root, &mut session_saver) {
+        Some(Ok(path)) => eprintln!("session saved: {}", path.display()),
+        Some(Err(e)) => eprintln!("daedalus: warning: could not save session: {e}"),
+        None => {}
+    }
     rt.shutdown();
     result
 }

@@ -252,21 +252,28 @@ fn prune_old_sessions(config: &Config, session_root: &Path, workspace: &Path) {
 /// Persist the current session history to disk. Safe to call repeatedly: the
 /// saver reuses the session file it created, rewriting it atomically, so
 /// calling this on every settled turn means a crash or disconnect loses at
-/// most the in-flight turn. Failures are warnings only — quitting must never
-/// be blocked by persistence.
-fn auto_save(rt: &AgentRuntime, root: &Path, saver: &mut session::SessionSaver) {
+/// most the in-flight turn. Quitting must never be blocked by persistence.
+///
+/// Returns `None` when there is nothing to save (no assistant turn yet),
+/// otherwise the outcome. The caller owns how it is surfaced: while the TUI
+/// holds the alternate screen it must not write to stderr — a raw `eprintln!`
+/// lands on the input row and smears the frame — so it reports a failure as a
+/// transcript notice instead, while the post-exit save prints its confirmation
+/// to the restored screen.
+fn auto_save(
+    rt: &AgentRuntime,
+    root: &Path,
+    saver: &mut session::SessionSaver,
+) -> Option<Result<PathBuf, String>> {
     let history = rt.history();
     if !session::has_conversation(&history) {
-        return;
+        return None;
     }
-    match saver.save(root, &rt.workspace_root(), &history) {
-        Ok(path) => {
-            eprintln!("session saved: {}", path.display());
-        }
-        Err(e) => {
-            eprintln!("daedalus: warning: could not save session: {e}");
-        }
-    }
+    Some(
+        saver
+            .save(root, &rt.workspace_root(), &history)
+            .map_err(|e| e.to_string()),
+    )
 }
 
 fn main() {
