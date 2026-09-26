@@ -577,16 +577,36 @@ impl UiModel {
         self.transcript.clear();
         self.assistant_buf.clear();
         self.thinking_buf.clear();
+        // Tool results carry only the call id; map ids back to names so a
+        // resumed session renders `✓ bash` rather than an anonymous marker
+        // (CRAB-158).
+        let mut names: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for message in history {
             match message {
                 Message::User(text) => {
                     self.transcript.push(TranscriptLine::User(text.clone()));
                 }
-                Message::Assistant {
-                    text: Some(text), ..
-                } if !text.is_empty() => {
-                    self.transcript
-                        .push(TranscriptLine::Assistant(text.clone()));
+                Message::Assistant { text, tool_calls } => {
+                    for call in tool_calls {
+                        names.insert(call.id.as_str(), call.name.as_str());
+                    }
+                    if let Some(text) = text {
+                        if !text.is_empty() {
+                            self.transcript
+                                .push(TranscriptLine::Assistant(text.clone()));
+                        }
+                    }
+                }
+                Message::ToolResult {
+                    tool_call_id,
+                    result,
+                } => {
+                    let name = names.get(tool_call_id.as_str()).copied().unwrap_or("tool");
+                    self.transcript.push(TranscriptLine::ToolResult {
+                        name: name.to_string(),
+                        ok: daedalus_core::runtime::tool_result_ok(result),
+                        output: (!result.is_empty()).then(|| result.clone()),
+                    });
                 }
                 _ => {}
             }
@@ -2955,7 +2975,7 @@ mod tests {
     }
 
     #[test]
-    fn load_history_repaints_user_and_assistant_text() {
+    fn load_history_repaints_user_assistant_and_tool_traffic() {
         let rt = test_rt();
         let mut model = UiModel::new(rt.state());
         model.load_history(&[
@@ -2978,12 +2998,100 @@ mod tests {
                 tool_calls: vec![],
             },
         ]);
-        // Tool traffic and the system prompt are not shown; text is.
+        // The system prompt is not shown; user/assistant text and the resumed
+        // tool result (with its call name, CRAB-158) are.
         assert_eq!(
             model.transcript,
             vec![
                 TranscriptLine::User("hello".into()),
+                TranscriptLine::ToolResult {
+                    name: "bash".into(),
+                    ok: true,
+                    output: Some("hi\n".into()),
+                },
                 TranscriptLine::Assistant("done".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resumed_tool_result_expands_with_ctrl_o() {
+        let theme = Theme::dark();
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.load_history(&[
+            Message::Assistant {
+                text: None,
+                tool_calls: vec![daedalus_core::provider::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({}),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                result: "l0\nl1\nl2\nl3\nl4\nl5\nl6\n".into(),
+            },
+        ]);
+        // Collapsed on resume, and expandable — the point of the replay.
+        let collapsed = line_texts(&transcript_lines(
+            &model.transcript,
+            &theme,
+            80,
+            model.verbose,
+        ));
+        assert_eq!(collapsed[0], "  ✓ bash");
+        assert!(collapsed
+            .iter()
+            .any(|l| l == "    … 2 more line(s) — Ctrl+O to expand"));
+        model.toggle_verbose();
+        let expanded = line_texts(&transcript_lines(
+            &model.transcript,
+            &theme,
+            80,
+            model.verbose,
+        ));
+        assert_eq!(expanded.len(), 1 + 7);
+        assert_eq!(expanded[7], "    l6");
+    }
+
+    #[test]
+    fn resumed_failed_tool_result_marks_the_error() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        model.load_history(&[
+            Message::Assistant {
+                text: None,
+                tool_calls: vec![daedalus_core::provider::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({}),
+                }],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                result: "tool error: boom".into(),
+            },
+            // An unknown call id falls back to a generic label rather than
+            // panicking.
+            Message::ToolResult {
+                tool_call_id: "missing".into(),
+                result: String::new(),
+            },
+        ]);
+        assert_eq!(
+            model.transcript,
+            vec![
+                TranscriptLine::ToolResult {
+                    name: "bash".into(),
+                    ok: false,
+                    output: Some("tool error: boom".into()),
+                },
+                TranscriptLine::ToolResult {
+                    name: "tool".into(),
+                    ok: true,
+                    output: None,
+                },
             ]
         );
     }

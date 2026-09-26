@@ -126,6 +126,14 @@ impl fmt::Display for Effort {
     }
 }
 
+/// Whether a stored tool-result string represents success (CRAB-158). Failures
+/// are formatted as `tool error: ...`; a call cut off by the output token limit
+/// records that it "was not executed". Shared so the runtime's `tool_end`
+/// events and the TUI's resumed-transcript replay agree on the marker.
+pub fn tool_result_ok(result: &str) -> bool {
+    !result.starts_with("tool error:") && !result.contains("was not executed")
+}
+
 /// Hardcoded per-provider capability table (CRAB-116): maps a canonical
 /// effort level to the wire value the provider understands. No discovery.
 pub fn provider_effort(provider: &ProviderInfo, effort: Effort) -> serde_json::Value {
@@ -1311,8 +1319,7 @@ impl AgentRuntime {
                                 };
                                 self.emit(Event::ToolEnd {
                                     name: call.name.clone(),
-                                    ok: !result_str.starts_with("tool error:")
-                                        && !result_str.contains("was not executed"),
+                                    ok: tool_result_ok(&result_str),
                                     error: result_str
                                         .strip_prefix("tool error:")
                                         .map(|s| s.trim().to_string()),
