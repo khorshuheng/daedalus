@@ -213,7 +213,7 @@ fn run(cli: Cli) -> Result<i32, String> {
             modes::run_rpc(&rt, &mut rx, &root, reader, &mut stdout)
         }
         Some(Mode::Tui) | None => {
-            let theme = config.theme.clone();
+            let mut theme = config.theme.clone();
             let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
             rt.set_interactive(true); // human present: no iteration cap
             let worker = rt.clone();
@@ -226,7 +226,7 @@ fn run(cli: Cli) -> Result<i32, String> {
                 &mut rx,
                 &cli.prompt(),
                 root.as_path(),
-                &theme,
+                &mut theme,
                 Some(persist_path),
             )
         }

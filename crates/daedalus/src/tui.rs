@@ -63,6 +63,8 @@ pub enum SlashCommand {
     Provider(String),
     /// Change the thinking effort (opens the effort picker when no argument).
     Effort(String),
+    /// Change the color theme (opens the theme picker when no argument).
+    Theme(String),
     /// Change the workspace.
     Workspace(PathBuf),
     /// List the discovered skills (user + workspace).
@@ -121,6 +123,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: Some("[level]"),
         description: "Change thinking effort (picker when omitted)",
         build: SlashCommand::Effort,
+    },
+    CommandSpec {
+        name: "theme",
+        aliases: &[],
+        args: Some("[name]"),
+        description: "Change the color theme (picker when omitted)",
+        build: SlashCommand::Theme,
     },
     CommandSpec {
         name: "workspace",
@@ -674,6 +683,10 @@ pub const EFFORT_CHOICES: &[Effort] = &[
     Effort::High,
 ];
 
+/// The built-in theme presets offered by the `/theme` picker, in display
+/// order. Names match `Theme::builtin`.
+pub const THEME_CHOICES: &[&str] = &["dark", "light"];
+
 /// A single-line text editor for the input box: the text plus a
 /// byte cursor that always sits on a UTF-8 char boundary. Pure logic — no
 /// terminal I/O — so cursor movement, insertion, deletion and the visible
@@ -1037,6 +1050,28 @@ fn remember_choice(model: &mut UiModel, remembered: &mut Remembered) {
     }
 }
 
+/// Switch the live theme and remember the choice in the config file. The
+/// active theme is shell state (the pure model carries only text), so the
+/// picker mutates it here; persistence mirrors `remember_choice`.
+fn apply_theme(theme: &mut Theme, model: &mut UiModel, name: &str) {
+    if theme.name == name {
+        return;
+    }
+    let Some(next) = Theme::builtin(name) else {
+        model.push_notice(&format!("unknown theme '{name}' (dark|light)"));
+        return;
+    };
+    *theme = next;
+    model.push_notice(&format!("theme: {name}"));
+    let Some(path) = model.persist.clone() else {
+        return;
+    };
+    match persist_edit(&path, &ConfigEdit::theme(name)) {
+        Ok(()) => model.push_notice(&format!("theme = {name:?} saved to {}", path.display())),
+        Err(e) => model.push_notice(&format!("could not save to {}: {e}", path.display())),
+    }
+}
+
 /// Render an edit as the TOML it wrote: `model = "m"`, `provider = "p"`,
 /// `effort = "high"`, or a comma-joined combination.
 fn edit_summary(edit: &ConfigEdit) -> String {
@@ -1064,7 +1099,7 @@ pub fn run_tui(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     initial: &str,
     session_root: &Path,
-    theme: &Theme,
+    theme: &mut Theme,
     persist: Option<PathBuf>,
 ) -> Result<i32, String> {
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
@@ -1231,6 +1266,7 @@ pub fn run_tui(
                                 &mut model,
                                 &mut input,
                                 &mut picker,
+                                theme,
                                 &mut login_pending,
                                 &mut should_exit,
                                 session_root,
@@ -1328,6 +1364,11 @@ enum Picker {
     Effort {
         selected: usize,
     },
+    /// Built-in theme presets. The choice applies immediately and is written
+    /// back to the config file, so it survives a restart.
+    Theme {
+        selected: usize,
+    },
     /// Model choices fetched from the provider, or handed over by the provider
     /// itself when it rejected the configured model.
     Model {
@@ -1358,6 +1399,7 @@ fn handle_key(
     model: &mut UiModel,
     input: &mut InputEditor,
     picker: &mut Option<Picker>,
+    theme: &mut Theme,
     login_pending: &mut bool,
     should_exit: &mut bool,
     session_root: &Path,
@@ -1369,6 +1411,7 @@ fn handle_key(
         // we do not hold a borrow across the mutations below.
         let max = match p {
             Picker::Effort { .. } => EFFORT_CHOICES.len(),
+            Picker::Theme { .. } => THEME_CHOICES.len(),
             Picker::Model { models, .. } => models.len(),
             Picker::Provider { .. } => PROVIDERS.len(),
             Picker::Session { sessions, .. } => sessions.len(),
@@ -1380,6 +1423,9 @@ fn handle_key(
             KeyCode::Esc => *picker = None,
             KeyCode::Down | KeyCode::Char('j') => match p {
                 Picker::Effort { selected } => {
+                    *selected = (*selected + 1).min(max - 1);
+                }
+                Picker::Theme { selected } => {
                     *selected = (*selected + 1).min(max - 1);
                 }
                 Picker::Model { selected, .. } => {
@@ -1394,6 +1440,9 @@ fn handle_key(
             },
             KeyCode::Up | KeyCode::Char('k') => match p {
                 Picker::Effort { selected } => {
+                    *selected = selected.saturating_sub(1);
+                }
+                Picker::Theme { selected } => {
                     *selected = selected.saturating_sub(1);
                 }
                 Picker::Model { selected, .. } => {
@@ -1412,6 +1461,11 @@ fn handle_key(
                     rt.set_effort(effort);
                     model.state.effort = effort;
                     *picker = None;
+                }
+                Picker::Theme { selected } => {
+                    let choice = THEME_CHOICES[*selected];
+                    *picker = None;
+                    apply_theme(theme, model, choice);
                 }
                 Picker::Model {
                     selected, models, ..
@@ -1543,7 +1597,7 @@ fn handle_key(
         }
         KeyCode::Enter => {
             let line = input.take();
-            if submit_line(rt, model, picker, session_root, login_pending, &line) {
+            if submit_line(rt, model, picker, theme, session_root, login_pending, &line) {
                 *should_exit = true;
             }
         }
@@ -1574,6 +1628,7 @@ fn submit_line(
     rt: &AgentRuntime,
     model: &mut UiModel,
     picker: &mut Option<Picker>,
+    theme: &mut Theme,
     session_root: &Path,
     login_pending: &mut bool,
     line: &str,
@@ -1612,7 +1667,7 @@ fn submit_line(
             false
         }
         LineAction::Command(cmd) => {
-            run_command(rt, model, picker, session_root, login_pending, cmd)
+            run_command(rt, model, picker, theme, session_root, login_pending, cmd)
         }
     }
 }
@@ -1623,6 +1678,7 @@ fn run_command(
     rt: &AgentRuntime,
     model: &mut UiModel,
     picker: &mut Option<Picker>,
+    theme: &mut Theme,
     session_root: &Path,
     login_pending: &mut bool,
     cmd: SlashCommand,
@@ -1718,6 +1774,13 @@ fn run_command(
                 model.push_notice(&format!(
                     "unknown effort '{arg}' (off|minimal|low|medium|high)"
                 ));
+            }
+        }
+        SlashCommand::Theme(arg) => {
+            if arg.is_empty() {
+                *picker = Some(Picker::Theme { selected: 0 });
+            } else {
+                apply_theme(theme, model, &arg);
             }
         }
         SlashCommand::Workspace(path) => {
@@ -2152,6 +2215,16 @@ fn draw(
                 .collect();
             draw_picker(f, &names, *selected, title, theme);
         }
+        Some(Picker::Theme { selected }) => {
+            let names: Vec<String> = THEME_CHOICES.iter().map(|s| s.to_string()).collect();
+            draw_picker(
+                f,
+                &names,
+                *selected,
+                " theme — ↑/↓ · Enter apply · Esc cancel ",
+                theme,
+            );
+        }
         Some(Picker::Model {
             selected,
             models,
@@ -2560,6 +2633,7 @@ mod tests {
             &mut model,
             &mut input,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -2584,6 +2658,7 @@ mod tests {
             &mut model,
             &mut input,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -2632,6 +2707,10 @@ mod tests {
             LineAction::Command(SlashCommand::Effort("high".to_string()))
         );
         assert_eq!(
+            parse_line("/theme light"),
+            LineAction::Command(SlashCommand::Theme("light".to_string()))
+        );
+        assert_eq!(
             parse_line("/workspace /tmp/proj"),
             LineAction::Command(SlashCommand::Workspace(PathBuf::from("/tmp/proj")))
         );
@@ -2670,6 +2749,7 @@ mod tests {
             &rt,
             &mut model,
             &mut picker,
+            &mut Theme::default(),
             Path::new("/tmp"),
             &mut login_pending,
             SlashCommand::Tools,
@@ -2713,6 +2793,7 @@ mod tests {
             &rt,
             &mut model,
             &mut picker,
+            &mut Theme::default(),
             session_root,
             &mut login_pending,
             SlashCommand::Skills,
@@ -2726,6 +2807,7 @@ mod tests {
             &rt,
             &mut model,
             &mut picker,
+            &mut Theme::default(),
             session_root,
             &mut login_pending,
             SlashCommand::Skill("demo".to_string()),
@@ -2739,6 +2821,7 @@ mod tests {
             &rt,
             &mut model,
             &mut picker,
+            &mut Theme::default(),
             session_root,
             &mut login_pending,
             SlashCommand::Skill("nope".to_string()),
@@ -2945,6 +3028,7 @@ mod tests {
             &mut model,
             &mut input,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -3418,6 +3502,7 @@ mod tests {
             &mut model,
             &mut editor,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -3430,6 +3515,7 @@ mod tests {
             &mut model,
             &mut editor,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -3457,6 +3543,7 @@ mod tests {
             &mut model,
             &mut editor,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -3465,6 +3552,42 @@ mod tests {
         );
         assert!(picker.is_none());
         assert_eq!(model.state.model, "b");
+    }
+
+    #[test]
+    fn theme_picker_enter_switches_the_live_theme() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut editor = InputEditor::default();
+        // "light" is the second preset.
+        let mut picker = Some(Picker::Theme { selected: 1 });
+        let mut theme = Theme::default();
+        assert_eq!(theme.name, "dark");
+        let mut login_pending = false;
+        let mut should_exit = false;
+        handle_key(
+            &rt,
+            &mut model,
+            &mut editor,
+            &mut picker,
+            &mut theme,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        );
+        assert!(picker.is_none());
+        assert_eq!(theme.name, "light");
+    }
+
+    #[test]
+    fn apply_theme_rejects_an_unknown_name_and_keeps_the_current_theme() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut theme = Theme::default();
+        apply_theme(&mut theme, &mut model, "neon");
+        assert_eq!(theme.name, "dark", "an unknown preset changes nothing");
     }
 
     #[test]
@@ -3544,6 +3667,7 @@ mod tests {
             &mut model,
             &mut editor,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             Path::new("/tmp"),
@@ -3713,6 +3837,7 @@ mod tests {
             &mut model,
             &mut editor,
             &mut picker,
+            &mut Theme::default(),
             &mut login_pending,
             &mut should_exit,
             root.path(),
