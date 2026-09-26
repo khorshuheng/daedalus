@@ -50,6 +50,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EffortStyle, ProviderInfo};
+use crate::instructions;
 use crate::provider::{Message, Provider, Response, StreamDelta};
 use crate::skills::{self, Skill};
 use crate::tools::resolver::ToolSet;
@@ -438,6 +439,10 @@ struct Inner {
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     /// Cached model ids discovered for the current provider.
     models: Mutex<Vec<String>>,
+    /// Where user instructions (`APPEND_SYSTEM.md`) are read from. Defaults to
+    /// the standard config dir; a seam so tests do not depend on the ambient
+    /// `~/.config`.
+    instructions_path: PathBuf,
 }
 
 /// A cloneable handle to a running agent. Construct with `AgentRuntime::new`
@@ -458,6 +463,25 @@ impl AgentRuntime {
         provider: Box<dyn Provider>,
         tools: ToolSet,
         workspace: Workspace,
+    ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        Self::with_instructions_path(
+            config,
+            provider,
+            tools,
+            workspace,
+            instructions::user_file(),
+        )
+    }
+
+    /// Like [`new`](Self::new), but reads user instructions from `path`. The
+    /// path is otherwise fixed at `~/.config/daedalus/APPEND_SYSTEM.md`; tests
+    /// use this to keep the seed prompt independent of the ambient config dir.
+    fn with_instructions_path(
+        config: Config,
+        provider: Box<dyn Provider>,
+        tools: ToolSet,
+        workspace: Workspace,
+        instructions_path: PathBuf,
     ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -492,6 +516,7 @@ impl AgentRuntime {
                 commands_rx: tokio::sync::Mutex::new(commands_rx),
                 events,
                 models: Mutex::new(Vec::new()),
+                instructions_path,
             }),
         };
         (runtime, rx)
@@ -863,8 +888,8 @@ impl AgentRuntime {
         });
     }
 
-    /// The seed system prompt for the current workspace, including the skills
-    /// catalog when any skills are installed.
+    /// The seed system prompt for the current workspace: the built-in prompt,
+    /// then any user instructions (`APPEND_SYSTEM.md`), then the skills catalog.
     fn system_prompt(&self) -> String {
         let base = format!(
             "You are daedalus, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
@@ -882,6 +907,10 @@ impl AgentRuntime {
              - Make the smallest change that satisfies the request.\n\
              - When finished, give a concise final answer.",
             self.workspace_path().display()
+        );
+        let base = instructions::append(
+            &base,
+            instructions::read_from(&self.inner.instructions_path).as_deref(),
         );
         skills::with_catalog(&base, &self.skills())
     }
@@ -1496,6 +1525,68 @@ mod tests {
         assert!(skills
             .iter()
             .any(|s| s.name == "demo" && s.prompt().contains("Do the demo thing.")));
+    }
+
+    /// A user-level `APPEND_SYSTEM.md` is appended to the seed prompt, after the
+    /// built-in text and before the skills catalog.
+    #[test]
+    fn system_prompt_appends_user_instructions() {
+        let (dir, ws) = workspace("instructions");
+        let config_home = tempfile::tempdir().unwrap();
+        let instructions_path = config_home.path().join("APPEND_SYSTEM.md");
+        std::fs::write(
+            &instructions_path,
+            "Always run `cargo fmt` before committing.\n",
+        )
+        .unwrap();
+        // A skill too, so the ordering (instructions before catalog) is checked.
+        let skills_dir = dir.path().join(".daedalus").join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        std::fs::write(skills_dir.join("demo.md"), "Demo skill.\n\nbody").unwrap();
+
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::with_instructions_path(
+            cfg,
+            Box::new(GateProvider::new(vec![])),
+            ToolSet::new(1000),
+            ws,
+            instructions_path,
+        );
+        let prompt = rt.system_prompt();
+
+        assert!(
+            prompt.contains("Additional instructions from the user:"),
+            "lead-in missing: {prompt}"
+        );
+        assert!(prompt.contains("Always run `cargo fmt` before committing."));
+        let instructions_at = prompt.find("Additional instructions").unwrap();
+        let catalog_at = prompt.find("Available skills").unwrap();
+        assert!(
+            instructions_at < catalog_at,
+            "user instructions must precede the skills catalog"
+        );
+    }
+
+    /// No instructions file (the common case) leaves the seed prompt unchanged:
+    /// no lead-in, same built-in text as before the feature.
+    #[test]
+    fn system_prompt_without_user_instructions_is_unmarked() {
+        let (dir, ws) = workspace("no-instructions");
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::with_instructions_path(
+            cfg,
+            Box::new(GateProvider::new(vec![])),
+            ToolSet::new(1000),
+            ws,
+            dir.path().join("missing.md"),
+        );
+        assert!(!rt.system_prompt().contains("Additional instructions"));
     }
 
     fn runtime_with(

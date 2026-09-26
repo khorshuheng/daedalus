@@ -54,11 +54,9 @@ impl Mode {
             "json" => Ok(Mode::Json),
             "rpc" => Ok(Mode::Rpc),
             "tui" => Ok(Mode::Tui),
-            "repl" => Err(
-                "the REPL was removed; the TUI is the interactive \
+            "repl" => Err("the REPL was removed; the TUI is the interactive \
                  frontend and the default on a terminal"
-                    .into(),
-            ),
+                .into()),
             other => Err(format!(
                 "unknown mode '{other}' (supported: json, rpc, tui)"
             )),

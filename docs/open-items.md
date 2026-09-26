@@ -20,13 +20,15 @@ Possible directions:
 - Inject a working-directory / OS / git-state line.
 - Auto-load `AGENTS.md` (or `DAEDALUS.md`) from the workspace when present, as
   project instructions.
-- Decide the caching story: the prompt is currently a static string (cache
-  friendly); per-turn env lines trade that for freshness.
+- Decide the caching story: the prompt was a constant string (cache
+  friendly); it is now re-derived each turn (the user-instructions file is
+  re-read), and per-turn env lines would trade that further for freshness.
 
 Partially addressed by: a user-level
 `~/.config/daedalus/APPEND_SYSTEM.md` is appended to the system prompt on every
-turn (matching pi's `APPEND_SYSTEM.md`). That covers standing user instructions;
-the workspace/project-context and env/cwd/git halves above remain open.
+turn when present (matching pi's `APPEND_SYSTEM.md`), between the built-in
+prompt and the skills catalog. That covers standing user instructions; the
+workspace/project-context and env/cwd/git halves above remain open.
 
 Context: this came out of reviewing the system prompt against pi / opencode /
 Claude Code / deepseek-harness. The tool-routing "translation" guidance was
