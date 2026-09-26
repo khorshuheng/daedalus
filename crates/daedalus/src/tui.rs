@@ -389,8 +389,9 @@ pub struct UiModel {
     /// Transcript scrollback (follow the tail unless the user scrolled up).
     pub scroll: TranscriptScroll,
     /// Global tool-output expansion (Ctrl+O, CRAB-158). When false, tool
-    /// results render as a collapsed preview.
-    pub verbose: bool,
+    /// results render as a collapsed preview. Private so it is only ever
+    /// changed through `toggle_verbose`, which invalidates the render cache.
+    verbose: bool,
     /// Bumped whenever the transcript changes, to key the render cache.
     pub revision: u64,
     /// Cache of the rendered transcript, keyed by (revision, area width).
@@ -1588,26 +1589,72 @@ const TOOL_PREVIEW_LINES: usize = 5;
 /// ...and at most this many characters, before the "Ctrl+O to expand" hint.
 const TOOL_PREVIEW_CHARS: usize = 600;
 
-/// Collapse a tool result to a preview. Returns the preview text and how many
-/// trailing lines were hidden (CRAB-158, mirroring ICARUS-113).
-fn tool_preview(content: &str) -> (String, usize) {
-    let norm = content.replace("\r\n", "\n");
+/// Normalize a tool result for display: CRLF to LF and drop trailing newlines
+/// (bash output almost always ends with one, which would otherwise render an
+/// empty line under every result).
+fn normalize_tool_output(content: &str) -> String {
+    content
+        .replace("\r\n", "\n")
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+/// A collapsed tool result: the preview text plus what was withheld.
+struct ToolPreview {
+    text: String,
+    /// Trailing source lines not shown.
+    hidden_lines: usize,
+    /// True when the character cap cut `text` short.
+    char_truncated: bool,
+}
+
+impl ToolPreview {
+    /// The "Ctrl+O to expand" hint, or `None` when nothing was hidden.
+    fn hint(&self) -> Option<String> {
+        if self.hidden_lines == 0 && !self.char_truncated {
+            return None;
+        }
+        let mut what = String::new();
+        if self.hidden_lines > 0 {
+            what.push_str(&format!("{} more line(s)", self.hidden_lines));
+        }
+        if self.char_truncated {
+            if !what.is_empty() {
+                what.push_str(" and ");
+            }
+            what.push_str("more text");
+        }
+        Some(format!("    … {what} — Ctrl+O to expand"))
+    }
+}
+
+/// Collapse a tool result to a preview, tracking both the lines dropped and
+/// whether the character cap cut the text short (CRAB-158, mirroring
+/// ICARUS-113). Either kind of hiding must surface the expand hint.
+fn tool_preview(content: &str) -> ToolPreview {
+    let norm = normalize_tool_output(content);
     let lines: Vec<&str> = norm.split('\n').collect();
     let shown = lines.len().min(TOOL_PREVIEW_LINES);
-    let mut preview = lines[..shown].join("\n");
-    let chars = preview.chars().count();
-    if chars > TOOL_PREVIEW_CHARS {
-        preview = preview.chars().take(TOOL_PREVIEW_CHARS).collect();
+    let mut text = lines[..shown].join("\n");
+    let char_truncated = text.chars().count() > TOOL_PREVIEW_CHARS;
+    if char_truncated {
+        text = text.chars().take(TOOL_PREVIEW_CHARS).collect();
     }
-    (preview, lines.len().saturating_sub(shown))
+    ToolPreview {
+        text,
+        hidden_lines: lines.len().saturating_sub(shown),
+        char_truncated,
+    }
 }
 
 /// Lay a tool result out as indented transcript lines: the first gets `⎿`, the
 /// rest align under it. One `TLine` per source line, so wrapping stays sane.
 fn tool_output_lines(content: &str, spec: StyleSpec) -> Vec<TLine<'static>> {
-    content
-        .replace("\r\n", "\n")
-        .split('\n')
+    let norm = normalize_tool_output(content);
+    if norm.is_empty() {
+        return Vec::new();
+    }
+    norm.split('\n')
         .enumerate()
         .map(|(i, line)| {
             let prefix = if i == 0 { "  ⎿ " } else { "    " };
@@ -1654,11 +1701,11 @@ fn transcript_lines(
                     if verbose {
                         out.extend(tool_output_lines(content, spec));
                     } else {
-                        let (preview, hidden) = tool_preview(content);
-                        out.extend(tool_output_lines(&preview, spec));
-                        if hidden > 0 {
+                        let preview = tool_preview(content);
+                        out.extend(tool_output_lines(&preview.text, spec));
+                        if let Some(hint) = preview.hint() {
                             out.push(TLine::from(Span::styled(
-                                format!("    … {hidden} more line(s) — Ctrl+O to expand"),
+                                hint,
                                 style(theme.token(Token::Notice)),
                             )));
                         }
@@ -2427,19 +2474,107 @@ mod tests {
     }
 
     #[test]
-    fn tool_preview_caps_lines_and_reports_hidden() {
-        // Short results pass through unchanged.
-        assert_eq!(tool_preview("one\ntwo"), ("one\ntwo".into(), 0));
+    fn tool_preview_caps_lines_and_flags_char_truncation() {
+        // Short results pass through unchanged, with no hint.
+        let p = tool_preview("one\ntwo");
+        assert_eq!(p.text, "one\ntwo");
+        assert_eq!(p.hidden_lines, 0);
+        assert!(!p.char_truncated);
+        assert_eq!(p.hint(), None);
+        // A trailing newline (ubiquitous for bash output) is not a blank line.
+        assert_eq!(tool_preview("hi\n").text, "hi");
+        assert_eq!(tool_preview("hi\n").hidden_lines, 0);
         // Long results keep the first five lines and count the remainder.
         let long = (0..9).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
-        let (preview, hidden) = tool_preview(&long);
-        assert_eq!(preview, "0\n1\n2\n3\n4");
-        assert_eq!(hidden, 4);
+        let p = tool_preview(&long);
+        assert_eq!(p.text, "0\n1\n2\n3\n4");
+        assert_eq!(p.hidden_lines, 4);
+        assert_eq!(p.hint().unwrap(), "    … 4 more line(s) — Ctrl+O to expand");
         // CRLF is normalized.
-        assert_eq!(tool_preview("a\r\nb"), ("a\nb".into(), 0));
-        // The character cap is char-boundary safe.
-        let (preview, _) = tool_preview(&"é".repeat(1000));
-        assert_eq!(preview.chars().count(), 600);
+        assert_eq!(tool_preview("a\r\nb").text, "a\nb");
+        // One very long line: the character cap stops it on a boundary, but
+        // the truncation must still surface a hint (CRAB-158 review).
+        let p = tool_preview(&"é".repeat(1000));
+        assert_eq!(p.text.chars().count(), 600);
+        assert!(p.char_truncated);
+        assert_eq!(p.hidden_lines, 0);
+        assert_eq!(p.hint().unwrap(), "    … more text — Ctrl+O to expand");
+        // Both cuts at once read coherently.
+        let p = tool_preview(
+            &(0..9)
+                .map(|_| "y".repeat(500))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(p.char_truncated && p.hidden_lines == 4);
+        assert_eq!(
+            p.hint().unwrap(),
+            "    … 4 more line(s) and more text — Ctrl+O to expand"
+        );
+    }
+
+    #[test]
+    fn char_truncated_preview_still_shows_the_expand_hint() {
+        // A wide single-line result (e.g. a long path dump) is cut by the
+        // character cap; the user must still be told output is hidden.
+        let theme = Theme::dark();
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ToolEnd {
+            name: "read".into(),
+            ok: true,
+            error: None,
+            output: Some("x".repeat(1000)),
+        });
+        let lines = line_texts(&transcript_lines(&m.transcript, &theme, 80, m.verbose));
+        assert_eq!(lines[0], "  ✓ read");
+        assert_eq!(lines[1].chars().count(), 4 + 600);
+        assert_eq!(lines[2], "    … more text — Ctrl+O to expand");
+    }
+
+    #[test]
+    fn trailing_newline_does_not_render_a_blank_line() {
+        // Bash output nearly always ends in a newline; it must not add a
+        // spurious padded line under the result.
+        let theme = Theme::dark();
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ToolEnd {
+            name: "bash".into(),
+            ok: true,
+            error: None,
+            output: Some("hi\n".into()),
+        });
+        assert_eq!(
+            line_texts(&transcript_lines(&m.transcript, &theme, 80, m.verbose)),
+            vec!["  ✓ bash", "  ⎿ hi"]
+        );
+    }
+
+    #[test]
+    fn ctrl_o_key_toggles_verbose_and_invalidates_the_cache() {
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let mut input = InputEditor::default();
+        let mut picker = None;
+        let mut login_pending = false;
+        let mut should_exit = false;
+        let base = model.revision;
+        handle_key(
+            &rt,
+            &mut model,
+            &mut input,
+            &mut picker,
+            &mut login_pending,
+            &mut should_exit,
+            Path::new("/tmp"),
+            KeyCode::Char('o'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(model.verbose, "Ctrl+O must expand tool output");
+        assert!(
+            model.revision > base,
+            "the toggle must invalidate the render cache"
+        );
+        assert!(!should_exit);
     }
 
     #[test]
@@ -2455,7 +2590,7 @@ mod tests {
             name: "bash".into(),
             ok: true,
             error: None,
-            output: Some("l0\nl1\nl2\nl3\nl4\nl5\nl6".into()),
+            output: Some("l0\nl1\nl2\nl3\nl4\nl5\nl6\n".into()),
         });
         // Collapsed by default: marker, first five indented lines, then a hint.
         assert_eq!(

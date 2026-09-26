@@ -181,7 +181,9 @@ pub enum Event {
         error: Option<String>,
         /// The tool result text, so a frontend can render the output under the
         /// call line (CRAB-158). Optional and omitted on the wire when empty,
-        /// so older event consumers keep working (CRAB-139).
+        /// so older event consumers keep working (CRAB-139). Bounded by the
+        /// tool's own `max_output` (32 KB by default), so the JSON/RPC frames
+        /// stay small.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
     },
