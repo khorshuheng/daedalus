@@ -115,6 +115,9 @@ struct Opts {
     files_with_matches: bool,
     count: bool,
     only_matching: bool,
+    /// True when a whole-buffer `is_match` prefilter is sound: the pattern has
+    /// no `^`/`$` anchors, whose per-line meaning differs from whole-text.
+    prefilter: bool,
     before: usize,
     after: usize,
     max_count: Option<usize>,
@@ -189,7 +192,14 @@ fn count_matches(
     invert: bool,
     only_matching: bool,
     max: Option<usize>,
+    prefilter: bool,
 ) -> usize {
+    // Cheap whole-buffer reject before touching individual lines. Only sound
+    // for non-invert matching: an invert search matches every line when the
+    // pattern is absent.
+    if prefilter && !invert && !re.is_match(text) {
+        return 0;
+    }
     let mut n = 0usize;
     for line in text.lines() {
         if re.is_match(line) != invert {
@@ -241,11 +251,13 @@ impl SearchTool {
         let sort_reverse = get_bool(args, "sort_reverse");
 
         let context = arg_usize(args, "context")?.unwrap_or(0);
-        let opts = Opts {
+        let mut opts = Opts {
             invert: get_bool(args, "invert"),
             files_with_matches: get_bool(args, "files_with_matches"),
             count: get_bool(args, "count"),
             only_matching: get_bool(args, "only_matching"),
+            // Filled in below once the pattern source is known.
+            prefilter: false,
             before: arg_usize(args, "before_context")?.unwrap_or(context),
             after: arg_usize(args, "after_context")?.unwrap_or(context),
             max_count: arg_usize(args, "max_count")?,
@@ -279,6 +291,11 @@ impl SearchTool {
             .case_insensitive(case_insensitive)
             .build()
             .map_err(|e| ToolError::Argument(format!("invalid regex '{pattern}': {e}")))?;
+        // A whole-buffer `is_match` rejects a non-matching file in one pass
+        // (regex literal optimizations) instead of a regex call per line. It is
+        // only equivalent for patterns without anchors, whose `^`/`$` would
+        // otherwise mean "start/end of the whole buffer".
+        opts.prefilter = !source.contains('^') && !source.contains('$');
 
         let root = match args.get("path").and_then(Value::as_str) {
             Some(p) => resolve(workspace, Path::new(p))?,
@@ -410,7 +427,14 @@ impl SearchTool {
                 .to_string();
 
             if total_count {
-                total += count_matches(&re, &text, opts.invert, opts.only_matching, opts.max_count);
+                total += count_matches(
+                    &re,
+                    &text,
+                    opts.invert,
+                    opts.only_matching,
+                    opts.max_count,
+                    opts.prefilter,
+                );
                 continue;
             }
 
@@ -491,9 +515,15 @@ fn render_file(
 ) -> (String, bool) {
     let mut out = String::new();
 
+    // Whole-buffer reject before the per-line pass: files with no match at all
+    // are the common case in a repo-wide search.
+    if opts.prefilter && !opts.invert && !re.is_match(text) {
+        return (out, false);
+    }
+
     // `-l` and `-c` emit one record per matched file.
     if opts.files_with_matches || opts.count {
-        let n = count_matches(re, text, opts.invert, false, None);
+        let n = count_matches(re, text, opts.invert, false, None, opts.prefilter);
         if n == 0 {
             return (out, false);
         }
@@ -635,6 +665,29 @@ mod tests {
         write(dir.path(), "a.txt", "hello\nworld\nhello again\n");
         let out = run(&ws, json!({"pattern": "hello"})).await.unwrap();
         assert_eq!(out.content, "a.txt:1:hello\na.txt:3:hello again");
+    }
+
+    /// The whole-buffer prefilter must not reject a file whose `^`-anchored
+    /// pattern matches a later line (DAE-116).
+    #[tokio::test]
+    async fn anchored_patterns_still_match_later_lines() {
+        let (ws, dir) = setup("anchor");
+        write(dir.path(), "a.txt", "bar\nfoo\n");
+        let out = run(&ws, json!({"pattern": "^foo"})).await.unwrap();
+        assert_eq!(out.content, "a.txt:2:foo");
+    }
+
+    /// Invert must not use the "no match at all" short-circuit: every line is a
+    /// match when the pattern is absent.
+    #[tokio::test]
+    async fn invert_still_returns_lines_without_the_pattern() {
+        let (ws, dir) = setup("invert-prefilter");
+        write(dir.path(), "a.txt", "one\ntwo\n");
+        let out = run(&ws, json!({"pattern": "absent", "invert": true}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("a.txt:1:one"), "{}", out.content);
+        assert!(out.content.contains("a.txt:2:two"), "{}", out.content);
     }
 
     #[tokio::test]

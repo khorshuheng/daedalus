@@ -6,7 +6,7 @@ use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +21,43 @@ const MAX_FILES: usize = 32;
 /// exact totals); larger files are streamed so a huge file is never loaded
 /// into memory just to return a capped slice.
 const MAX_FULL_READ: u64 = 4 * 1024 * 1024;
+
+/// Read one line (with its trailing `\n`) storing at most `cap` bytes. An
+/// over-long line is truncated to `cap` and the rest skipped, so a 200 MB
+/// single-line file never materializes in memory. Returns `(bytes, truncated)`.
+fn read_line_capped<R: BufRead>(reader: &mut R, cap: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    reader
+        .by_ref()
+        .take(cap as u64)
+        .read_until(b'\n', &mut buf)?;
+    if buf.last() == Some(&b'\n') || buf.len() < cap {
+        return Ok((buf, false));
+    }
+    // No newline within `cap`: the line is longer; discard the rest of it.
+    skip_until_newline(reader)?;
+    Ok((buf, true))
+}
+
+/// Consume bytes through the next `\n` without buffering them.
+fn skip_until_newline<R: BufRead>(reader: &mut R) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        match available.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                reader.consume(i + 1);
+                return Ok(());
+            }
+            None => {
+                let n = available.len();
+                reader.consume(n);
+            }
+        }
+    }
+}
 
 pub struct ReadTool {
     pub max_output: usize,
@@ -312,12 +349,21 @@ impl ReadTool {
         offset: usize,
         limit: Option<usize>,
     ) -> Result<String, ToolError> {
-        let content = match std::fs::read_to_string(resolved) {
-            Ok(c) => c,
+        let bytes = match std::fs::read(resolved) {
+            Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ToolError::NotFound(display.to_string()));
             }
             Err(e) => return Err(ToolError::Io(e.to_string())),
+        };
+        // Lossy-decode so a Latin-1 or partially binary file is readable with a
+        // note instead of a raw "stream did not contain valid UTF-8" error.
+        let (content, lossy) = match String::from_utf8(bytes) {
+            Ok(s) => (s, false),
+            Err(e) => {
+                let bytes = e.into_bytes();
+                (String::from_utf8_lossy(&bytes).into_owned(), true)
+            }
         };
 
         let lines: Vec<&str> = content.lines().collect();
@@ -348,14 +394,18 @@ impl ReadTool {
         // of an empty result.
         if kept.is_empty() {
             let line = selected[0];
-            return Ok(format!(
+            let mut hint = format!(
                 "[Line {shown_start} is {} bytes, exceeds {} limit. Use bash: sed -n '{}p' {} | head -c {}]",
                 line.len(),
                 self.max_output,
                 shown_start,
                 display,
                 self.max_output
-            ));
+            );
+            if lossy {
+                hint.push_str("\n\n[non-UTF-8 bytes replaced with U+FFFD]");
+            }
+            return Ok(hint);
         }
 
         let body = kept.join("\n");
@@ -371,6 +421,9 @@ impl ReadTool {
             out = format!(
                 "{out}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]"
             );
+        }
+        if lossy {
+            out.push_str("\n\n[non-UTF-8 bytes replaced with U+FFFD]");
         }
 
         Ok(out)
@@ -388,24 +441,50 @@ impl ReadTool {
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
         let file = std::fs::File::open(resolved).map_err(|e| ToolError::Io(e.to_string()))?;
-        let reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::new(file);
         let max_lines = limit.unwrap_or(MAX_LINES).min(MAX_LINES);
         let start = offset - 1; // 0-based lines to skip
         let mut kept: Vec<String> = Vec::new();
         let mut bytes = 0usize;
         let mut line_no = 0usize;
         let mut more = false;
+        let mut lossy = false;
 
-        for line in reader.lines() {
+        loop {
             if cancel.is_cancelled() {
                 return Err(ToolError::Cancelled);
             }
-            let line = line.map_err(|e| ToolError::Io(e.to_string()))?;
+            // Never materialize a whole line: keep at most `max_output + 1`
+            // bytes and skip the rest of an over-long line.
+            let (raw, line_truncated) = read_line_capped(&mut reader, self.max_output + 1)
+                .map_err(|e| ToolError::Io(e.to_string()))?;
+            if raw.is_empty() {
+                break; // EOF
+            }
+            let text = match std::str::from_utf8(&raw) {
+                Ok(s) => std::borrow::Cow::Borrowed(s),
+                Err(_) => {
+                    lossy = true;
+                    std::borrow::Cow::Owned(String::from_utf8_lossy(&raw).into_owned())
+                }
+            };
+            let line = text.strip_suffix('\n').unwrap_or(&text);
+            let line = line.strip_suffix('\r').unwrap_or(line);
             line_no += 1;
             if line_no <= start {
                 continue;
             }
             if kept.len() >= max_lines {
+                more = true;
+                break;
+            }
+            if line_truncated {
+                if kept.is_empty() {
+                    return Ok(format!(
+                        "[Line {line_no} exceeds {} bytes. Use bash: sed -n '{}p' {} | head -c {}]",
+                        self.max_output, line_no, display, self.max_output
+                    ));
+                }
                 more = true;
                 break;
             }
@@ -424,7 +503,7 @@ impl ReadTool {
                 more = true;
                 break;
             }
-            kept.push(line);
+            kept.push(line.to_string());
             bytes += add;
         }
 
@@ -440,7 +519,7 @@ impl ReadTool {
         let shown_start = offset;
         let shown_end = offset + kept.len() - 1;
         let body = kept.join("\n");
-        let out = if more {
+        let mut out = if more {
             format!(
                 "{body}\n\n[Showing lines {shown_start}-{shown_end}. Use offset={} to continue.]",
                 shown_end + 1
@@ -448,6 +527,9 @@ impl ReadTool {
         } else {
             body
         };
+        if lossy {
+            out.push_str("\n\n[non-UTF-8 bytes replaced with U+FFFD]");
+        }
         Ok(out)
     }
 }
@@ -486,6 +568,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content, "line1\nline2\nline3");
+    }
+
+    /// A non-UTF-8 file is decoded lossily with a note instead of a raw io
+    /// error (DAE-118).
+    #[tokio::test]
+    async fn non_utf8_file_is_read_lossily_with_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("latin1.txt"), [b'h', b'i', 0xFF, b'\n']).unwrap();
+        let ws = Workspace::new(root).unwrap();
+        let tool = ReadTool { max_output: 1000 };
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "latin1.txt"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains("hi"), "{}", out.content);
+        assert!(
+            out.content.contains("non-UTF-8"),
+            "expected a note: {}",
+            out.content
+        );
+    }
+
+    /// A multi-megabyte single line is not materialized whole; the streaming
+    /// path caps it and returns the targeted hint (DAE-118).
+    #[tokio::test]
+    async fn huge_single_line_is_bounded_in_streaming_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut big = "x".repeat(5 * 1024 * 1024);
+        big.push('\n');
+        big.push_str("second\n");
+        std::fs::write(root.join("big.txt"), big).unwrap();
+        let ws = Workspace::new(root).unwrap();
+        let tool = ReadTool { max_output: 1000 };
+        let out = tool
+            .run(
+                &ws,
+                &json!({"path": "big.txt"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.content.contains("exceeds 1000"),
+            "expected the single-line hint: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
