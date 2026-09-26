@@ -103,12 +103,14 @@ impl Provider for FakeProvider {
                     response: Response::Text(text),
                     prompt_tokens: None,
                     aborted: true,
+                    reasoning: Vec::new(),
                 });
             }
             Ok(Completion {
                 response,
                 prompt_tokens: None,
                 aborted: false,
+                reasoning: Vec::new(),
             })
         })
     }

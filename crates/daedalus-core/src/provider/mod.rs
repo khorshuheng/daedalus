@@ -26,6 +26,41 @@ pub struct ToolCall {
     pub args: Value, // JSON object of arguments
 }
 
+/// One piece of a provider reasoning/thinking block. Mirrors the shapes the
+/// supported wires emit: signed text (Anthropic), summary text, and opaque
+/// encrypted/redacted payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningPart {
+    /// Plain reasoning text with an optional provider signature.
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    /// Provider-generated reasoning summary text.
+    Summary(String),
+    /// Provider-encrypted reasoning payload.
+    Encrypted(String),
+    /// Redacted reasoning payload preserved as opaque data.
+    Redacted { data: String },
+}
+
+/// A provider reasoning/thinking block, preserved in history so it can be
+/// replayed on the next request. Anthropic requires the signed thinking block
+/// back when a `tool_use` loop continues, and DeepSeek's thinking mode expects
+/// `reasoning_content` on assistant messages in a tool loop, so dropping these
+/// makes the second request of a tool-using turn fail.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ReasoningBlock {
+    /// Provider-issued durable handle, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Ordered parts of the block.
+    #[serde(default)]
+    pub content: Vec<ReasoningPart>,
+}
+
 /// A canonical message in the agent history. Provider implementations convert
 /// these to and from their own wire format.
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +70,8 @@ pub enum Message {
     Assistant {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        /// Provider thinking/reasoning to replay with this message.
+        reasoning: Vec<ReasoningBlock>,
     },
     ToolResult {
         tool_call_id: String,
@@ -61,6 +98,9 @@ pub struct Completion {
     pub prompt_tokens: Option<usize>,
     /// True when the generation was interrupted mid-stream (user steering).
     pub aborted: bool,
+    /// Thinking/reasoning captured from the stream, for replay on the next
+    /// request (see [`ReasoningBlock`]).
+    pub reasoning: Vec<ReasoningBlock>,
 }
 
 /// Typed provider errors, surfaced clearly at the loop boundary.
@@ -74,6 +114,10 @@ pub enum ProviderError {
     Malformed(String),
     #[error("http error: {0}")]
     Http(String),
+    /// The request was cancelled by the caller. Distinct from an error so the
+    /// runtime can report a clean interruption instead of a provider failure.
+    #[error("cancelled")]
+    Cancelled,
     /// The provider does not support the requested capability.
     #[error("unsupported: {0}")]
     Unsupported(String),

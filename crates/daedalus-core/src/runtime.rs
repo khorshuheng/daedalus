@@ -51,7 +51,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, EffortStyle, ProviderInfo};
 use crate::instructions;
-use crate::provider::{Message, Provider, Response, StreamDelta};
+use crate::provider::{Message, Provider, ReasoningPart, Response, StreamDelta};
 use crate::skills::{self, Skill};
 use crate::tools::resolver::ToolSet;
 use crate::workspace::Workspace;
@@ -315,10 +315,15 @@ pub enum CommandKind {
     Resume,
 }
 
-/// Internal queue item: a wire command or a worker shutdown request.
+/// Internal queue item: a wire command, a queued history replacement, or a
+/// worker shutdown request.
 #[derive(Debug, Clone, PartialEq)]
 enum Control {
     Command(CommandKind),
+    /// `replace_history` routed through the worker so a resume can never be
+    /// overwritten by an in-flight turn's history snapshot. Applied only when
+    /// the worker is idle (deferred to settle if it arrives mid-turn).
+    ReplaceHistory(Vec<Message>),
     Shutdown,
 }
 
@@ -402,13 +407,32 @@ fn estimate_tokens(text: &str) -> usize {
 fn estimate_message_tokens(m: &Message) -> usize {
     match m {
         Message::System(s) | Message::User(s) => estimate_tokens(s) + 4,
-        Message::Assistant { text, tool_calls } => {
+        Message::Assistant {
+            text,
+            tool_calls,
+            reasoning,
+        } => {
             let text_tokens = text.as_deref().map(estimate_tokens).unwrap_or(0);
             let call_tokens: usize = tool_calls
                 .iter()
                 .map(|tc| 8 + estimate_tokens(&tc.name) + estimate_tokens(&tc.args.to_string()))
                 .sum();
-            text_tokens + call_tokens + 4
+            let reasoning_tokens: usize = reasoning
+                .iter()
+                .map(|block| {
+                    block
+                        .content
+                        .iter()
+                        .map(|part| match part {
+                            ReasoningPart::Text { text, .. } => estimate_tokens(text),
+                            ReasoningPart::Summary(s)
+                            | ReasoningPart::Encrypted(s)
+                            | ReasoningPart::Redacted { data: s } => estimate_tokens(s),
+                        })
+                        .sum::<usize>()
+                })
+                .sum();
+            text_tokens + call_tokens + reasoning_tokens + 4
         }
         Message::ToolResult { result, .. } => estimate_tokens(result) + 4,
     }
@@ -428,16 +452,20 @@ fn anchored_total(history: &[Message], anchor_tokens: usize, anchor_len: usize) 
 }
 
 /// Drop the oldest assistant-turn blocks while the history exceeds `budget`.
-/// The seed (`history[..seed_len]`) is never dropped.
+/// The seed (`history[..seed_len]`) is never dropped. Returns whether anything
+/// was dropped.
 fn trim_history(
     history: &mut Vec<Message>,
     seed_len: usize,
     budget: usize,
     anchor_tokens: &mut usize,
     anchor_len: &mut usize,
-) {
-    while anchored_total(history, *anchor_tokens, *anchor_len) > budget && history.len() > seed_len
-    {
+) -> bool {
+    // Track the total across iterations instead of re-estimating the whole
+    // history after every drop (which was O(n²) for a long history).
+    let mut total = anchored_total(history, *anchor_tokens, *anchor_len);
+    let mut changed = false;
+    while total > budget && history.len() > seed_len {
         let Some(first_assistant) = history
             .iter()
             .position(|m| matches!(m, Message::Assistant { .. }))
@@ -448,12 +476,59 @@ fn trim_history(
         while end < history.len() && matches!(history[end], Message::ToolResult { .. }) {
             end += 1;
         }
+        let dropped: usize = history[first_assistant..end]
+            .iter()
+            .map(estimate_message_tokens)
+            .sum();
         if first_assistant < *anchor_len {
+            // The exact prefix is being dropped; it is no longer a valid
+            // anchor, so recount from scratch.
             *anchor_tokens = 0;
             *anchor_len = 0;
+            history.drain(first_assistant..end);
+            total = total_tokens(history);
+        } else {
+            history.drain(first_assistant..end);
+            total = total.saturating_sub(dropped);
         }
-        history.drain(first_assistant..end);
+        changed = true;
     }
+    changed
+}
+
+/// Replace the bulk of the oldest large tool outputs past the seed with a short
+/// placeholder while the history exceeds `budget`. The `ToolResult` (and so its
+/// pairing with the originating tool call) is kept; only the output text — the
+/// largest part of most histories — is dropped. Returns whether anything
+/// changed.
+fn trim_tool_outputs(history: &mut [Message], seed_len: usize, budget: usize) -> bool {
+    /// Below this, dropping the output is not worth the loss of information.
+    const MIN_TRIM_BYTES: usize = 512;
+    let mut total = total_tokens(history);
+    if total <= budget {
+        return false;
+    }
+    let mut changed = false;
+    for message in history.iter_mut().skip(seed_len) {
+        if total <= budget {
+            break;
+        }
+        if let Message::ToolResult { result, .. } = message {
+            if result.len() <= MIN_TRIM_BYTES {
+                continue;
+            }
+            let before = estimate_tokens(result);
+            let note = format!(
+                "[older tool output omitted to save context: {} bytes]",
+                result.len()
+            );
+            let after = estimate_tokens(&note);
+            *result = note;
+            total = total.saturating_sub(before.saturating_sub(after));
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The shared state behind an `AgentRuntime` handle. The worker thread owns
@@ -500,6 +575,9 @@ struct Inner {
     events: tokio::sync::mpsc::UnboundedSender<Event>,
     /// Cached model ids discovered for the current provider.
     models: Mutex<Vec<String>>,
+    /// A `replace_history` that arrived while the worker was busy, applied
+    /// once the turn settles (last request wins).
+    deferred_history: Mutex<Option<Vec<Message>>>,
     /// Where user instructions (`APPEND_SYSTEM.md`) are read from. Defaults to
     /// the standard config dir; a seam so tests do not depend on the ambient
     /// `~/.config`.
@@ -525,6 +603,18 @@ impl AgentRuntime {
         tools: ToolSet,
         workspace: Workspace,
     ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
+        Self::new_with_tools(config, provider, Arc::new(tools), workspace)
+    }
+
+    /// Like [`new`](Self::new), but takes a shared tool set. A server builds
+    /// the built-ins + MCP tools once and hands the same `Arc` to every
+    /// session, so MCP child processes are not spawned per connection.
+    pub fn new_with_tools(
+        config: Config,
+        provider: Box<dyn Provider>,
+        tools: Arc<ToolSet>,
+        workspace: Workspace,
+    ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
         Self::with_instructions_path(
             config,
             provider,
@@ -540,14 +630,13 @@ impl AgentRuntime {
     fn with_instructions_path(
         config: Config,
         provider: Box<dyn Provider>,
-        tools: ToolSet,
+        tools: Arc<ToolSet>,
         workspace: Workspace,
         instructions_path: PathBuf,
     ) -> (AgentRuntime, tokio::sync::mpsc::UnboundedReceiver<Event>) {
         let (events, rx) = tokio::sync::mpsc::unbounded_channel();
         let (commands_tx, commands_rx) = tokio::sync::mpsc::unbounded_channel();
         let schemas = tools.tool_schemas();
-        let tools = Arc::new(tools);
         let model = config.model.clone();
         let provider_name = config.provider.name.to_string();
         let provider_info = config.provider;
@@ -583,6 +672,7 @@ impl AgentRuntime {
                 commands_rx: tokio::sync::Mutex::new(commands_rx),
                 events,
                 models: Mutex::new(Vec::new()),
+                deferred_history: Mutex::new(None),
                 instructions_path,
             }),
         };
@@ -693,9 +783,23 @@ impl AgentRuntime {
         self.inner.history.lock().unwrap().clone()
     }
 
-    /// Replace the conversation wholesale (e.g. `/resume` loads a previous
-    /// session). The first message must be the system prompt.
+    /// Replace the conversation wholesale (e.g. `/resume`). While a turn is
+    /// running the request is queued and applied when the worker settles, so it
+    /// can never be clobbered by the turn's history snapshot; when idle it is
+    /// applied immediately. The first message must be the system prompt.
     pub fn replace_history(&self, history: Vec<Message>) {
+        if self.inner.busy.load(Ordering::SeqCst) {
+            let _ = self
+                .inner
+                .commands_tx
+                .send(Control::ReplaceHistory(history));
+        } else {
+            self.apply_history(history);
+        }
+    }
+
+    /// Worker-side apply of a queued history replacement.
+    fn apply_history(&self, history: Vec<Message>) {
         let mut h = self.inner.history.lock().unwrap();
         *h = history;
         *self.inner.anchor.lock().unwrap() = (0, 0);
@@ -854,37 +958,41 @@ impl AgentRuntime {
             drop(st);
             self.emit(agent_start);
         }
-        while let Some(kind) = self.wait_for_command().await {
-            match kind {
-                CommandKind::Prompt { text } => self.drive_until_settled(&text).await,
-                // While idle a steer/follow-up is simply a new turn.
-                CommandKind::Steer { text } | CommandKind::FollowUp { text } => {
-                    self.drive_until_settled(&text).await
-                }
-                CommandKind::Abort {} => self.cancel_clear(),
-                CommandKind::GetState {} => self.emit_state_changed(),
-                CommandKind::Clear {} => {
-                    self.reset_to_seed();
-                    self.emit_state_changed();
-                }
-                CommandKind::Resume => {}
-                CommandKind::ListModels {} => {
-                    let provider = Arc::clone(&self.inner.provider.lock().unwrap());
-                    match provider.list_models().await {
-                        Ok(models) => {
-                            *self.inner.models.lock().unwrap() = models.clone();
-                            self.emit(Event::ModelsListed { models });
-                        }
-                        Err(e) => self.emit(Event::Error {
-                            message: format!("could not list models: {e}"),
-                            kind: None,
-                        }),
+        while let Some(control) = self.wait_for_command().await {
+            match control {
+                Control::ReplaceHistory(history) => self.apply_history(history),
+                Control::Shutdown => break,
+                Control::Command(kind) => match kind {
+                    CommandKind::Prompt { text } => self.drive_until_settled(&text).await,
+                    // While idle a steer/follow-up is simply a new turn.
+                    CommandKind::Steer { text } | CommandKind::FollowUp { text } => {
+                        self.drive_until_settled(&text).await
                     }
-                }
-                CommandKind::SetProvider { provider } => self.switch_provider(&provider).await,
-                CommandKind::SetModel { .. }
-                | CommandKind::SetEffort { .. }
-                | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
+                    CommandKind::Abort {} => self.cancel_clear(),
+                    CommandKind::GetState {} => self.emit_state_changed(),
+                    CommandKind::Clear {} => {
+                        self.reset_to_seed();
+                        self.emit_state_changed();
+                    }
+                    CommandKind::Resume => {}
+                    CommandKind::ListModels {} => {
+                        let provider = Arc::clone(&self.inner.provider.lock().unwrap());
+                        match provider.list_models().await {
+                            Ok(models) => {
+                                *self.inner.models.lock().unwrap() = models.clone();
+                                self.emit(Event::ModelsListed { models });
+                            }
+                            Err(e) => self.emit(Event::Error {
+                                message: format!("could not list models: {e}"),
+                                kind: None,
+                            }),
+                        }
+                    }
+                    CommandKind::SetProvider { provider } => self.switch_provider(&provider).await,
+                    CommandKind::SetModel { .. }
+                    | CommandKind::SetEffort { .. }
+                    | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
+                },
             }
         }
     }
@@ -1048,23 +1156,23 @@ impl AgentRuntime {
         }
     }
 
-    /// Pop the oldest queued command without blocking, or `None` (also when
-    /// the next item is a shutdown request).
-    async fn pop_queued(&self) -> Option<CommandKind> {
+    /// Pop the oldest queued item without blocking, or `None` (also when the
+    /// next item is a shutdown request).
+    async fn pop_queued(&self) -> Option<Control> {
         let mut rx = self.inner.commands_rx.lock().await;
         match rx.try_recv() {
-            Ok(Control::Command(kind)) => Some(kind),
             Ok(Control::Shutdown) | Err(_) => None,
+            Ok(other) => Some(other),
         }
     }
 
-    /// Block until the queue has a command, then pop it. Returns `None` on a
+    /// Block until the queue has an item, then pop it. Returns `None` on a
     /// shutdown request so the worker loop can exit.
-    async fn wait_for_command(&self) -> Option<CommandKind> {
+    async fn wait_for_command(&self) -> Option<Control> {
         let mut rx = self.inner.commands_rx.lock().await;
         match rx.recv().await {
-            Some(Control::Command(kind)) => Some(kind),
             Some(Control::Shutdown) | None => None,
+            Some(other) => Some(other),
         }
     }
 
@@ -1078,7 +1186,17 @@ impl AgentRuntime {
     async fn drain_queue(&self) -> (Vec<String>, Vec<String>) {
         let mut steers = Vec::new();
         let mut follow_ups = Vec::new();
-        while let Some(kind) = self.pop_queued().await {
+        while let Some(control) = self.pop_queued().await {
+            let kind = match control {
+                Control::Command(kind) => kind,
+                // A resume while busy is deferred; applying it now would race
+                // the in-flight turn's history snapshot.
+                Control::ReplaceHistory(history) => {
+                    *self.inner.deferred_history.lock().unwrap() = Some(history);
+                    continue;
+                }
+                Control::Shutdown => break,
+            };
             match kind {
                 CommandKind::Steer { text } => steers.push(text),
                 CommandKind::FollowUp { text } => follow_ups.push(text),
@@ -1088,6 +1206,10 @@ impl AgentRuntime {
                 }
                 CommandKind::GetState {} => self.emit_state_changed(),
                 CommandKind::Clear {} => {
+                    // Stop the in-flight turn first: resetting the history and
+                    // then continuing would send a completion with no user
+                    // message (and orphan the turn's tool results).
+                    self.cancel_current();
                     self.reset_to_seed();
                     self.emit_state_changed();
                 }
@@ -1106,24 +1228,30 @@ impl AgentRuntime {
                     }
                 }
                 CommandKind::SetProvider { provider } => self.switch_provider(&provider).await,
-                CommandKind::SetModel { .. }
-                | CommandKind::SetEffort { .. }
-                | CommandKind::SwitchWorkspace { .. } => self.apply_state_command(kind).await,
+                CommandKind::SetModel { .. } | CommandKind::SetEffort { .. } => {
+                    self.apply_state_command(kind).await
+                }
+                CommandKind::SwitchWorkspace { .. } => {
+                    // Same as Clear: the seed prompt changes, so the running
+                    // turn cannot continue against the new workspace.
+                    self.cancel_current();
+                    self.apply_state_command(kind).await;
+                }
             }
         }
         (steers, follow_ups)
     }
 
-    /// Append `text` as the next user message, replacing the seed system
-    /// prompt with one ranked against it when memory is enabled.
-    fn push_user(&self, text: &str) {
-        let seed = self.system_prompt();
+    /// Append `text` as the next user message, setting the seed system prompt
+    /// (history[0]) to `seed`. The caller computes `seed` once per turn so a
+    /// steer does not re-read instructions and re-walk the skills directories.
+    fn push_user(&self, text: &str, seed: &str) {
         let mut h = self.inner.history.lock().unwrap();
         // Refresh the seed system prompt (history[0]) for this task.
         if h.is_empty() {
-            h.push(Message::System(seed));
+            h.push(Message::System(seed.to_string()));
         } else if let Some(Message::System(first)) = h.first_mut() {
-            *first = seed;
+            *first = seed.to_string();
         }
         h.push(Message::User(text.to_string()));
     }
@@ -1147,65 +1275,83 @@ impl AgentRuntime {
         budget: usize,
         anchor_tokens: &mut usize,
         anchor_len: &mut usize,
-    ) {
-        // Try compaction first when over budget.
-        if anchored_total(history, *anchor_tokens, *anchor_len) > budget {
-            self.compact_history(history, seed_len, budget).await;
+    ) -> bool {
+        let mut changed = false;
+        // Cheapest first: drop the bulk of old tool outputs, keeping the calls
+        // and their success/failure. This usually brings the history under
+        // budget without a provider call at all.
+        if anchored_total(history, *anchor_tokens, *anchor_len) > budget
+            && trim_tool_outputs(history, seed_len, budget)
+        {
+            // A trimmed message inside the anchored prefix makes the exact
+            // count stale.
+            *anchor_tokens = 0;
+            *anchor_len = 0;
+            changed = true;
+        }
+        // Then summarize the oldest removable turns, at most once per step (the
+        // fallback trim below bounds whatever remains).
+        if anchored_total(history, *anchor_tokens, *anchor_len) > budget
+            && self.compact_history(history, seed_len, budget).await
+        {
+            changed = true;
         }
         // Whatever remains over budget is trimmed (compaction is best-effort:
         // a summary may itself be long, or the provider may be unavailable).
-        trim_history(history, seed_len, budget, anchor_tokens, anchor_len);
+        if trim_history(history, seed_len, budget, anchor_tokens, anchor_len) {
+            changed = true;
+        }
+        changed
     }
 
-    /// Compact the oldest removable turns (past the seed) into a single
-    /// summary System message, repeated until the history fits `budget` or
-    /// nothing more can be removed. Best-effort: returns without changing
-    /// anything when there is nothing summarizable or the provider call
-    /// fails (the caller then trims).
-    async fn compact_history(&self, history: &mut Vec<Message>, seed_len: usize, budget: usize) {
-        // Find the oldest removable turn block (an Assistant message and its
-        // following ToolResults). Compaction summarizes from the seed onward.
-        loop {
-            // Everything from the seed up to (and including) the oldest
-            // assistant block + its tool results is compacted into a summary.
-            let Some(first_removable) = history
-                .iter()
-                .enumerate()
-                .skip(seed_len)
-                .find(|(_, m)| matches!(m, Message::Assistant { .. }))
-                .map(|(i, _)| i)
-            else {
-                return; // no assistant turns yet (nothing worth compacting)
-            };
-            let mut block_end = first_removable + 1;
-            while block_end < history.len()
-                && matches!(history[block_end], Message::ToolResult { .. })
-            {
-                block_end += 1;
-            }
-            // Compact from the first non-system message (index 1, past the
-            // system prompt) through the oldest assistant block, so the User
-            // that prompted the assistant is summarized too.
-            let compact_from = 1usize.max(seed_len.saturating_sub(1));
-            let compact_range = compact_from..block_end;
-            let to_compact: Vec<Message> = history[compact_range.clone()].to_vec();
-            if to_compact.len() <= 1 {
-                return; // nothing meaningful to compress
-            }
-            let summary = match self.request_summary(&to_compact).await {
-                Some(s) if !s.is_empty() => s,
-                _ => return, // compaction unavailable/failed; caller trims
-            };
-            // Replace the compacted range with a summary System message.
-            history.drain(compact_range);
-            history.insert(
-                compact_from,
-                Message::System(format!("Summary of earlier conversation: {summary}")),
-            );
-            if anchored_total(history, 0, 0) <= budget {
-                return;
-            }
+    /// Compact the oldest removable turn (an Assistant message and its
+    /// following ToolResults) into a single summary System message. At most one
+    /// compaction per context-management pass: each call is a full provider
+    /// request, so looping would multiply latency and cost; the caller's
+    /// fallback trim bounds whatever the single summary does not.
+    async fn compact_history(
+        &self,
+        history: &mut Vec<Message>,
+        seed_len: usize,
+        budget: usize,
+    ) -> bool {
+        // Everything from the seed up to (and including) the oldest assistant
+        // block + its tool results is compacted into a summary.
+        let Some(first_removable) = history
+            .iter()
+            .enumerate()
+            .skip(seed_len)
+            .find(|(_, m)| matches!(m, Message::Assistant { .. }))
+            .map(|(i, _)| i)
+        else {
+            return false; // no assistant turns yet (nothing worth compacting)
+        };
+        let mut block_end = first_removable + 1;
+        while block_end < history.len() && matches!(history[block_end], Message::ToolResult { .. })
+        {
+            block_end += 1;
         }
+        // Compact from the first non-system message (index 1, past the system
+        // prompt) through the oldest assistant block, so the User that prompted
+        // the assistant is summarized too.
+        let compact_from = 1usize.max(seed_len.saturating_sub(1));
+        let compact_range = compact_from..block_end;
+        let to_compact: Vec<Message> = history[compact_range.clone()].to_vec();
+        if to_compact.len() <= 1 {
+            return false; // nothing meaningful to compress
+        }
+        let summary = match self.request_summary(&to_compact).await {
+            Some(s) if !s.is_empty() => s,
+            _ => return false, // compaction unavailable/failed; caller trims
+        };
+        // Replace the compacted range with a summary System message.
+        history.drain(compact_range);
+        history.insert(
+            compact_from,
+            Message::System(format!("Summary of earlier conversation: {summary}")),
+        );
+        let _ = budget;
+        true
     }
 
     /// Ask the provider to compress `messages` into a short summary. Returns
@@ -1221,8 +1367,17 @@ impl AgentRuntime {
                 .iter()
                 .map(|m| match m {
                     Message::User(u) => format!("user: {u}"),
-                    Message::Assistant { text, .. } => {
-                        format!("assistant: {}", text.as_deref().unwrap_or("(tool call)"))
+                    Message::Assistant {
+                        text, tool_calls, ..
+                    } => {
+                        // Include the call names and arguments: the summary is
+                        // what later turns rely on, and `(tool call)` alone
+                        // loses what was actually done.
+                        let mut s = format!("assistant: {}", text.as_deref().unwrap_or(""));
+                        for call in tool_calls {
+                            s.push_str(&format!("\n  tool_call {}: {}", call.name, call.args));
+                        }
+                        s
                     }
                     Message::ToolResult { result, .. } => format!("result: {result}"),
                     Message::System(s) => format!("system: {s}"),
@@ -1256,7 +1411,17 @@ impl AgentRuntime {
         saved: &mut VecDeque<String>,
     ) -> (String, bool, Option<String>) {
         self.emit(Event::TurnStart {});
-        self.push_user(user_text);
+        // A cancelled turn (e.g. a follow-up drained after the user aborted)
+        // must not push its user message into history only to bail: that left
+        // orphaned, unanswered user turns behind.
+        if self.inner.cancel.lock().unwrap().is_cancelled() {
+            self.emit(Event::TurnEnd {});
+            return (String::new(), true, None);
+        }
+        // Compute the seed prompt once per user message; steers in this turn
+        // reuse it instead of re-reading instructions/skills each time.
+        let seed = self.system_prompt();
+        self.push_user(user_text, &seed);
         let seed_len = 2; // [System, first User] are never trimmed.
         let mut iterations = 0usize;
         let mut final_text = String::new();
@@ -1268,18 +1433,20 @@ impl AgentRuntime {
             // follow-ups wait for settle (kept in `saved`).
             let (steers, followups) = self.drain_queue().await;
             saved.extend(followups);
+            // Check cancellation before delivering steers: an abort (or a
+            // mid-turn clear/workspace switch) must not leak queued messages
+            // into a history that is about to be discarded.
+            if self.inner.cancel.lock().unwrap().is_cancelled() {
+                interrupted = true;
+                break 'steps;
+            }
             if !steers.is_empty() {
                 // A steer arrived after the assistant's tool phase: append it
                 // as a user message and keep looping (no settle).
                 for steer in steers {
-                    self.push_user(&steer);
+                    self.push_user(&steer, &seed);
                     iterations = 0; // fresh turn budget for the steer
                 }
-            }
-
-            if self.inner.cancel.lock().unwrap().is_cancelled() {
-                interrupted = true;
-                break 'steps;
             }
             if iterations >= self.inner.config.max_iterations
                 && !self.inner.interactive.load(Ordering::SeqCst)
@@ -1302,25 +1469,28 @@ impl AgentRuntime {
                 let anchor = *self.inner.anchor.lock().unwrap();
                 (h, anchor)
             };
-            self.manage_context(
-                &mut h,
-                seed_len,
-                self.inner.config.max_context_tokens,
-                &mut a0,
-                &mut a1,
-            )
-            .await;
-            {
-                // Write the compacted/trimmed history back wholesale.
+            let changed = self
+                .manage_context(
+                    &mut h,
+                    seed_len,
+                    self.inner.config.max_context_tokens,
+                    &mut a0,
+                    &mut a1,
+                )
+                .await;
+            if changed {
+                // Only a context change needs the managed copy written back;
+                // otherwise `h` already equals the history and can go straight
+                // to the provider (no extra full-history clone).
                 let mut hh = self.inner.history.lock().unwrap();
-                *hh = h;
-                *self.inner.anchor.lock().unwrap() = (a0, a1);
+                *hh = h.clone();
             }
+            *self.inner.anchor.lock().unwrap() = (a0, a1);
 
-            let completion = {
-                // Clone the history so the lock is not held across the await
-                // (the vector is small and this is the only mutation window).
-                let h = self.inner.history.lock().unwrap().clone();
+            let (completion, sent_len) = {
+                // `h` is the snapshot sent this step (the vector is small and
+                // this is the only mutation window).
+                let sent_len = h.len();
                 let effort_params = {
                     let st = self.inner.state.lock().unwrap();
                     provider_effort(*self.inner.provider_info.lock().unwrap(), st.effort)
@@ -1336,7 +1506,7 @@ impl AgentRuntime {
                     }
                 };
                 let provider = Arc::clone(&self.inner.provider.lock().unwrap());
-                provider
+                let completion = provider
                     .complete(
                         &h,
                         &self.inner.schemas,
@@ -1344,7 +1514,8 @@ impl AgentRuntime {
                         cancel,
                         &mut on_delta,
                     )
-                    .await
+                    .await;
+                (completion, sent_len)
             };
             match completion {
                 Err(e) => {
@@ -1366,6 +1537,13 @@ impl AgentRuntime {
                         message: message.clone(),
                         kind: error_kind(&e),
                     });
+                    // A cancellation surfaced as an error still ends the turn
+                    // as interrupted, so queued follow-ups are not delivered.
+                    if matches!(e, crate::provider::ProviderError::Cancelled)
+                        || self.inner.cancel.lock().unwrap().is_cancelled()
+                    {
+                        interrupted = true;
+                    }
                     // The turn ended without an answer: report it, so one-shot
                     // callers (`run_once`) and the adapters do not treat this as
                     // a completed turn.
@@ -1377,6 +1555,11 @@ impl AgentRuntime {
                         self.emit(Event::Usage {
                             prompt_tokens: Some(tokens),
                         });
+                        // Anchor exact accounting to the provider-reported
+                        // prompt size: it is the exact token count of the
+                        // `history[..sent_len]` we just sent, so budgeting no
+                        // longer has to guess with chars/4 for that prefix.
+                        *self.inner.anchor.lock().unwrap() = (tokens, sent_len);
                     }
                     if completion.aborted {
                         // Keep the partial text so the model sees what it was
@@ -1390,6 +1573,7 @@ impl AgentRuntime {
                             h.push(Message::Assistant {
                                 text: Some(partial.clone()),
                                 tool_calls: vec![],
+                                reasoning: completion.reasoning,
                             });
                             final_text = partial;
                         }
@@ -1402,6 +1586,7 @@ impl AgentRuntime {
                             h.push(Message::Assistant {
                                 text: Some(text.clone()),
                                 tool_calls: vec![],
+                                reasoning: completion.reasoning,
                             });
                             final_text = text;
                             break 'steps;
@@ -1410,6 +1595,7 @@ impl AgentRuntime {
                             self.inner.history.lock().unwrap().push(Message::Assistant {
                                 text: None,
                                 tool_calls: calls.clone(),
+                                reasoning: completion.reasoning,
                             });
                             // Run tool calls in parallel, like
                             // pi. Each thread locks the workspace and checks
@@ -1476,6 +1662,7 @@ impl AgentRuntime {
                             h.push(Message::Assistant {
                                 text: None,
                                 tool_calls: calls.clone(),
+                                reasoning: completion.reasoning,
                             });
                             drop(h);
                             for call in &calls {
@@ -1524,6 +1711,11 @@ impl AgentRuntime {
             final_text = text;
             interrupted = was_interrupted;
         }
+        // A resume requested while busy applies now that the turn has settled,
+        // so its history cannot be overwritten by the worker's snapshot.
+        if let Some(history) = self.inner.deferred_history.lock().unwrap().take() {
+            self.apply_history(history);
+        }
         self.emit(Event::AgentSettled {
             text: final_text,
             interrupted,
@@ -1558,6 +1750,7 @@ mod tests {
                             response,
                             prompt_tokens: Some(1),
                             aborted: false,
+                            reasoning: Vec::new(),
                         })
                         .collect(),
                 ),
@@ -1580,6 +1773,7 @@ mod tests {
                     response: Response::Text("done".into()),
                     prompt_tokens: None,
                     aborted: false,
+                    reasoning: Vec::new(),
                 }))
             })
         }
@@ -1653,7 +1847,7 @@ mod tests {
         let (rt, _rx) = AgentRuntime::with_instructions_path(
             cfg,
             Box::new(GateProvider::new(vec![])),
-            ToolSet::new(1000),
+            Arc::new(ToolSet::new(1000)),
             ws,
             instructions_path,
         );
@@ -1684,7 +1878,7 @@ mod tests {
         let (rt, _rx) = AgentRuntime::with_instructions_path(
             cfg,
             Box::new(GateProvider::new(vec![])),
-            ToolSet::new(1000),
+            Arc::new(ToolSet::new(1000)),
             ws,
             dir.path().join("missing.md"),
         );
@@ -1738,6 +1932,55 @@ mod tests {
 
     fn text(text: &str) -> String {
         text.to_string()
+    }
+
+    #[test]
+    fn trim_tool_outputs_drops_bulk_but_keeps_the_result() {
+        let big = "x".repeat(10_000);
+        let mut history = vec![
+            Message::System("seed".into()),
+            Message::User("q".into()),
+            Message::Assistant {
+                text: None,
+                tool_calls: vec![],
+                reasoning: vec![],
+            },
+            Message::ToolResult {
+                tool_call_id: "c1".into(),
+                result: big,
+            },
+        ];
+        assert!(total_tokens(&history) > 100);
+        assert!(trim_tool_outputs(&mut history, 2, 100));
+        assert!(
+            total_tokens(&history) <= 100,
+            "still {} tokens",
+            total_tokens(&history)
+        );
+        // The result survives (with its pairing) as a short placeholder.
+        assert!(matches!(
+            &history[3],
+            Message::ToolResult { result, .. } if result.contains("omitted")
+        ));
+    }
+
+    #[test]
+    fn provider_prompt_tokens_become_the_context_anchor() {
+        let (dir, ws) = workspace("anchor");
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::new(
+            cfg,
+            Box::new(GateProvider::new(vec![Response::Text("done".into())])),
+            ToolSet::new(1000),
+            ws,
+        );
+        rt.run_once("hello").unwrap();
+        let (tokens, len) = *rt.inner.anchor.lock().unwrap();
+        assert_eq!(tokens, 1, "GateProvider reports one prompt token");
+        assert_eq!(len, 2, "the anchor covers [System, User]");
     }
 
     #[test]
@@ -2280,6 +2523,49 @@ mod tests {
         handle.join().unwrap_or(());
     }
 
+    /// An abort while a completion is in flight must not leak a queued
+    /// follow-up into history (DAE-112).
+    #[test]
+    fn abort_before_a_queued_follow_up_does_not_leak_it_into_history() {
+        struct Hanging;
+        impl Provider for Hanging {
+            fn complete<'a>(
+                &'a self,
+                _history: &'a [Message],
+                _tools: &'a [serde_json::Value],
+                _effort_params: &'a serde_json::Value,
+                cancel: CancellationToken,
+                _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
+            ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+                Box::pin(async move {
+                    cancel.cancelled().await;
+                    Ok(Completion {
+                        response: Response::Text(String::new()),
+                        prompt_tokens: None,
+                        aborted: true,
+                        reasoning: Vec::new(),
+                    })
+                })
+            }
+        }
+
+        let (rt, mut rx, handle, _ws) = runtime_with("abort-leak", Box::new(Hanging));
+        rt.prompt("first");
+        rt.follow_up("second");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        rt.abort();
+        let (events, settled) = collect_until_settled(&mut rx);
+        assert!(settled, "{events:?}");
+        let h = rt.history();
+        assert!(
+            !h.iter()
+                .any(|m| matches!(m, Message::User(u) if u == "second")),
+            "the queued follow-up leaked into history: {h:?}"
+        );
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
     /// A provider scripted to pause on each call so the test can queue
     /// commands mid-turn deterministically.
     struct PausableProvider {
@@ -2311,6 +2597,7 @@ mod tests {
                     response: Response::Text("done".into()),
                     prompt_tokens: None,
                     aborted: false,
+                    reasoning: Vec::new(),
                 }))
             })
         }
@@ -2328,11 +2615,13 @@ mod tests {
             }]),
             prompt_tokens: None,
             aborted: false,
+            reasoning: Vec::new(),
         });
         completions.push_back(Completion {
             response: Response::Text("steered answer".into()),
             prompt_tokens: None,
             aborted: false,
+            reasoning: Vec::new(),
         });
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -2372,6 +2661,110 @@ mod tests {
         assert!(h
             .iter()
             .any(|m| matches!(m, Message::User(u) if u == "no, do it the other way")));
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn clear_while_busy_aborts_and_resets_instead_of_continuing() {
+        let (dir, ws) = workspace("clear-busy");
+        let mut completions = VecDeque::new();
+        completions.push_back(Completion {
+            response: Response::ToolCalls(vec![ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "true"}),
+            }]),
+            prompt_tokens: None,
+            aborted: false,
+            reasoning: Vec::new(),
+        });
+        completions.push_back(Completion {
+            response: Response::Text("should never run".into()),
+            prompt_tokens: None,
+            aborted: false,
+            reasoning: Vec::new(),
+        });
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider = PausableProvider {
+            completions: Mutex::new(completions),
+            release_rx: Mutex::new(release_rx),
+            started_tx,
+        };
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone());
+        let worker = rt.clone();
+        let handle = std::thread::spawn(move || worker.run_forever());
+
+        rt.prompt("long task");
+        let _ = started_rx.recv_timeout(std::time::Duration::from_secs(5));
+        rt.clear();
+        // Let call 1 return its tool call; the clear is then drained and must
+        // abort the turn rather than continue with a history that no longer
+        // has the user message.
+        let _ = release_tx.send(());
+        let (events, settled) = collect_until_settled(&mut rx);
+        assert!(settled, "must settle: {events:?}");
+        let interrupted = events.iter().find_map(|e| match e {
+            Event::AgentSettled { interrupted, .. } => Some(*interrupted),
+            _ => None,
+        });
+        assert_eq!(interrupted, Some(true));
+        let h = rt.history();
+        assert!(
+            matches!(h.as_slice(), [Message::System(_)]),
+            "clear must leave only the seed, got {h:?}"
+        );
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    #[test]
+    fn replace_history_while_busy_applies_after_the_turn_settles() {
+        let (dir, ws) = workspace("resume-busy");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let provider = PausableProvider {
+            completions: Mutex::new(VecDeque::from([Completion {
+                response: Response::Text("first".into()),
+                prompt_tokens: None,
+                aborted: false,
+                reasoning: Vec::new(),
+            }])),
+            release_rx: Mutex::new(release_rx),
+            started_tx,
+        };
+        let tools = ToolSet::new(1000);
+        let cfg = Config {
+            max_iterations: 10,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(provider), tools, ws.clone());
+        let worker = rt.clone();
+        let handle = std::thread::spawn(move || worker.run_forever());
+
+        rt.prompt("first question");
+        let _ = started_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let resumed = vec![
+            Message::System("resumed seed".into()),
+            Message::User("resumed question".into()),
+        ];
+        rt.replace_history(resumed.clone());
+        let _ = release_tx.send(());
+        let (events, settled) = collect_until_settled(&mut rx);
+        assert!(settled, "must settle: {events:?}");
+        assert_eq!(
+            rt.history(),
+            resumed,
+            "the queued resume must win over the turn's snapshot"
+        );
         rt.shutdown();
         handle.join().unwrap_or(());
     }
@@ -2432,6 +2825,7 @@ mod tests {
                     response: Response::Text("partial story".into()),
                     prompt_tokens: None,
                     aborted: true,
+                    reasoning: Vec::new(),
                 })
             })
         }
@@ -2506,6 +2900,7 @@ mod parallel_tests {
                     response,
                     prompt_tokens: None,
                     aborted: false,
+                    reasoning: Vec::new(),
                 })
             })
         }
@@ -2550,6 +2945,7 @@ mod compaction_tests {
             Message::Assistant {
                 text: Some("a".repeat(5000)),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
             Message::User("second question".into()),
         ];
@@ -2583,6 +2979,7 @@ mod compaction_tests {
             Message::Assistant {
                 text: Some("x".repeat(300)),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ];
         let mut a0 = 0usize;
@@ -2655,6 +3052,7 @@ mod effort_tests {
                     response: Response::Text("done".into()),
                     prompt_tokens: None,
                     aborted: false,
+                    reasoning: Vec::new(),
                 })
             })
         }
@@ -2730,6 +3128,95 @@ mod effort_tests {
             seen[0],
             serde_json::json!({ "reasoning_effort": "high" }),
             "the configured effort must be sent, not the Medium default"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+    use crate::provider::{Completion, ProviderError, ReasoningBlock, ReasoningPart, ToolCall};
+    use std::sync::Mutex as StdMutex;
+
+    struct ReasoningShared {
+        histories: StdMutex<Vec<Vec<Message>>>,
+        step: StdMutex<usize>,
+    }
+
+    struct ReasoningProvider {
+        shared: Arc<ReasoningShared>,
+    }
+
+    impl Provider for ReasoningProvider {
+        fn complete<'a>(
+            &'a self,
+            history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: CancellationToken,
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                self.shared.histories.lock().unwrap().push(history.to_vec());
+                let mut step = self.shared.step.lock().unwrap();
+                let reasoning = vec![ReasoningBlock {
+                    id: None,
+                    content: vec![ReasoningPart::Text {
+                        text: "think".into(),
+                        signature: Some("sig".into()),
+                    }],
+                }];
+                let response = if *step == 0 {
+                    Response::ToolCalls(vec![ToolCall {
+                        id: "c1".into(),
+                        name: "bash".into(),
+                        args: serde_json::json!({"command": "echo hi"}),
+                    }])
+                } else {
+                    Response::Text("done".into())
+                };
+                *step += 1;
+                Ok(Completion {
+                    response,
+                    prompt_tokens: None,
+                    aborted: false,
+                    reasoning,
+                })
+            })
+        }
+    }
+
+    /// A signed reasoning block returned with a tool call is stored on the
+    /// assistant message and therefore present in the next request's history
+    /// (DAE-103: Anthropic/DeepSeek reject a tool loop without it).
+    #[test]
+    fn reasoning_is_stored_and_replayed_on_the_next_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = Workspace::new(dir.path().to_path_buf()).unwrap();
+        let cfg = Config {
+            max_iterations: 5,
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let shared = Arc::new(ReasoningShared {
+            histories: StdMutex::new(Vec::new()),
+            step: StdMutex::new(0),
+        });
+        let provider = ReasoningProvider {
+            shared: Arc::clone(&shared),
+        };
+        let (rt, _rx) = AgentRuntime::new(cfg, Box::new(provider), ToolSet::new(1000), workspace);
+        rt.run_once("task").unwrap();
+
+        let histories = shared.histories.lock().unwrap();
+        assert_eq!(histories.len(), 2, "tool step then final step");
+        assert!(
+            histories[1].iter().any(|m| matches!(
+                m,
+                Message::Assistant { reasoning, .. } if !reasoning.is_empty()
+            )),
+            "the reasoning block must be replayed: {:?}",
+            histories[1]
         );
     }
 }

@@ -198,8 +198,9 @@ fn run(cli: Cli) -> Result<i32, String> {
             let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
+            let root = session::default_root();
             let mut stdout = std::io::stdout();
-            modes::run_json(&rt, &mut rx, &cli.prompt(), &mut stdout)
+            modes::run_json(&rt, &mut rx, &root, &cli.prompt(), &mut stdout)
         }
         Some(Mode::Rpc) => {
             let (rt, mut rx) = AgentRuntime::new(config, provider, tools, workspace);
@@ -248,11 +249,17 @@ fn prune_old_sessions(config: &Config, session_root: &Path, workspace: &Path) {
     }
 }
 
-/// Persist the current session history to disk (auto-save on exit).
-/// Failures are warnings only — quitting must never be blocked by persistence.
-/// (removed the auto-reflection that used to follow the save.)
-fn auto_save(rt: &AgentRuntime, root: &Path) {
-    match session::save_session(root, &rt.workspace_root(), &rt.history()) {
+/// Persist the current session history to disk. Safe to call repeatedly: the
+/// saver reuses the session file it created, rewriting it atomically, so
+/// calling this on every settled turn means a crash or disconnect loses at
+/// most the in-flight turn. Failures are warnings only — quitting must never
+/// be blocked by persistence.
+fn auto_save(rt: &AgentRuntime, root: &Path, saver: &mut session::SessionSaver) {
+    let history = rt.history();
+    if !session::has_conversation(&history) {
+        return;
+    }
+    match saver.save(root, &rt.workspace_root(), &history) {
         Ok(path) => {
             eprintln!("session saved: {}", path.display());
         }
@@ -279,9 +286,7 @@ fn main() {
 /// conversation actually produced output.
 #[cfg(test)]
 fn has_conversation(history: &[daedalus_core::provider::Message]) -> bool {
-    history
-        .iter()
-        .any(|m| matches!(m, daedalus_core::provider::Message::Assistant { .. }))
+    daedalus_core::session::has_conversation(history)
 }
 
 #[cfg(test)]
@@ -319,6 +324,7 @@ mod tests {
                     response: Response::Text("done".into()),
                     prompt_tokens: None,
                     aborted: false,
+                    reasoning: Vec::new(),
                 })
             })
         }

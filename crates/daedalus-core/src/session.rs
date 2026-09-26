@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{Message, ToolCall};
+use crate::provider::{Message, ReasoningBlock, ToolCall};
 
 /// The on-disk format version stored in every header line. Bump when the
 /// entry schema changes; loaders refuse files with a different version.
@@ -79,6 +79,9 @@ enum Entry {
     Assistant {
         text: Option<String>,
         tool_calls: Vec<ToolCall>,
+        // Old session files predate reasoning capture; default to empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reasoning: Vec<ReasoningBlock>,
     },
     ToolResult {
         tool_call_id: String,
@@ -90,9 +93,14 @@ fn entry_from_message(m: &Message) -> Entry {
     match m {
         Message::System(text) => Entry::System { text: text.clone() },
         Message::User(text) => Entry::User { text: text.clone() },
-        Message::Assistant { text, tool_calls } => Entry::Assistant {
+        Message::Assistant {
+            text,
+            tool_calls,
+            reasoning,
+        } => Entry::Assistant {
             text: text.clone(),
             tool_calls: tool_calls.clone(),
+            reasoning: reasoning.clone(),
         },
         Message::ToolResult {
             tool_call_id,
@@ -108,7 +116,15 @@ fn message_from_entry(entry: Entry) -> Message {
     match entry {
         Entry::System { text } => Message::System(text),
         Entry::User { text } => Message::User(text),
-        Entry::Assistant { text, tool_calls } => Message::Assistant { text, tool_calls },
+        Entry::Assistant {
+            text,
+            tool_calls,
+            reasoning,
+        } => Message::Assistant {
+            text,
+            tool_calls,
+            reasoning,
+        },
         Entry::ToolResult {
             tool_call_id,
             result,
@@ -286,6 +302,14 @@ fn load_file(path: &Path) -> Result<Vec<Message>, SessionError> {
     Ok(messages)
 }
 
+/// True when `history` contains at least one assistant message: the minimum
+/// for a session worth persisting.
+pub fn has_conversation(history: &[Message]) -> bool {
+    history
+        .iter()
+        .any(|m| matches!(m, Message::Assistant { .. }))
+}
+
 /// The default sessions root: `~/.local/share/daedalus/sessions`.
 pub fn default_root() -> PathBuf {
     crate::paths::data_dir().join("sessions")
@@ -309,6 +333,12 @@ pub fn save_session(root: &Path, cwd: &Path, history: &[Message]) -> Result<Path
         parent_session_id: None,
     };
 
+    write_file_atomic(&path, &render_session(&header, history)?)?;
+    Ok(path)
+}
+
+/// Render a complete session file: the header line then one line per message.
+fn render_session(header: &Entry, history: &[Message]) -> Result<String, SessionError> {
     let mut out = String::new();
     let push = |entry: &Entry, out: &mut String| -> Result<(), SessionError> {
         let line = serde_json::to_string(entry).map_err(|e| SessionError::Serde(e.to_string()))?;
@@ -316,12 +346,82 @@ pub fn save_session(root: &Path, cwd: &Path, history: &[Message]) -> Result<Path
         out.push('\n');
         Ok(())
     };
-    push(&header, &mut out)?;
+    push(header, &mut out)?;
     for message in history {
         push(&entry_from_message(message), &mut out)?;
     }
-    write_file_atomic(&path, &out)?;
-    Ok(path)
+    Ok(out)
+}
+
+/// Incremental session persistence for one conversation. The first save creates
+/// a session file; later saves rewrite that same file atomically, so a crash,
+/// SIGHUP or client disconnect loses at most the in-flight turn while
+/// `/resume` still lists exactly one session. A change of `cwd` (workspace
+/// switch) starts a new session file.
+#[derive(Debug, Default)]
+pub struct SessionSaver {
+    path: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    header: Option<Entry>,
+}
+
+impl SessionSaver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The file this saver has written, if any.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    /// Persist `history`, reusing the file created by an earlier call for the
+    /// same `cwd`. Callers should gate on [`has_conversation`] so an aborted
+    /// turn that produced nothing does not create an empty session.
+    pub fn save(
+        &mut self,
+        root: &Path,
+        cwd: &Path,
+        history: &[Message],
+    ) -> Result<PathBuf, SessionError> {
+        let reuse = self
+            .path
+            .as_ref()
+            .filter(|_| self.cwd.as_deref() == Some(cwd));
+        match (reuse, self.header.as_ref()) {
+            (Some(path), Some(header)) => {
+                write_file_atomic(path, &render_session(header, history)?)?;
+                Ok(path.clone())
+            }
+            _ => {
+                let dir = session_dir(root, cwd);
+                std::fs::create_dir_all(&dir).map_err(SessionError::Io)?;
+                let created_at = now_millis();
+                let id = new_id(created_at);
+                let path = dir.join(format!("{created_at}_{id}.jsonl"));
+                let header = Entry::Header {
+                    version: FORMAT_VERSION,
+                    id,
+                    created_at,
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    parent_session_id: None,
+                };
+                write_file_atomic(&path, &render_session(&header, history)?)?;
+                self.path = Some(path.clone());
+                self.cwd = Some(cwd.to_path_buf());
+                self.header = Some(header);
+                Ok(path)
+            }
+        }
+    }
+
+    /// Forget the current file so the next save starts a new session (used
+    /// after `/clear` when the caller wants a fresh session on disk).
+    pub fn reset(&mut self) {
+        self.path = None;
+        self.cwd = None;
+        self.header = None;
+    }
 }
 
 /// Load the most recent session for `cwd`, or `None` when there is no saved
@@ -557,6 +657,13 @@ mod tests {
                     name: "bash".into(),
                     args: serde_json::json!({"command": "echo hi"}),
                 }],
+                reasoning: vec![ReasoningBlock {
+                    id: None,
+                    content: vec![crate::provider::ReasoningPart::Text {
+                        text: "think".into(),
+                        signature: Some("sig".into()),
+                    }],
+                }],
             },
             Message::ToolResult {
                 tool_call_id: "c1".into(),
@@ -565,6 +672,7 @@ mod tests {
             Message::Assistant {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ]
     }
@@ -578,6 +686,31 @@ mod tests {
             load_previous(&root, &cwd()).unwrap().unwrap(),
             sample_history()
         );
+    }
+
+    #[test]
+    fn session_saver_rewrites_one_file_across_saves() {
+        let (_guard, root) = tempdir("saver");
+        let mut saver = SessionSaver::new();
+        let first = sample_history();
+        let path = saver.save(&root, &cwd(), &first).unwrap();
+
+        let mut second = first.clone();
+        second.push(Message::User("another turn".into()));
+        let path_again = saver.save(&root, &cwd(), &second).unwrap();
+
+        assert_eq!(path, path_again, "later saves must reuse the session file");
+        assert_eq!(
+            list_sessions(&root, &cwd()).unwrap().len(),
+            1,
+            "incremental saves must not create duplicate sessions"
+        );
+        assert_eq!(load_previous(&root, &cwd()).unwrap().unwrap(), second);
+
+        // A different working directory starts a new session file.
+        let other = PathBuf::from("/tmp/other-project");
+        let other_path = saver.save(&root, &other, &second).unwrap();
+        assert_ne!(path, other_path);
     }
 
     #[test]

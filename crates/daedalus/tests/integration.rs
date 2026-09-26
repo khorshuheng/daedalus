@@ -323,6 +323,7 @@ fn usage_event_carries_provider_reported_prompt_tokens() {
                     response: Response::Text("done".into()),
                     prompt_tokens: Some(4321),
                     aborted: false,
+                    reasoning: Vec::new(),
                 })
             })
         }

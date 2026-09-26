@@ -27,6 +27,16 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 
 use daedalus_core::runtime::{AgentRuntime, Command, CommandKind, ErrorKind, Event};
+use daedalus_core::session::{self, SessionSaver};
+
+/// Persist the runtime's current history through `saver` when there is a
+/// conversation worth keeping. Best-effort: a failure must never break a turn.
+fn persist(rt: &AgentRuntime, root: &Path, saver: &mut SessionSaver) {
+    let history = rt.history();
+    if session::has_conversation(&history) {
+        let _ = saver.save(root, &rt.workspace_root(), &history);
+    }
+}
 
 /// The runtime's event receiver type (tokio unbounded channel).
 type EventRx = tokio::sync::mpsc::UnboundedReceiver<Event>;
@@ -121,11 +131,15 @@ impl Mode {
 pub fn run_json(
     rt: &AgentRuntime,
     rx: &mut EventRx,
+    root: &Path,
     prompt: &str,
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     rt.prompt(prompt);
     let outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+    // Persist the completed turn so `--mode json` sessions are resumable too.
+    let mut saver = SessionSaver::new();
+    persist(rt, root, &mut saver);
     Ok(if outcome.errored {
         exit_code_for(&outcome)
     } else {
@@ -200,6 +214,7 @@ pub fn run_rpc(
     });
 
     let mut exit = 0i32;
+    let mut saver = SessionSaver::new();
     loop {
         let command = match cmd_rx.recv() {
             Ok(Ok(command)) => command,
@@ -213,19 +228,24 @@ pub fn run_rpc(
             CommandKind::Prompt { text } => {
                 rt.prompt(text);
                 outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                persist(rt, root, &mut saver);
             }
             CommandKind::Steer { text } => {
                 // Arrived while idle: it starts a turn.
                 rt.steer(text);
                 outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                persist(rt, root, &mut saver);
             }
             CommandKind::FollowUp { text } => {
                 rt.follow_up(text);
                 outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                persist(rt, root, &mut saver);
             }
             CommandKind::Abort {} => {
                 rt.abort();
                 outcome = drain_until_quiet(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                // Keep whatever partial progress the aborted turn made.
+                persist(rt, root, &mut saver);
             }
             CommandKind::SetModel { model } => {
                 rt.set_model(model);
@@ -438,7 +458,7 @@ mod tests {
         let (tmp, _root, rt, mut rx, handle, _ws) =
             setup("json", vec![Response::Text("hello world".into())]);
         let mut out = Vec::new();
-        let code = run_json(&rt, &mut rx, "greet", &mut out).unwrap();
+        let code = run_json(&rt, &mut rx, &_root, "greet", &mut out).unwrap();
         assert_eq!(code, 0);
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text
@@ -525,6 +545,7 @@ mod tests {
             Message::Assistant {
                 text: Some("a1".into()),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ];
         session::save_session(&root, ws.root(), &prior).unwrap();
@@ -643,7 +664,7 @@ mod tests {
         }]);
         let (tmp, _root, rt, mut rx, handle, _ws) = setup_with("json-cap", vec![tool_call; 3], 2);
         let mut out = Vec::new();
-        let code = run_json(&rt, &mut rx, "loop forever", &mut out).unwrap();
+        let code = run_json(&rt, &mut rx, &_root, "loop forever", &mut out).unwrap();
         assert_eq!(code, 2, "the cap must not look like success");
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<serde_json::Value> = text

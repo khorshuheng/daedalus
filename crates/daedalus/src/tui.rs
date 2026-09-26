@@ -291,6 +291,20 @@ pub struct TranscriptScroll {
     viewport: usize,
 }
 
+/// Cached, wrapped-transcript geometry for one (revision, width). `heights[i]`
+/// is the number of visual rows logical line `i` wraps to, so the total height
+/// (which can exceed `u16::MAX`) and the mapping from a scroll row back to a
+/// logical line are both direct lookups. Rendering then clones and wraps only
+/// the visible slice instead of the whole transcript each frame.
+#[derive(Debug, Clone)]
+pub struct TranscriptCache {
+    revision: u64,
+    width: u16,
+    lines: Vec<TLine<'static>>,
+    heights: Vec<usize>,
+    total: usize,
+}
+
 impl Default for TranscriptScroll {
     fn default() -> Self {
         Self {
@@ -392,7 +406,7 @@ pub struct UiModel {
     /// Bumped whenever the transcript changes, to key the render cache.
     pub revision: u64,
     /// Cache of the rendered transcript, keyed by (revision, area width).
-    pub md_cache: Option<(u64, u16, Vec<ratatui::text::Line<'static>>)>,
+    pub md_cache: Option<TranscriptCache>,
     /// Active slash-command completion, if any.
     pub completion: Option<Completion>,
     /// True while a `/model` model-list fetch is in flight.
@@ -581,7 +595,9 @@ impl UiModel {
                 Message::User(text) => {
                     self.transcript.push(TranscriptLine::User(text.clone()));
                 }
-                Message::Assistant { text, tool_calls } => {
+                Message::Assistant {
+                    text, tool_calls, ..
+                } => {
                     for call in tool_calls {
                         names.insert(call.id.as_str(), call.name.as_str());
                     }
@@ -1070,6 +1086,10 @@ pub fn run_tui(
     let mut picker: Option<Picker> = None;
     let mut login_pending = false;
     let mut should_exit = false;
+    // Persist after every settled turn, so a crash, SIGHUP or kill loses at
+    // most the in-flight turn instead of the whole session. Declared outside
+    // the run closure so the final save after terminal restore can reuse it.
+    let mut session_saver = daedalus_core::session::SessionSaver::new();
 
     let result = (|| -> Result<i32, String> {
         // One-time editing-key hint so the line editor is discoverable.
@@ -1084,12 +1104,17 @@ pub fn run_tui(
 
         let clock = Instant::now();
         let mut last_render = Instant::now();
+        // Only redraw when something actually changed; an idle session must not
+        // burn CPU re-wrapping the transcript every frame.
+        let mut dirty = true;
         loop {
             if should_exit {
                 break;
             }
             // Drain runtime events into the model.
+            let mut got_event = false;
             while let Ok(ev) = rx.try_recv() {
+                got_event = true;
                 // A pending `/model` fetch resolves into the model picker, or a
                 // notice explaining why it failed.
                 if model.model_fetch_pending {
@@ -1123,16 +1148,26 @@ pub fn run_tui(
                     }
                 }
                 let state_changed = matches!(ev, Event::StateChanged { .. });
+                let settled = matches!(ev, Event::AgentSettled { .. });
                 model.apply_event(&ev);
                 if state_changed {
                     model.state = rt.state();
                     remember_choice(&mut model, &mut remembered);
                 }
+                if settled {
+                    crate::auto_save(rt, session_root, &mut session_saver);
+                }
             }
-            // Render at ~30fps (also drives the busy spinner).
-            if last_render.elapsed() >= Duration::from_millis(33) {
+            if got_event {
+                dirty = true;
+            }
+            // Redraw when dirty; while busy the spinner still needs periodic
+            // frames even if no event arrived.
+            let busy = rt.is_busy();
+            let due = dirty || (busy && last_render.elapsed() >= Duration::from_millis(100));
+            if due {
                 let provider = rt.provider_kind();
-                let spinner = if rt.is_busy() {
+                let spinner = if busy {
                     spinner_frame(clock.elapsed())
                 } else {
                     ' '
@@ -1151,9 +1186,11 @@ pub fn run_tui(
                     })
                     .map_err(|e| e.to_string())?;
                 last_render = Instant::now();
+                dirty = false;
             }
             // Poll for a key (short timeout keeps the spinner/event drain live).
             if event::poll(Duration::from_millis(33)).map_err(|e| e.to_string())? {
+                dirty = true;
                 match event::read().map_err(|e| e.to_string())? {
                     TermEvent::Key(key) if key.kind == KeyEventKind::Press => {
                         // Ctrl-Y copies the transcript selection via OSC 52.
@@ -1240,7 +1277,7 @@ pub fn run_tui(
     // Auto-save at session end *after* the terminal is restored,
     // so its stderr output lands on the normal screen. Failures are warnings
     // only — quitting must never be blocked by persistence.
-    crate::auto_save(rt, session_root);
+    crate::auto_save(rt, session_root, &mut session_saver);
     rt.shutdown();
     result
 }
@@ -1560,15 +1597,25 @@ fn run_command(
             );
         }
         SlashCommand::Clear => {
-            rt.clear();
-            model.transcript.clear();
-            model.push_notice("conversation cleared");
+            if rt.is_busy() {
+                // Resetting mid-stream would leave the runtime and the
+                // transcript out of step; make the user abort first.
+                model.push_notice("cannot clear while a turn is running; abort first (Esc)");
+            } else {
+                rt.clear();
+                model.transcript.clear();
+                model.push_notice("conversation cleared");
+            }
         }
         SlashCommand::Exit => {
             // Auto-save happens in run_tui after the loop exits.
             return true;
         }
         SlashCommand::Resume => {
+            if rt.is_busy() {
+                model.push_notice("cannot resume while a turn is running; abort first (Esc)");
+                return false;
+            }
             // List every session for this cwd and let the user pick one, like
             // pi's resume picker. Titles are derived
             // from the first user message; sessions store no name of their own.
@@ -1633,8 +1680,14 @@ fn run_command(
             }
         }
         SlashCommand::Workspace(path) => {
-            rt.switch_workspace(&path.to_string_lossy());
-            model.state.workspace = path.to_string_lossy().into_owned();
+            if rt.is_busy() {
+                model.push_notice(
+                    "cannot switch workspace while a turn is running; abort first (Esc)",
+                );
+            } else {
+                rt.switch_workspace(&path.to_string_lossy());
+                model.state.workspace = path.to_string_lossy().into_owned();
+            }
         }
         SlashCommand::Skills => {
             let skills = rt.skills();
@@ -1878,6 +1931,44 @@ fn thinking_line(text: &str, theme: &Theme) -> TLine<'static> {
     ))
 }
 
+/// Select the logical lines covering visual rows `[top, top + viewport)` from
+/// the concatenation of the cached transcript and the live tail, plus the row
+/// offset within the first selected line. Clones only the visible slice.
+fn visible_transcript(
+    cached: &[TLine<'static>],
+    cached_heights: &[usize],
+    live: &[TLine<'static>],
+    live_heights: &[usize],
+    top: usize,
+    viewport: usize,
+) -> (Vec<TLine<'static>>, usize) {
+    let mut out: Vec<TLine<'static>> = Vec::new();
+    let mut offset = 0usize;
+    let mut skip = top;
+    let mut started = false;
+    let mut covered = 0usize;
+    for (line, &height) in cached
+        .iter()
+        .zip(cached_heights)
+        .chain(live.iter().zip(live_heights))
+    {
+        if !started {
+            if skip >= height {
+                skip -= height;
+                continue;
+            }
+            offset = skip;
+            started = true;
+        }
+        out.push(line.clone());
+        covered += height;
+        if covered >= offset + viewport {
+            break;
+        }
+    }
+    (out, offset)
+}
+
 /// Render a frame: transcript on top, input editor (with a visible caret) at
 /// the bottom, footer with an animated spinner while busy. The model/effort
 /// picker renders as a centered overlay sized to its choices.
@@ -1913,32 +2004,74 @@ fn draw(
     // Transcript: markdown-rendered and cached by (revision, width), plus the
     // live streaming answer as a trailing block.
     let inner_w = chunks[0].width.saturating_sub(2);
-    if !matches!(&model.md_cache, Some((r, w, _)) if *r == model.revision && *w == chunks[0].width)
+    if !matches!(&model.md_cache, Some(c) if c.revision == model.revision && c.width == chunks[0].width)
     {
         let rendered = transcript_lines(&model.transcript, theme, inner_w, model.verbose);
-        model.md_cache = Some((model.revision, chunks[0].width, rendered));
+        // Precompute each logical line's wrapped height once per revision/width
+        // so the total (which can exceed u16::MAX) and the visible slice are
+        // direct lookups instead of a full re-wrap every frame.
+        let heights: Vec<usize> = rendered
+            .iter()
+            .map(|line| {
+                Paragraph::new(vec![line.clone()])
+                    .wrap(Wrap { trim: false })
+                    .line_count(inner_w)
+            })
+            .collect();
+        let total = heights.iter().sum();
+        model.md_cache = Some(TranscriptCache {
+            revision: model.revision,
+            width: chunks[0].width,
+            lines: rendered,
+            heights,
+            total,
+        });
     }
-    let mut lines: Vec<TLine> = model.md_cache.as_ref().unwrap().2.clone();
+
     // Live reasoning streams as a trailing block until `flush_thinking` moves
     // it into the transcript (on the first text/tool delta or turn end).
     // Rendering it here keeps a long reasoning phase from looking like a
-    // frozen spinner.
+    // frozen spinner. The unfinished answer is re-parsed as markdown, but that
+    // is bounded by the current answer, not the whole session.
+    let mut live: Vec<TLine> = Vec::new();
     if !model.thinking_buf.is_empty() {
         for line in model.thinking_buf.lines() {
-            lines.push(thinking_line(line, theme));
+            live.push(thinking_line(line, theme));
         }
     }
     if !model.assistant_buf.is_empty() {
-        lines.extend(crate::markdown::render(
+        live.extend(crate::markdown::render(
             &model.assistant_buf,
             inner_w,
             &markdown_style(theme),
         ));
     }
-    // `line_count` returns the wrapped height including the block's border
-    // rows, so the full chunk height is the matching viewport. Scrolling by the
-    // logical line count instead left the newest (wrapped) lines off-screen.
-    let transcript = Paragraph::new(lines)
+    let live_heights: Vec<usize> = live
+        .iter()
+        .map(|line| {
+            Paragraph::new(vec![line.clone()])
+                .wrap(Wrap { trim: false })
+                .line_count(inner_w)
+        })
+        .collect();
+    let cache = model.md_cache.as_ref().expect("cache populated above");
+    let total = cache.total + live_heights.iter().sum::<usize>();
+    // The block's top/bottom borders are not content rows, so the scroll
+    // viewport is the inner height.
+    let viewport = chunks[0].height.saturating_sub(2) as usize;
+    let top = model.scroll.resolve(total, viewport);
+    let (visible, offset) = visible_transcript(
+        &cache.lines,
+        &cache.heights,
+        &live,
+        &live_heights,
+        top,
+        viewport,
+    );
+    // Render only the visible logical lines, starting at `offset` rows into the
+    // first. This keeps `scroll` at (a bounded) u16 and avoids the u16::MAX cap
+    // on the total transcript height.
+    let transcript = Paragraph::new(visible)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1947,9 +2080,7 @@ fn draw(
                 .title_style(style(theme.token(Token::Title))),
         )
         .wrap(Wrap { trim: false });
-    let total = transcript.line_count(inner_w);
-    let top = model.scroll.resolve(total, chunks[0].height as usize);
-    let transcript = transcript.scroll(((top.min(u16::MAX as usize)) as u16, 0));
+    let transcript = transcript.scroll((offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(transcript, chunks[0]);
 
     // Remember the transcript viewport for mouse selection, then paint the
@@ -2331,6 +2462,47 @@ mod tests {
 
     fn ctrl_c() -> (KeyCode, KeyModifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    /// The visible-slice selector must reach rows past the old `u16::MAX` cap
+    /// (DAE-110) and clone only the window (DAE-113).
+    #[test]
+    fn visible_transcript_reaches_past_u16_max() {
+        let lines: Vec<TLine> = (0..100_000)
+            .map(|i| TLine::from(format!("line {i}")))
+            .collect();
+        let heights = vec![1usize; lines.len()];
+        let live: Vec<TLine> = Vec::new();
+        let top = u16::MAX as usize + 10;
+        let (visible, offset) = visible_transcript(&lines, &heights, &live, &[], top, 5);
+        assert_eq!(offset, 0);
+        assert_eq!(visible.len(), 5);
+        assert_eq!(visible[0].spans[0].content, format!("line {top}"));
+    }
+
+    /// A scroll position inside a wrapped logical line offsets into it and
+    /// carries the following lines needed to fill the viewport.
+    #[test]
+    fn visible_transcript_offsets_into_a_wrapped_line() {
+        let lines = vec![TLine::from("a"), TLine::from("b")];
+        let heights = vec![3usize, 1];
+        let (visible, offset) = visible_transcript(&lines, &heights, &[], &[], 1, 3);
+        assert_eq!(offset, 1);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].spans[0].content, "a");
+        assert_eq!(visible[1].spans[0].content, "b");
+    }
+
+    /// The live tail is appended after the cached transcript when scrolling
+    /// reaches it.
+    #[test]
+    fn visible_transcript_includes_the_live_tail() {
+        let cached = vec![TLine::from("cached")];
+        let live = vec![TLine::from("live")];
+        let (visible, offset) = visible_transcript(&cached, &[1], &live, &[1], 1, 3);
+        assert_eq!(offset, 0);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].spans[0].content, "live");
     }
 
     #[test]
@@ -3356,6 +3528,7 @@ mod tests {
                     name: "bash".into(),
                     args: serde_json::json!({"command": "echo hi"}),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 tool_call_id: "c1".into(),
@@ -3364,6 +3537,7 @@ mod tests {
             Message::Assistant {
                 text: Some("done".into()),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ]);
         // The system prompt is not shown; user/assistant text and the resumed
@@ -3395,6 +3569,7 @@ mod tests {
                     name: "bash".into(),
                     args: serde_json::json!({}),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 tool_call_id: "c1".into(),
@@ -3435,6 +3610,7 @@ mod tests {
                     name: "bash".into(),
                     args: serde_json::json!({}),
                 }],
+                reasoning: vec![],
             },
             Message::ToolResult {
                 tool_call_id: "c1".into(),
@@ -3475,6 +3651,7 @@ mod tests {
             Message::Assistant {
                 text: Some("first answer".into()),
                 tool_calls: vec![],
+                reasoning: vec![],
             },
         ];
         daedalus_core::session::save_session(root.path(), &cwd, &history).unwrap();
