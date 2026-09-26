@@ -173,6 +173,20 @@ async fn session_loop(
     let handle = std::thread::spawn(move || worker.run_forever());
     rt.get_state(); // emit the initial state_changed
 
+    // Outbound frames go through a bounded queue drained by a writer task. A
+    // slow client therefore cannot make the runtime's event channel grow
+    // without limit: once the queue is full the client is dropped.
+    const OUTBOUND_CAPACITY: usize = 256;
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(OUTBOUND_CAPACITY);
+    let writer = tokio::spawn(async move {
+        while let Some(message) = out_rx.recv().await {
+            if sink.send(message).await.is_err() {
+                break;
+            }
+        }
+        let _ = sink.close().await;
+    });
+
     // Persist after every settled turn and again on disconnect (see below); a
     // long server session is no longer lost when the client goes away.
     let mut saver = session::SessionSaver::new();
@@ -184,7 +198,9 @@ async fn session_loop(
                 let text = serde_json::to_string(&event).unwrap_or_else(|e| {
                     format!("{{\"type\":\"error\",\"message\":\"serialize: {e}\"}}")
                 });
-                if sink.send(Message::Text(text.into())).await.is_err() {
+                if out_tx.try_send(Message::Text(text.into())).is_err() {
+                    // The writer is gone or the client is too far behind; drop
+                    // it rather than buffer without bound.
                     break;
                 }
                 if settled {
@@ -205,9 +221,8 @@ async fn session_loop(
                                     "id": id,
                                     "ok": true
                                 });
-                                if sink
-                                    .send(Message::Text(response.to_string().into()))
-                                    .await
+                                if out_tx
+                                    .try_send(Message::Text(response.to_string().into()))
                                     .is_err()
                                 {
                                     break;
@@ -220,7 +235,7 @@ async fn session_loop(
                                     kind: None,
                                 };
                                 let json = serde_json::to_string(&event).unwrap();
-                                if sink.send(Message::Text(json.into())).await.is_err() {
+                                if out_tx.try_send(Message::Text(json.into())).is_err() {
                                     break;
                                 }
                             }
@@ -233,6 +248,10 @@ async fn session_loop(
             }
         }
     }
+
+    // Let the writer flush whatever is queued for a moment, then stop it.
+    drop(out_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), writer).await;
 
     // Abort first: a disconnect mid-turn would otherwise leave `shutdown`
     // waiting for the turn to settle.
