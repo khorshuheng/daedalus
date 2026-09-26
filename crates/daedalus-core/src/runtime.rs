@@ -358,6 +358,10 @@ pub struct RuntimeState {
     pub effort: Effort,
     pub workspace: String,
     pub busy: bool,
+    /// Token budget for the conversation history: the denominator a frontend
+    /// uses for its context-usage percentage. `0` when unknown.
+    #[serde(default)]
+    pub max_context_tokens: usize,
 }
 
 /// Classify a provider failure for `Event::Error.kind`, so frontends can react
@@ -542,6 +546,7 @@ impl AgentRuntime {
         let provider_info = config.provider;
         let provider_config = config.clone();
         let effort = config.effort;
+        let max_context_tokens = config.max_context_tokens;
         let ws_path = workspace.root().to_string_lossy().into_owned();
         let runtime = AgentRuntime {
             inner: Arc::new(Inner {
@@ -557,6 +562,7 @@ impl AgentRuntime {
                     effort,
                     workspace: ws_path,
                     busy: false,
+                    max_context_tokens,
                 }),
                 cancel: Mutex::new(CancellationToken::new()),
                 interactive: AtomicBool::new(false),
