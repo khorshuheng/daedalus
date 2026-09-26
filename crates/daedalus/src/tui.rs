@@ -383,7 +383,6 @@ pub struct UiModel {
     pub thinking_buf: String,
     pub state: RuntimeState,
     pub usage: Option<usize>,
-    pub iterations: usize,
     /// Transcript scrollback (follow the tail unless the user scrolled up).
     pub scroll: TranscriptScroll,
     /// Global tool-output expansion (Ctrl+O). When false, tool
@@ -419,7 +418,6 @@ impl UiModel {
             thinking_buf: String::new(),
             state,
             usage: None,
-            iterations: 0,
             scroll: TranscriptScroll::default(),
             verbose: false,
             revision: 0,
@@ -439,9 +437,7 @@ impl UiModel {
         let before = self.transcript.len();
         match event {
             Event::AgentStart { .. } => {}
-            Event::TurnStart {} => {
-                self.iterations += 1;
-            }
+            Event::TurnStart {} => {}
             Event::TextDelta { text } => {
                 self.flush_thinking();
                 self.assistant_buf.push_str(text);
@@ -3086,13 +3082,12 @@ mod tests {
     }
 
     #[test]
-    fn iterations_and_usage_are_tracked() {
+    fn usage_is_tracked() {
         let mut m = UiModel::new(state());
         m.apply_event(&Event::TurnStart {});
         m.apply_event(&Event::Usage {
             prompt_tokens: Some(1200),
         });
-        assert_eq!(m.iterations, 1);
         assert_eq!(m.usage, Some(1200));
     }
 
