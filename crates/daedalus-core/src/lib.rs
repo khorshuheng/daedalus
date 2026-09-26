@@ -2,6 +2,7 @@
 //!
 //! The crate is split into these layers:
 //! - `config`/`workspace`: configuration and workspace scoping.
+//! - `catalog`: hand-maintained model context windows for the footer.
 //! - `credential`: API-key resolution (flag > provider env > keyring).
 //! - `instructions`: user-level `APPEND_SYSTEM.md`, appended to the prompt.
 //! - `tools`: the five built-in tools (read, search, bash, edit, write).
@@ -17,6 +18,7 @@
 //! is async (tokio) but stays runtime-agnostic: the worker thread owns its
 //! current-thread runtime, and nothing here uses `#[tokio::main]`.
 
+pub mod catalog;
 pub mod config;
 pub mod credential;
 pub mod instructions;
