@@ -13,6 +13,9 @@ path = "src/lib.rs"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# Surgical config-file edits (remember a model/provider choice) so comments and
+# unrelated keys survive. Already in the tree via toml 0.8, so it costs nothing.
+toml_edit = "0.22"
 # The provider layer moved to rig-core (async); the hand-written
 # HTTP/SSE clients and their MSRV-era pins are gone.
 rig-core = "=0.42.0"

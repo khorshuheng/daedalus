@@ -15,6 +15,7 @@
 //! that provider; adding a provider is one table row, no client code.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -394,12 +395,6 @@ impl PartialConfig {
 impl Config {
     /// Build a `Config` by merging the config `file`, then CLI `flags` over
     /// defaults — `flags > config file > defaults` (the env layer was
-    /// removed). `api_key` is resolved separately by the caller via
-    /// `crate::credential::resolve_api_key` and passed in; the config file
-    /// cannot carry a secret. `default_workspace` is used unless an override
-    /// supplies one.
-    /// Build a `Config` by merging the config `file`, then CLI `flags` over
-    /// defaults — `flags > config file > defaults` (the env layer was
     /// removed). `api_key_flag` feeds the resolution chain
     /// (`--api-key` > provider-native env > keyring); the config file cannot
     /// carry a secret, so an `api_key` key in it is rejected. `default_workspace`
@@ -438,6 +433,105 @@ impl Config {
         let api_key = crate::credential::resolve_api_key(info, api_key_flag);
         merged.resolve(default_workspace, api_key)
     }
+}
+
+/// A partial edit to the on-disk config: only the keys set to `Some` are
+/// written, so a frontend remembers exactly what the user changed and leaves
+/// the rest of the file alone.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ConfigEdit {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl ConfigEdit {
+    /// An edit remembering a chosen model, written to the `model` key.
+    pub fn model(name: impl Into<String>) -> Self {
+        Self {
+            model: Some(name.into()),
+            provider: None,
+        }
+    }
+
+    /// An edit remembering a chosen provider, written to the `provider` key.
+    pub fn provider(name: impl Into<String>) -> Self {
+        Self {
+            provider: Some(name.into()),
+            model: None,
+        }
+    }
+
+    /// True when the edit would change nothing.
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none()
+    }
+}
+
+/// Write `edit`'s keys into the TOML config at `path`, creating the file (and
+/// its parent directory) when it is not there yet.
+///
+/// The edit is surgical: `toml_edit` reparses the existing text and only the
+/// named keys are replaced, so comments, key order, and unrelated tables
+/// (`theme`, `mcp_servers`, …) survive. A key the file does not have is added
+/// to the top-level block, which is always emitted before any `[table]`
+/// header — it cannot be swallowed by a trailing table.
+///
+/// Deliberately **not** written: `base_url`. It is a global override the user
+/// hand-writes (a proxy, a gateway); rewriting it on a provider switch would
+/// silently retarget every later run.
+///
+/// The new text lands in a temporary file in the same directory and is renamed
+/// into place, so an interrupted write cannot truncate a user's config.
+pub fn persist_edit(path: &Path, edit: &ConfigEdit) -> Result<(), String> {
+    if edit.is_empty() {
+        return Ok(());
+    }
+    // Validate before touching the file: a bad value must not rewrite it.
+    if let Some(name) = &edit.provider {
+        provider_by_name(name)?;
+    }
+    if let Some(model) = &edit.model {
+        if model.trim().is_empty() {
+            return Err("refusing to save an empty model".into());
+        }
+    }
+    let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(path) {
+        Ok(text) => text
+            .parse()
+            .map_err(|e| format!("invalid config '{}': {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(e) => return Err(format!("cannot read config '{}': {e}", path.display())),
+    };
+    if let Some(provider) = &edit.provider {
+        // Providers are matched case-insensitively; store the canonical name.
+        set_top_level(&mut doc, "provider", &provider.trim().to_ascii_lowercase());
+    }
+    if let Some(model) = &edit.model {
+        set_top_level(&mut doc, "model", model.trim());
+    }
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create '{}': {e}", dir.display()))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("cannot write next to '{}': {e}", path.display()))?;
+    tmp.write_all(doc.to_string().as_bytes())
+        .map_err(|e| format!("cannot write '{}': {e}", path.display()))?;
+    tmp.persist(path)
+        .map_err(|e| format!("cannot replace '{}': {e}", path.display()))?;
+    Ok(())
+}
+
+/// Set a top-level `key = "value"`. An existing value keeps its own
+/// decorations, so an inline comment (`model = "a" # why`) stays on the line;
+/// a missing key is appended to the top-level block.
+fn set_top_level(doc: &mut toml_edit::DocumentMut, key: &str, value: &str) {
+    let mut new = toml_edit::Value::from(value);
+    if let Some(toml_edit::Item::Value(old)) = doc.get(key) {
+        *new.decor_mut() = old.decor().clone();
+    }
+    doc[key] = toml_edit::Item::Value(new);
 }
 
 #[cfg(test)]
@@ -706,6 +800,139 @@ url = "http://localhost:8000/mcp"
                 .map(PathBuf::as_path),
             Some(Path::new("/home/alice/projects"))
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // persist_edit: remembering a runtime choice in the config file
+    // ------------------------------------------------------------------
+
+    /// A file that exercises the shapes a real config has: leading comments,
+    /// an inline comment, unrelated top-level keys, a table, and an array of
+    /// tables.
+    const EXISTING: &str = r#"# My config.
+model = "old-model"  # keep this comment
+max_iterations = 7
+
+[theme]
+name = "dark"
+
+[[mcp_servers]]
+name = "fs"
+command = "npx"
+"#;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("daedalus-config-persist-{name}"));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn persist_edit_replaces_only_the_named_key() {
+        let dir = tmpdir("replace");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+
+        persist_edit(&path, &ConfigEdit::model("new-model")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("new-model"));
+        assert!(!text.contains("old-model"));
+        // Comments are part of the file the user wrote, not ours to drop.
+        assert!(text.contains("# My config."));
+        assert!(text.contains("# keep this comment"));
+        // Everything unrelated survives, including the tables.
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.model, "new-model");
+        assert_eq!(c.max_iterations, 7);
+        assert_eq!(c.mcp_servers.len(), 1);
+        assert_eq!(c.mcp_servers[0].name, "fs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_adds_a_missing_key_to_the_top_level_block() {
+        let dir = tmpdir("add");
+        let path = dir.join("config.toml");
+        // No top-level key at all — the inserted one must not land inside the
+        // table that happens to be last in the file.
+        std::fs::write(&path, "[theme]\nname = \"dark\"\n").unwrap();
+
+        persist_edit(&path, &ConfigEdit::model("m")).unwrap();
+
+        let raw: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("model").and_then(|v| v.as_str()), Some("m"));
+        assert!(raw.get("theme").is_some(), "the theme table must survive");
+        // The end-to-end proof: it loads, and the theme is still the table's.
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.model, "m");
+        assert_eq!(c.provider.name, "openai");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_writes_the_provider_key_without_touching_a_base_url() {
+        let dir = tmpdir("provider");
+        let path = dir.join("config.toml");
+        // A hand-written gateway: switching provider must not retarget it.
+        std::fs::write(
+            &path,
+            "model = \"m\"\nbase_url = \"http://localhost:9999/v1\"\n",
+        )
+        .unwrap();
+
+        // Names are matched case-insensitively and stored canonically.
+        persist_edit(&path, &ConfigEdit::provider("DeepSeek")).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("provider = \"deepseek\""), "{text}");
+        assert!(text.contains("base_url = \"http://localhost:9999/v1\""));
+        assert!(text.contains("model = \"m\""));
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.provider.name, "deepseek");
+        assert_eq!(c.base_url, "http://localhost:9999/v1");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_creates_the_file_and_its_directory() {
+        let dir = tmpdir("create");
+        // A nested path that does not exist yet, i.e. the first run ever.
+        let path = dir.join("nested").join("daedalus").join("config.toml");
+
+        persist_edit(&path, &ConfigEdit::model("m")).unwrap();
+
+        let c = load(ws(), Some(&path), PartialConfig::default()).unwrap();
+        assert_eq!(c.model, "m");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_rejects_bad_input_and_leaves_the_file_alone() {
+        let dir = tmpdir("reject");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, EXISTING).unwrap();
+
+        let err = persist_edit(&path, &ConfigEdit::provider("nope")).unwrap_err();
+        assert!(err.contains("unknown provider 'nope'"), "{err}");
+        let err = persist_edit(&path, &ConfigEdit::model("   ")).unwrap_err();
+        assert!(err.contains("empty model"), "{err}");
+
+        // Not a single byte changed.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), EXISTING);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_edit_of_nothing_is_a_noop() {
+        let dir = tmpdir("noop");
+        let path = dir.join("config.toml");
+
+        persist_edit(&path, &ConfigEdit::default()).unwrap();
+
+        assert!(!path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

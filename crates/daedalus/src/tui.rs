@@ -28,9 +28,9 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use daedalus_core::config::PROVIDERS;
+use daedalus_core::config::{persist_edit, ConfigEdit, PROVIDERS};
 use daedalus_core::provider::Message;
-use daedalus_core::runtime::{AgentRuntime, Effort, Event, RuntimeState};
+use daedalus_core::runtime::{AgentRuntime, Effort, ErrorKind, Event, RuntimeState};
 use daedalus_core::theme::{Modifiers, StyleSpec, Theme, ThemeColor, Token};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Position, Rect};
@@ -408,6 +408,9 @@ pub struct UiModel {
     /// The transcript viewport's visible text rows from the last draw, one
     /// string per screen row (wrapping included), for selection extraction.
     pub transcript_rows: Vec<String>,
+    /// Where a model/provider chosen at runtime is remembered (set by
+    /// `run_tui`; `None` writes nothing, so tests never touch a real config).
+    pub persist: Option<PathBuf>,
 }
 
 impl UiModel {
@@ -429,6 +432,7 @@ impl UiModel {
             selection: None,
             transcript_area: Rect::default(),
             transcript_rows: Vec::new(),
+            persist: None,
         }
     }
 
@@ -509,7 +513,7 @@ impl UiModel {
                 self.flush_assistant();
             }
             Event::ModelsListed { .. } => {} // handled by the shell
-            Event::Error { message } => {
+            Event::Error { message, .. } => {
                 self.flush_thinking();
                 self.flush_assistant();
                 self.transcript
@@ -894,6 +898,26 @@ fn picker_offset(selected: usize, viewport: usize) -> usize {
     }
 }
 
+/// The model picker to open when the provider rejects the configured model.
+///
+/// The list is what the provider itself reported it serves — a hint, not a
+/// gate, since a provider may also accept aliases it never names. `None` for
+/// every other error, and for a rejection that named no alternatives: a picker
+/// with no rows is a dead end, and the message is the remedy on its own.
+fn model_picker_for_rejection(kind: &Option<ErrorKind>) -> Option<Picker> {
+    match kind {
+        Some(ErrorKind::InvalidModel {
+            requested,
+            supported,
+        }) if !supported.is_empty() => Some(Picker::Model {
+            selected: 0,
+            models: supported.clone(),
+            rejected_model: Some(requested.clone()),
+        }),
+        _ => None,
+    }
+}
+
 /// A `width x height` rectangle centered inside `area` (clamped to it).
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
@@ -928,16 +952,85 @@ fn refresh_completion(
     };
 }
 
+/// The model/provider the run started with — the baseline `remember_choice`
+/// diffs against, so only a change the runtime actually adopted is saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Remembered {
+    provider: String,
+    model: String,
+}
+
+impl Remembered {
+    fn of(state: &RuntimeState) -> Self {
+        Self {
+            provider: state.provider.clone(),
+            model: state.model.clone(),
+        }
+    }
+}
+
+/// Remember a model/provider the runtime **actually adopted**, once per
+/// change, by writing it into the config file at `persist`.
+///
+/// Diffing against the run's starting values (rather than hooking the pickers)
+/// is what makes this correct for providers: a switch the runtime refused — an
+/// unknown name, or no API key — never reaches `StateChanged`, so a refused
+/// choice is never written back and the next run cannot start broken. The same
+/// single hook covers the picker, `/model`, and `/provider`.
+///
+/// A failed write is a notice, never fatal: a read-only config must not take
+/// the session down.
+fn remember_choice(model: &mut UiModel, remembered: &mut Remembered) {
+    let Some(path) = model.persist.clone() else {
+        return;
+    };
+    if model.state.provider == remembered.provider && model.state.model == remembered.model {
+        return;
+    }
+    let mut edit = ConfigEdit::default();
+    if model.state.provider != remembered.provider {
+        edit.provider = Some(model.state.provider.clone());
+    }
+    if model.state.model != remembered.model {
+        edit.model = Some(model.state.model.clone());
+    }
+    // Move the baseline either way: the user has been told once, and a config
+    // that keeps failing must not repeat the same notice on every event.
+    remembered.provider = model.state.provider.clone();
+    remembered.model = model.state.model.clone();
+    let saved = edit_summary(&edit);
+    match persist_edit(&path, &edit) {
+        Ok(()) => model.push_notice(&format!("{saved} saved to {}", path.display())),
+        Err(e) => model.push_notice(&format!("could not save to {}: {e}", path.display())),
+    }
+}
+
+/// Render an edit as the TOML it wrote: `model = "m"`, `provider = "p"`, or
+/// `provider = "p", model = "m"`.
+fn edit_summary(edit: &ConfigEdit) -> String {
+    let mut parts = Vec::new();
+    if let Some(provider) = &edit.provider {
+        parts.push(format!("provider = {provider:?}"));
+    }
+    if let Some(model) = &edit.model {
+        parts.push(format!("model = {model:?}"));
+    }
+    parts.join(", ")
+}
+
 /// Ratatui rendering + event loop shell. Owns the screen (crossterm raw
 /// mode + alternate screen); all *state* lives in the pure model above.
 /// Never prints to stdout directly — ratatui owns the terminal. On exit the
-/// session is auto-saved via `crate::auto_save`.
+/// session is auto-saved via `crate::auto_save`. A model/provider the user
+/// changes at runtime is remembered in `persist` (the config file), or nowhere
+/// when that is `None`.
 pub fn run_tui(
     rt: &AgentRuntime,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     initial: &str,
     session_root: &Path,
     theme: &Theme,
+    persist: Option<PathBuf>,
 ) -> Result<i32, String> {
     enable_raw_mode().map_err(|e| format!("cannot enable raw mode: {e}"))?;
     let mut stdout = std::io::stdout();
@@ -952,6 +1045,8 @@ pub fn run_tui(
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
     let mut model = UiModel::new(rt.state());
+    model.persist = persist;
+    let mut remembered = Remembered::of(&model.state);
     let mut input = InputEditor::default();
     let mut picker: Option<Picker> = None;
     let mut login_pending = false;
@@ -984,6 +1079,7 @@ pub fn run_tui(
                             picker = Some(Picker::Model {
                                 selected: 0,
                                 models: models.clone(),
+                                rejected_model: None,
                             });
                             model.model_fetch_pending = false;
                         }
@@ -991,17 +1087,27 @@ pub fn run_tui(
                             model.push_notice("no models reported; use /model <name>");
                             model.model_fetch_pending = false;
                         }
-                        Event::Error { message } => {
+                        Event::Error { message, .. } => {
                             model.push_notice(&format!("{message}; use /model <name>"));
                             model.model_fetch_pending = false;
                         }
                         _ => {}
                     }
                 }
+                // The provider rejected the configured model. The transcript
+                // already carries the message (which lists what it does
+                // serve); turn that list into a picker rather than leaving the
+                // user to retype a name from prose.
+                if let Event::Error { kind, .. } = &ev {
+                    if let Some(p) = model_picker_for_rejection(kind) {
+                        picker = Some(p);
+                    }
+                }
                 let state_changed = matches!(ev, Event::StateChanged { .. });
                 model.apply_event(&ev);
                 if state_changed {
                     model.state = rt.state();
+                    remember_choice(&mut model, &mut remembered);
                 }
             }
             // Render at ~30fps (also drives the busy spinner).
@@ -1126,10 +1232,15 @@ enum Picker {
     Effort {
         selected: usize,
     },
-    /// Model choices fetched from the provider.
+    /// Model choices fetched from the provider, or handed over by the provider
+    /// itself when it rejected the configured model.
     Model {
         selected: usize,
         models: Vec<String>,
+        /// The model the provider rejected, when that rejection is why the
+        /// picker opened (as opposed to the user typing `/model`). The title
+        /// then says so, since the overlay appeared uninvited.
+        rejected_model: Option<String>,
     },
     /// Provider choices from the registry.
     Provider {
@@ -1206,7 +1317,9 @@ fn handle_key(
                     model.state.effort = effort;
                     *picker = None;
                 }
-                Picker::Model { selected, models } => {
+                Picker::Model {
+                    selected, models, ..
+                } => {
                     if let Some(name) = models.get(*selected) {
                         rt.set_model(name);
                         model.state.model = name.clone();
@@ -1471,6 +1584,7 @@ fn run_command(
                     *picker = Some(Picker::Model {
                         selected: 0,
                         models,
+                        rejected_model: None,
                     });
                 }
             } else {
@@ -1834,14 +1948,18 @@ fn draw(
                 .collect();
             draw_picker(f, &names, *selected, title, theme);
         }
-        Some(Picker::Model { selected, models }) => {
-            draw_picker(
-                f,
-                models,
-                *selected,
-                " model — ↑/↓ · Enter apply · Esc cancel ",
-                theme,
-            );
+        Some(Picker::Model {
+            selected,
+            models,
+            rejected_model,
+        }) => {
+            // When the picker opened because the provider turned the current
+            // model down, say which one in the title.
+            let title = match rejected_model {
+                Some(m) => format!(" model '{m}' rejected — ↑/↓ · Enter apply · Esc cancel "),
+                None => " model — ↑/↓ · Enter apply · Esc cancel ".to_string(),
+            };
+            draw_picker(f, models, *selected, &title, theme);
         }
         Some(Picker::Provider { selected }) => {
             let names: Vec<String> = PROVIDERS.iter().map(|p| p.name.to_string()).collect();
@@ -2670,6 +2788,124 @@ mod tests {
         assert_eq!(m.state.provider, "anthropic");
     }
 
+    /// A model whose chosen model/provider is written to `path`, plus the
+    /// baseline `run_tui` starts it with (the values the run loaded).
+    fn persistent(s: RuntimeState, path: &Path) -> (UiModel, Remembered) {
+        let mut m = UiModel::new(s);
+        m.persist = Some(path.to_path_buf());
+        let remembered = Remembered::of(&m.state);
+        (m, remembered)
+    }
+
+    fn notices(m: &UiModel) -> Vec<String> {
+        m.transcript
+            .iter()
+            .filter_map(|l| match l {
+                TranscriptLine::Notice(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_adopted_model_and_provider_are_remembered_in_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "provider = \"openai\"\nmodel = \"gpt-4o\" # mine\n").unwrap();
+        let (mut m, mut remembered) = persistent(state(), &path);
+
+        // An unchanged state (every other StateChanged) writes nothing.
+        remember_choice(&mut m, &mut remembered);
+        assert!(m.transcript.is_empty(), "nothing changed, nothing to say");
+
+        m.state.provider = "deepseek".into();
+        m.state.model = "deepseek-chat".into();
+        remember_choice(&mut m, &mut remembered);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("provider = \"deepseek\""), "{text}");
+        assert!(text.contains("model = \"deepseek-chat\""), "{text}");
+        assert!(
+            !text.contains("gpt-4o"),
+            "the replaced value is gone:\n{text}"
+        );
+        assert!(
+            text.contains("# mine"),
+            "hand-written notes survive:\n{text}"
+        );
+        let said = notices(&m);
+        assert_eq!(said.len(), 1, "one change, one notice: {said:?}");
+        assert!(
+            said[0].contains("deepseek-chat") && said[0].contains("config.toml"),
+            "{said:?}"
+        );
+    }
+
+    #[test]
+    fn a_config_file_is_created_when_there_is_none_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("config.toml");
+        let (mut m, mut remembered) = persistent(state(), &path);
+        m.state.model = "o3".into();
+        remember_choice(&mut m, &mut remembered);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("o3"));
+    }
+
+    #[test]
+    fn one_change_is_remembered_once_and_switching_back_counts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (mut m, mut remembered) = persistent(state(), &path);
+        m.state.model = "o3".into();
+        remember_choice(&mut m, &mut remembered);
+        // More StateChanged events for the same state must not re-write (or
+        // re-notice): only a real change is news.
+        remember_choice(&mut m, &mut remembered);
+        assert_eq!(notices(&m).len(), 1);
+        m.state.model = "gpt-4o".into();
+        remember_choice(&mut m, &mut remembered);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("model = \"gpt-4o\""), "{text}");
+        assert_eq!(notices(&m).len(), 2);
+    }
+
+    #[test]
+    fn an_unwritable_config_is_a_notice_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the config file should be: the write must fail.
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+        let (mut m, mut remembered) = persistent(state(), &path);
+        m.state.model = "o3".into();
+        remember_choice(&mut m, &mut remembered);
+        let said = notices(&m);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].starts_with("could not save to"), "{said:?}");
+    }
+
+    #[test]
+    fn without_a_target_nothing_is_written_or_said() {
+        let mut m = UiModel::new(state());
+        let mut remembered = Remembered::of(&m.state);
+        m.state.model = "o3".into();
+        m.state.provider = "deepseek".into();
+        remember_choice(&mut m, &mut remembered);
+        assert!(m.transcript.is_empty());
+    }
+
+    #[test]
+    fn a_remembered_provider_is_written_by_registry_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let (mut m, mut remembered) = persistent(state(), &path);
+        // Providers are matched case-insensitively; the file gets the
+        // canonical name so it reloads cleanly.
+        m.state.provider = "DeepSeek".into();
+        remember_choice(&mut m, &mut remembered);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.trim(), "provider = \"deepseek\"", "{text}");
+    }
+
     #[test]
     fn agent_settled_flushes_final_text() {
         let mut m = UiModel::new(state());
@@ -2821,6 +3057,7 @@ mod tests {
         let mut m = UiModel::new(state());
         m.apply_event(&Event::Error {
             message: "boom".into(),
+            kind: None,
         });
         assert_eq!(
             m.transcript.last(),
@@ -2931,6 +3168,7 @@ mod tests {
         let mut picker = Some(Picker::Model {
             selected: 1,
             models: vec!["a".into(), "b".into()],
+            rejected_model: None,
         });
         let mut login_pending = false;
         let mut should_exit = false;
@@ -2947,6 +3185,70 @@ mod tests {
         );
         assert!(picker.is_none());
         assert_eq!(model.state.model, "b");
+    }
+
+    #[test]
+    fn a_rejected_model_opens_a_picker_of_the_providers_alternatives() {
+        let kind = ErrorKind::InvalidModel {
+            requested: "bogus".into(),
+            supported: vec!["deepseek-flash".into(), "deepseek-v4-pro".into()],
+        };
+        match model_picker_for_rejection(&Some(kind)) {
+            Some(Picker::Model {
+                selected,
+                models,
+                rejected_model,
+            }) => {
+                assert_eq!(selected, 0);
+                assert_eq!(models, vec!["deepseek-flash", "deepseek-v4-pro"]);
+                assert_eq!(rejected_model.as_deref(), Some("bogus"));
+            }
+            other => panic!("expected a model picker, got one: {:?}", other.is_some()),
+        }
+    }
+
+    #[test]
+    fn a_rejection_without_alternatives_or_another_error_opens_nothing() {
+        // The provider named no model: the message alone is the remedy, and a
+        // zero-row picker would be a dead end.
+        let bare = ErrorKind::InvalidModel {
+            requested: "bogus".into(),
+            supported: Vec::new(),
+        };
+        assert!(model_picker_for_rejection(&Some(bare)).is_none());
+        // Auth and the iteration cap have their own remedies, not a model list.
+        assert!(model_picker_for_rejection(&Some(ErrorKind::Auth)).is_none());
+        assert!(model_picker_for_rejection(&Some(ErrorKind::IterationCap)).is_none());
+        assert!(model_picker_for_rejection(&None).is_none());
+    }
+
+    #[test]
+    fn the_rejection_picker_names_the_model_it_replaced() {
+        use ratatui::backend::TestBackend;
+        let rt = test_rt();
+        let mut model = UiModel::new(rt.state());
+        let theme = Theme::default();
+        let input = InputEditor::default();
+        let picker = Some(Picker::Model {
+            selected: 0,
+            models: vec!["deepseek-flash".into()],
+            rejected_model: Some("bogus".into()),
+        });
+        // Wide enough that the title is not clipped.
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|f| draw(f, &mut model, &theme, &input, &picker, false, ' ', "fake"))
+            .unwrap();
+        // Flatten the screen so the model name and its title can be searched.
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("'bogus' rejected"), "{screen}");
+        assert!(screen.contains("deepseek-flash"), "{screen}");
     }
 
     #[test]

@@ -104,7 +104,12 @@ async fn session_loop(
     let workspace = match resolve_workspace(&state, &query, identity.as_deref()) {
         Ok(ws) => ws,
         Err(e) => {
-            let event = Event::Error { message: e };
+            // Not classifiable: this is a bad workspace mapping/override, and
+            // the message is the whole story.
+            let event = Event::Error {
+                message: e,
+                kind: None,
+            };
             let _ = sink
                 .send(Message::Text(serde_json::to_string(&event).unwrap().into()))
                 .await;
@@ -157,7 +162,10 @@ async fn session_loop(
                             }
                             Ok(None) => {}
                             Err(message) => {
-                                let event = Event::Error { message };
+                                let event = Event::Error {
+                                    message,
+                                    kind: None,
+                                };
                                 let json = serde_json::to_string(&event).unwrap();
                                 if sink.send(Message::Text(json.into())).await.is_err() {
                                     break;

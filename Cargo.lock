@@ -571,6 +571,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit 0.22.27",
  "unicode-normalization",
  "unicode-segmentation",
 ]

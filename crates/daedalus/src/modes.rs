@@ -13,14 +13,65 @@
 //!   `{"type":"response","id":...}` line after the command's events so
 //!   clients can correlate replies (pi's RPC mode).
 //!
+//! ## Exit codes
+//!
+//! Both headless modes exit `0` only when the command completed. A failed turn
+//! exits `1` (provider error, rejected model, authentication, or an aborted
+//! turn) and a turn that ran out of iteration budget exits `2`. The emitted
+//! events remain the source of truth — a failing turn still streams its
+//! `Event::Error` — but a script that only looks at `$?` is no longer told a
+//! dead turn succeeded.
+//!
 
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use daedalus_core::runtime::{AgentRuntime, Command, CommandKind, Event};
+use daedalus_core::runtime::{AgentRuntime, Command, CommandKind, ErrorKind, Event};
 
 /// The runtime's event receiver type (tokio unbounded channel).
 type EventRx = tokio::sync::mpsc::UnboundedReceiver<Event>;
+
+/// What one drain saw: whether the command failed, and how. The runtime reports
+/// a failed turn as `Event::Error` on the same stream as everything else, so the
+/// adapters would otherwise have to re-read the JSONL they just wrote to notice;
+/// this carries that verdict out of the drain instead.
+#[derive(Debug, Default, Clone)]
+struct DrainOutcome {
+    /// True once any `Event::Error` was seen. Such a turn ends without an
+    /// answer, and the adapters must not report it as completed.
+    errored: bool,
+    /// Classification of the error that ended the turn. A later error does not
+    /// overwrite it: the first one explains why the turn stopped, and a tool
+    /// that merely failed while the turn continued is not a terminal error.
+    kind: Option<ErrorKind>,
+}
+
+impl DrainOutcome {
+    /// Whether the command completed without a runtime error.
+    fn ok(&self) -> bool {
+        !self.errored
+    }
+
+    /// Fold one event into the outcome.
+    fn observe(&mut self, event: &Event) {
+        if let Event::Error { kind, .. } = event {
+            self.errored = true;
+            if self.kind.is_none() {
+                self.kind = kind.clone();
+            }
+        }
+    }
+}
+
+/// The process exit code for a failed drain: `2` for the iteration cap (the
+/// turn was cut short by a budget the user can raise) and `1` for every other
+/// failure.
+fn exit_code_for(outcome: &DrainOutcome) -> i32 {
+    match outcome.kind {
+        Some(ErrorKind::IterationCap) => 2,
+        _ => 1,
+    }
+}
 
 /// Blocking receive with a timeout (tokio receivers have no
 /// `blocking_recv_timeout`; a poll loop keeps the semantics).
@@ -65,7 +116,8 @@ impl Mode {
 }
 
 /// One-shot json: run `prompt` and emit every runtime Event as a JSONL line
-/// until `agent_settled`. Returns the process exit code.
+/// until `agent_settled`. Returns the process exit code (`0` completed, `1`
+/// failed, `2` iteration cap).
 pub fn run_json(
     rt: &AgentRuntime,
     rx: &mut EventRx,
@@ -73,8 +125,12 @@ pub fn run_json(
     out: &mut dyn Write,
 ) -> Result<i32, String> {
     rt.prompt(prompt);
-    drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
-    Ok(0)
+    let outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+    Ok(if outcome.errored {
+        exit_code_for(&outcome)
+    } else {
+        0
+    })
 }
 
 /// rpc: read `Command` JSON lines from `input` on a reader thread, push each
@@ -88,7 +144,8 @@ pub fn run_json(
 /// on the main thread: push, drain events to the command's terminal event,
 /// then write `{"type":"response","id":...}` when the request had an `id`.
 ///
-/// Returns the process exit code (0 on EOF / normal shutdown).
+/// Returns the process exit code (`0` on EOF / normal shutdown; the first
+/// failed request decides otherwise).
 pub fn run_rpc(
     rt: &AgentRuntime,
     rx: &mut EventRx,
@@ -142,6 +199,7 @@ pub fn run_rpc(
         }
     });
 
+    let mut exit = 0i32;
     loop {
         let command = match cmd_rx.recv() {
             Ok(Ok(command)) => command,
@@ -150,51 +208,52 @@ pub fn run_rpc(
         };
         let id = command.id.clone();
         let mut responded = false;
+        let mut outcome = DrainOutcome::default();
         match &command.kind {
             CommandKind::Prompt { text } => {
                 rt.prompt(text);
-                drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
             }
             CommandKind::Steer { text } => {
                 // Arrived while idle: it starts a turn.
                 rt.steer(text);
-                drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
             }
             CommandKind::FollowUp { text } => {
                 rt.follow_up(text);
-                drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
             }
             CommandKind::Abort {} => {
                 rt.abort();
-                drain_until_quiet(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
+                outcome = drain_until_quiet(rx, out, |e| matches!(e, Event::AgentSettled { .. }))?;
             }
             CommandKind::SetModel { model } => {
                 rt.set_model(model);
-                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::SetProvider { provider } => {
                 rt.set_provider(provider);
-                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::SetEffort { effort } => {
                 rt.set_effort(*effort);
-                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::SwitchWorkspace { path } => {
                 rt.switch_workspace(path);
-                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::Clear {} => {
                 rt.clear();
-                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::GetState {} => {
                 rt.get_state();
-                drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::StateChanged { .. }))?;
             }
             CommandKind::ListModels {} => {
                 rt.refresh_models();
-                drain_until(rx, out, |e| matches!(e, Event::ModelsListed { .. }))?;
+                outcome = drain_until(rx, out, |e| matches!(e, Event::ModelsListed { .. }))?;
             }
             CommandKind::Resume => {
                 let history = daedalus_core::session::load_previous(root, &rt.workspace_root())
@@ -212,17 +271,30 @@ pub fn run_rpc(
                     _ => {
                         write_response(out, id.as_deref(), false)?;
                         responded = true;
+                        // Nothing to resume is a failed request, not a quiet
+                        // success: the client asked for a session that is not
+                        // there, so the process reports it too.
+                        outcome.errored = true;
                     }
                 }
             }
         }
         if !responded {
-            write_response(out, id.as_deref(), true)?;
+            // The correlated response mirrors whether the command worked, so
+            // a client driving via `id` sees the failure the same way the exit
+            // code reports it.
+            write_response(out, id.as_deref(), outcome.ok())?;
+        }
+        if outcome.errored && exit == 0 {
+            // Keep serving the remaining requests (a client may be probing),
+            // but remember the first failure: the final exit code must not
+            // claim the whole session succeeded.
+            exit = exit_code_for(&outcome);
         }
         out.flush().map_err(|e| e.to_string())?;
     }
     let _ = reader.join();
-    Ok(0)
+    Ok(exit)
 }
 
 /// Forward an interactive command (steer/followUp/abort) straight into the
@@ -237,24 +309,23 @@ fn forward_interactive(rt: &AgentRuntime, kind: &CommandKind) {
 }
 
 /// Drain runtime events, writing each as a JSONL line, until `stop` matches.
-/// Returns the number of events written.
 fn drain_until(
     rx: &mut EventRx,
     out: &mut dyn Write,
     stop: impl Fn(&Event) -> bool,
-) -> Result<usize, String> {
-    let mut count = 0usize;
+) -> Result<DrainOutcome, String> {
+    let mut outcome = DrainOutcome::default();
     loop {
         match rx.blocking_recv() {
             Some(event) => {
                 let line = serde_json::to_string(&event).map_err(|e| e.to_string())?;
                 writeln!(out, "{line}").map_err(|e| e.to_string())?;
-                count += 1;
+                outcome.observe(&event);
                 if stop(&event) {
-                    return Ok(count);
+                    return Ok(outcome);
                 }
             }
-            None => return Ok(count),
+            None => return Ok(outcome),
         }
     }
 }
@@ -265,19 +336,19 @@ fn drain_until_quiet(
     rx: &mut EventRx,
     out: &mut dyn Write,
     stop: impl Fn(&Event) -> bool,
-) -> Result<usize, String> {
-    let mut count = 0usize;
+) -> Result<DrainOutcome, String> {
+    let mut outcome = DrainOutcome::default();
     loop {
         match recv_timeout(rx, std::time::Duration::from_millis(100)) {
             Some(event) => {
                 let line = serde_json::to_string(&event).map_err(|e| e.to_string())?;
                 writeln!(out, "{line}").map_err(|e| e.to_string())?;
-                count += 1;
+                outcome.observe(&event);
                 if stop(&event) {
-                    return Ok(count);
+                    return Ok(outcome);
                 }
             }
-            None => return Ok(count),
+            None => return Ok(outcome),
         }
     }
 }
@@ -296,7 +367,7 @@ mod tests {
     use super::*;
     use daedalus_core::config::Config;
     use daedalus_core::provider::fake::FakeProvider;
-    use daedalus_core::provider::{Message, Response};
+    use daedalus_core::provider::{Message, Response, ToolCall};
     use daedalus_core::runtime::Effort;
     use daedalus_core::session;
     use daedalus_core::tools::resolver::ToolSet;
@@ -318,11 +389,28 @@ mod tests {
         std::thread::JoinHandle<()>,
         Workspace,
     ) {
+        setup_with(_name, responses, 10)
+    }
+
+    /// Like `setup`, with an explicit iteration budget (to drive a turn into
+    /// the cap).
+    fn setup_with(
+        _name: &str,
+        responses: Vec<Response>,
+        max_iterations: usize,
+    ) -> (
+        TempDir,
+        PathBuf,
+        AgentRuntime,
+        EventRx,
+        std::thread::JoinHandle<()>,
+        Workspace,
+    ) {
         let dir = tempfile::tempdir().expect("create temp dir");
         let root = dir.path().join("sessions");
         let ws = Workspace::new(dir.path().to_path_buf()).unwrap();
         let cfg = Config {
-            max_iterations: 10,
+            max_iterations,
             workspace: dir.path().to_path_buf(),
             ..Config::defaults(dir.path().to_path_buf())
         };
@@ -513,6 +601,90 @@ mod tests {
         let mut out = Vec::new();
         let err = run_rpc(&rt, &mut rx, tmp.path(), input, &mut out).unwrap_err();
         assert!(err.contains("bad request"));
+        shutdown(&rt, handle);
+        let _ = tmp;
+    }
+
+    /// The iteration cap is the one failure a caller can act on (raise the
+    /// budget), so it gets a distinct code; every other failure is a plain `1`.
+    #[test]
+    fn failure_exit_codes_distinguish_the_cap() {
+        let cap = DrainOutcome {
+            errored: true,
+            kind: Some(ErrorKind::IterationCap),
+        };
+        assert_eq!(exit_code_for(&cap), 2);
+        let auth = DrainOutcome {
+            errored: true,
+            kind: Some(ErrorKind::Auth),
+        };
+        assert_eq!(exit_code_for(&auth), 1);
+        // An unclassified failure (a tool error the runtime only renders) is
+        // still a failure.
+        let unclassified = DrainOutcome {
+            errored: true,
+            kind: None,
+        };
+        assert_eq!(exit_code_for(&unclassified), 1);
+        assert!(!unclassified.ok());
+        assert!(DrainOutcome::default().ok());
+    }
+
+    /// A turn killed by the iteration cap used to exit 0: scripts could not
+    /// tell a dead run from a finished one. The events keep the detail, the
+    /// exit code answers "did this work".
+    #[test]
+    fn json_mode_exits_2_on_the_iteration_cap() {
+        // A model that only ever asks for tools never answers.
+        let tool_call = Response::ToolCalls(vec![ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "true"}),
+        }]);
+        let (tmp, _root, rt, mut rx, handle, _ws) = setup_with("json-cap", vec![tool_call; 3], 2);
+        let mut out = Vec::new();
+        let code = run_json(&rt, &mut rx, "loop forever", &mut out).unwrap();
+        assert_eq!(code, 2, "the cap must not look like success");
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let error = lines
+            .iter()
+            .find(|v| v["type"] == "error")
+            .unwrap_or_else(|| panic!("the failure is still streamed: {text}"));
+        assert_eq!(error["kind"]["reason"], "iteration_cap");
+        // The stream still ends in a settle: the exit code is the verdict, not
+        // a replacement for the event vocabulary.
+        assert_eq!(lines.last().unwrap()["type"], "agent_settled");
+        shutdown(&rt, handle);
+        let _ = tmp;
+    }
+
+    /// Likewise in rpc: a request that cannot be satisfied answers `ok: false`
+    /// (so a client can react per-id) *and* moves the exit code off 0.
+    #[test]
+    fn rpc_failed_request_answers_not_ok_and_exits_nonzero() {
+        let (tmp, root, rt, mut rx, handle, _ws) = setup("rpc-resume-none", vec![]);
+        // An existing session directory with no saved session in it: resume has
+        // nothing to restore.
+        std::fs::create_dir_all(&root).unwrap();
+        let input = Box::new(Cursor::new(
+            "{\"id\":\"r1\",\"type\":\"resume\"}\n".to_string(),
+        ));
+        let mut out = Vec::new();
+        let code = run_rpc(&rt, &mut rx, &root, input, &mut out).unwrap();
+        assert_eq!(code, 1, "resuming nothing is a failure, not a no-op");
+        let text = String::from_utf8(out).unwrap();
+        let last: serde_json::Value = text
+            .lines()
+            .last()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .unwrap();
+        assert_eq!(last["type"], "response");
+        assert_eq!(last["id"], "r1");
+        assert_eq!(last["ok"], false);
         shutdown(&rt, handle);
         let _ = tmp;
     }

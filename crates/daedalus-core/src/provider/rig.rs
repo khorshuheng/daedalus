@@ -257,13 +257,17 @@ impl RigProvider {
 
     /// Classify a rig completion error, preserving that policy:
     /// quota/billing is never retried, auth is auth, timeouts are timeouts,
-    /// transient statuses (and bare transport failures) stay retryable.
-    fn map_error(err: &CompletionError) -> (ProviderError, bool) {
+    /// a rejected model is never retried, transient statuses (and bare
+    /// transport failures) stay retryable. `model` is the id daedalus asked
+    /// for, so a rejection can name it even when the provider does not.
+    fn map_error(err: &CompletionError, model: &str) -> (ProviderError, bool) {
         let body = err.provider_response_body().unwrap_or_default().to_string();
         let status = err.provider_response_status().map(|s| s.as_u16());
         if let Some(code) = status {
-            let mapped = map_status_error(code, body.clone());
-            let retryable = !is_quota_or_billing(&body) && is_transient_status(code);
+            let mapped = map_status_error(code, body.clone(), Some(model));
+            let retryable = !matches!(mapped, ProviderError::InvalidModel { .. })
+                && !is_quota_or_billing(&body)
+                && is_transient_status(code);
             (mapped, retryable)
         } else if is_quota_or_billing(&body) {
             (
@@ -296,7 +300,7 @@ impl RigProvider {
                 match result {
                     Ok(stream) => return Ok(stream),
                     Err(e) => {
-                        let (mapped, retryable) = Self::map_error(&e);
+                        let (mapped, retryable) = Self::map_error(&e, &self.model);
                         if !retryable || attempt >= MAX_RETRIES {
                             return Err(mapped);
                         }
@@ -449,7 +453,7 @@ impl Provider for RigProvider {
                     }
                     // Partial tool-call fragments and other unmodeled items.
                     Ok(_) => {}
-                    Err(e) => return Err(Self::map_error(&e).0),
+                    Err(e) => return Err(Self::map_error(&e, &self.model).0),
                 }
             }
 

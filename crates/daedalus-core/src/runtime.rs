@@ -220,7 +220,35 @@ pub enum Event {
     /// The provider's available model ids, in reply to `list_models`.
     ModelsListed { models: Vec<String> },
     /// A non-fatal error surfaced by the runtime.
-    Error { message: String },
+    Error {
+        message: String,
+        /// Machine-readable classification, when the runtime has one. Optional
+        /// and omitted on the wire when `None`, so older event consumers keep
+        /// working — and so a consumer never has to match on `message` prose.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<ErrorKind>,
+    },
+}
+
+/// What an [`Event::Error`] actually was, so a frontend can react (offer a
+/// model picker, prompt for a key) without parsing the message text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum ErrorKind {
+    /// The provider rejected the configured model. `supported` is the list the
+    /// provider itself reported — not a hard-coded catalog, and not necessarily
+    /// exhaustive, since a provider may also serve aliases it does not name.
+    /// A frontend should offer these as candidates, not treat them as a gate.
+    InvalidModel {
+        requested: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        supported: Vec<String>,
+    },
+    /// Authentication failed for the active provider (no key, or a rejected
+    /// one). The fix is a credential, not a retry.
+    Auth,
+    /// The iteration budget ran out before a final answer.
+    IterationCap,
 }
 
 impl Event {
@@ -330,6 +358,24 @@ pub struct RuntimeState {
     pub effort: Effort,
     pub workspace: String,
     pub busy: bool,
+}
+
+/// Classify a provider failure for `Event::Error.kind`, so frontends can react
+/// to the failure rather than to its prose. `None` means "render the message":
+/// a timeout or a malformed response has no special handling anywhere.
+fn error_kind(e: &crate::provider::ProviderError) -> Option<ErrorKind> {
+    match e {
+        crate::provider::ProviderError::InvalidModel {
+            requested,
+            supported,
+            ..
+        } => Some(ErrorKind::InvalidModel {
+            requested: requested.clone(),
+            supported: supported.clone(),
+        }),
+        crate::provider::ProviderError::Auth(_) => Some(ErrorKind::Auth),
+        _ => None,
+    }
 }
 
 /// Rough token estimate: ~4 characters per token (fine for budgeting).
@@ -682,7 +728,10 @@ impl AgentRuntime {
         let info = match crate::config::provider_by_name(name) {
             Ok(i) => i,
             Err(e) => {
-                self.emit(Event::Error { message: e });
+                self.emit(Event::Error {
+                    message: e,
+                    kind: None,
+                });
                 return;
             }
         };
@@ -694,6 +743,7 @@ impl AgentRuntime {
                     "no API key for provider '{}': set {env} or pass --api-key; note /login stores for the current provider",
                     info.name
                 ),
+                kind: Some(ErrorKind::Auth),
             });
             return;
         }
@@ -720,6 +770,7 @@ impl AgentRuntime {
             }
             Err(e) => self.emit(Event::Error {
                 message: format!("could not list models: {e}"),
+                kind: None,
             }),
         }
     }
@@ -801,6 +852,7 @@ impl AgentRuntime {
                         }
                         Err(e) => self.emit(Event::Error {
                             message: format!("could not list models: {e}"),
+                            kind: None,
                         }),
                     }
                 }
@@ -949,6 +1001,7 @@ impl AgentRuntime {
                 }
                 Err(e) => self.emit(Event::Error {
                     message: format!("cannot switch workspace to '{path}': {e}"),
+                    kind: None,
                 }),
             },
             _ => {}
@@ -1008,6 +1061,7 @@ impl AgentRuntime {
                         }
                         Err(e) => self.emit(Event::Error {
                             message: format!("could not list models: {e}"),
+                            kind: None,
                         }),
                     }
                 }
@@ -1196,6 +1250,7 @@ impl AgentRuntime {
                 );
                 self.emit(Event::Error {
                     message: msg.clone(),
+                    kind: Some(ErrorKind::IterationCap),
                 });
                 error = Some(msg);
                 interrupted = true;
@@ -1267,7 +1322,14 @@ impl AgentRuntime {
                         }
                         _ => format!("provider error: {e}"),
                     };
-                    self.emit(Event::Error { message });
+                    self.emit(Event::Error {
+                        message: message.clone(),
+                        kind: error_kind(&e),
+                    });
+                    // The turn ended without an answer: report it, so one-shot
+                    // callers (`run_once`) and the adapters do not treat this as
+                    // a completed turn.
+                    error = Some(message);
                     break 'steps;
                 }
                 Ok(completion) => {
@@ -1681,6 +1743,73 @@ mod tests {
         handle.join().unwrap_or(());
     }
 
+    /// A provider that always fails the way a live provider rejects a model.
+    struct FailProvider;
+
+    impl Provider for FailProvider {
+        fn complete<'a>(
+            &'a self,
+            _history: &'a [Message],
+            _tools: &'a [serde_json::Value],
+            _effort_params: &'a serde_json::Value,
+            _cancel: CancellationToken,
+            _on_delta: &'a mut (dyn FnMut(StreamDelta) + Send),
+        ) -> futures::future::BoxFuture<'a, Result<Completion, ProviderError>> {
+            Box::pin(async move {
+                Err(ProviderError::InvalidModel {
+                    requested: "totally-bogus-xyz-42".into(),
+                    supported: vec!["deepseek-flash".into()],
+                    detail: "The model 'totally-bogus-xyz-42' does not exist".into(),
+                })
+            })
+        }
+    }
+
+    /// A rejected model reaches the frontend as a typed `ErrorKind`, so an
+    /// adapter can offer the provider's list instead of parsing the message.
+    #[test]
+    fn provider_failure_carries_a_machine_readable_kind() {
+        let (dir, ws) = workspace("provider-kind");
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, mut rx) = AgentRuntime::new(cfg, Box::new(FailProvider), ToolSet::new(1000), ws);
+        let worker = rt.clone();
+        let handle = std::thread::spawn(move || worker.run_forever());
+        rt.prompt("hello");
+        let (events, settled) = collect_until_settled(&mut rx);
+        assert!(settled, "a failed turn still settles");
+        let kind = events.iter().find_map(|e| match e {
+            Event::Error { kind, .. } => Some(kind.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            kind,
+            Some(Some(ErrorKind::InvalidModel {
+                requested: "totally-bogus-xyz-42".into(),
+                supported: vec!["deepseek-flash".into()],
+            })),
+            "events: {events:?}"
+        );
+        rt.shutdown();
+        handle.join().unwrap_or(());
+    }
+
+    /// The one-shot path reports a provider failure as a failure rather than
+    /// returning the (empty) text of a turn that never produced an answer.
+    #[test]
+    fn provider_failure_makes_run_once_fail() {
+        let (dir, ws) = workspace("provider-error-once");
+        let cfg = Config {
+            workspace: dir.path().to_path_buf(),
+            ..Config::defaults(dir.path().to_path_buf())
+        };
+        let (rt, _rx) = AgentRuntime::new(cfg, Box::new(FailProvider), ToolSet::new(1000), ws);
+        let err = rt.run_once("hello").unwrap_err();
+        assert!(matches!(err, RuntimeError::Provider(_)), "got {err:?}");
+    }
+
     #[test]
     fn interactive_mode_is_not_capped_by_max_iterations() {
         // Interactive adapters (REPL/TUI) opt out of the iteration cap: a
@@ -1886,13 +2015,18 @@ mod tests {
         let mut err = None;
         while err.is_none() && std::time::Instant::now() < deadline {
             match rx.try_recv() {
-                Ok(Event::Error { message }) => err = Some(message),
+                Ok(Event::Error { message, kind }) => err = Some((message, kind)),
                 Ok(_) => {}
                 Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
             }
         }
-        let msg = err.expect("expected a refusal");
+        let (msg, kind) = err.expect("expected a refusal");
         assert!(msg.contains("no API key for provider 'gemini'"), "{msg}");
+        assert_eq!(
+            kind,
+            Some(ErrorKind::Auth),
+            "the refusal must be classifiable so a UI can prompt for a key"
+        );
         assert_eq!(rt.provider_kind().name, "openai");
         rt.shutdown();
         handle.join().unwrap_or(());

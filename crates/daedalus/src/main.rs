@@ -11,8 +11,10 @@
 //!
 //! Exit codes:
 //!   0 — clean exit
-//!   1 — hard error (bad config/flags, provider unreachable)
-//!   2 — iteration cap exceeded
+//!   1 — hard error (bad config/flags, provider unreachable) or a failed turn
+//!       (provider error, rejected model, authentication, aborted turn, a
+//!       resume with no session to restore)
+//!   2 — iteration cap exceeded (no final answer within the budget)
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -150,6 +152,12 @@ fn run(cli: Cli) -> Result<i32, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let default_workspace = cli.dir.clone().unwrap_or(cwd);
     let config_path = resolve_config_path(cli.config.clone());
+    // Where a runtime model/provider choice is written back. With no
+    // `--config` (and no file yet) that is still the default path: creating it
+    // on the first save is the point of remembering the choice at all.
+    let persist_path = config_path
+        .clone()
+        .unwrap_or_else(|| daedalus_core::paths::config_dir().join("config.toml"));
 
     let config = Config::load(
         default_workspace,
@@ -210,7 +218,16 @@ fn run(cli: Cli) -> Result<i32, String> {
             let worker = rt.clone();
             let _worker_handle = std::thread::spawn(move || worker.run_forever());
             let root = session::default_root();
-            tui::run_tui(&rt, &mut rx, &cli.prompt(), root.as_path(), &theme)
+            // A runtime model/provider choice (picker, `/model`, `/provider`)
+            // is remembered in the config file for the next run.
+            tui::run_tui(
+                &rt,
+                &mut rx,
+                &cli.prompt(),
+                root.as_path(),
+                &theme,
+                Some(persist_path),
+            )
         }
     }
 }
