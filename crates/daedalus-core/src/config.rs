@@ -354,9 +354,14 @@ impl PartialConfig {
                 return Err("timeout_secs must be >= 1".into());
             }
         }
-        let max_context_tokens = self
-            .max_context_tokens
-            .unwrap_or_else(|| DEFAULT_CONTEXT_WINDOW.saturating_sub(4_096));
+        let max_context_tokens = self.max_context_tokens.unwrap_or_else(|| {
+            // Derive from the model's known window, reserving room for the
+            // completion. An unknown window keeps the conservative default
+            // rather than inventing one.
+            let window = crate::catalog::context_window(provider.name, &model)
+                .unwrap_or(DEFAULT_CONTEXT_WINDOW);
+            window.saturating_sub(4_096)
+        });
         if max_context_tokens == 0 {
             return Err("max_context_tokens must be >= 1".into());
         }
@@ -693,7 +698,9 @@ mod tests {
         assert_eq!(c.provider.name, "deepseek");
         assert_eq!(c.base_url, "https://api.deepseek.com");
         assert_eq!(c.model, "deepseek-chat");
-        assert_eq!(c.max_context_tokens, DEFAULT_CONTEXT_WINDOW - 4_096);
+        // The budget is derived from the model's known window (64K) rather than
+        // the model-independent default.
+        assert_eq!(c.max_context_tokens, 64_000 - 4_096);
     }
 
     #[test]
