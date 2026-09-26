@@ -363,10 +363,12 @@ pub enum TranscriptLine {
     /// Streamed model reasoning (CRAB-139), rendered dim and italic.
     Thinking(String),
     Tool(String),
-    /// A finished tool call: the `✓`/`✗` marker line (CRAB-140 tokens).
+    /// A finished tool call: the `✓`/`✗` marker line (CRAB-140 tokens),
+    /// followed by the result text when present (CRAB-158).
     ToolResult {
         name: String,
         ok: bool,
+        output: Option<String>,
     },
     Notice(String),
 }
@@ -386,6 +388,9 @@ pub struct UiModel {
     pub settled: bool,
     /// Transcript scrollback (follow the tail unless the user scrolled up).
     pub scroll: TranscriptScroll,
+    /// Global tool-output expansion (Ctrl+O, CRAB-158). When false, tool
+    /// results render as a collapsed preview.
+    pub verbose: bool,
     /// Bumped whenever the transcript changes, to key the render cache.
     pub revision: u64,
     /// Cache of the rendered transcript, keyed by (revision, area width).
@@ -415,6 +420,7 @@ impl UiModel {
             iterations: 0,
             settled: false,
             scroll: TranscriptScroll::default(),
+            verbose: false,
             revision: 0,
             md_cache: None,
             completion: None,
@@ -451,11 +457,14 @@ impl UiModel {
                 };
                 self.transcript.push(TranscriptLine::Tool(line));
             }
-            Event::ToolEnd { name, ok, .. } => {
+            Event::ToolEnd {
+                name, ok, output, ..
+            } => {
                 self.flush_thinking();
                 self.transcript.push(TranscriptLine::ToolResult {
                     name: name.clone(),
                     ok: *ok,
+                    output: output.clone(),
                 });
             }
             Event::TurnEnd {} => {
@@ -550,6 +559,13 @@ impl UiModel {
     pub fn push_notice(&mut self, text: &str) {
         self.transcript
             .push(TranscriptLine::Notice(text.to_string()));
+        self.revision += 1;
+    }
+
+    /// Flip the global tool-output expansion (Ctrl+O, CRAB-158) and invalidate
+    /// the cached transcript so the change is visible on the next frame.
+    pub fn toggle_verbose(&mut self) {
+        self.verbose = !self.verbose;
         self.revision += 1;
     }
 
@@ -924,7 +940,7 @@ pub fn run_tui(
     let result = (|| -> Result<i32, String> {
         // One-time editing-key hint so the line editor is discoverable.
         model.push_notice(
-            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · PgUp/PgDn/↑↓ scroll · drag to select · Ctrl-Y copy · /help commands",
+            "editing: ←→ Home End Del · Ctrl-W word · Ctrl-U/Ctrl-K line · PgUp/PgDn/↑↓ scroll · drag to select · Ctrl-Y copy · Ctrl-O tool output · /help commands",
         );
         // Seed the transcript with the initial prompt, then start the turn.
         if !initial.trim().is_empty() {
@@ -1313,6 +1329,8 @@ fn handle_key(
         KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => input.home(),
         KeyCode::Char('e') if modifiers.contains(KeyModifiers::CONTROL) => input.end(),
         KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => input.delete(),
+        // Ctrl+O expands/collapses every tool result (CRAB-158).
+        KeyCode::Char('o') if modifiers.contains(KeyModifiers::CONTROL) => model.toggle_verbose(),
         KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_prev_word(),
         KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_to_start(),
         KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => input.kill_to_end(),
@@ -1386,6 +1404,9 @@ fn run_command(
                 let args = c.args.map(|a| format!(" {a}")).unwrap_or_default();
                 model.push_notice(&format!("/{}{} — {}", c.name, args, c.description));
             }
+            model.push_notice(
+                "keys: Enter send · Esc/Ctrl-C abort (busy) or quit (prompt) · PgUp/PgDn/↑↓ scroll · Ctrl-O tool output · Ctrl-Y copy",
+            );
         }
         SlashCommand::Clear => {
             rt.clear();
@@ -1561,12 +1582,48 @@ fn markdown_style(theme: &Theme) -> crate::markdown::MarkdownStyle {
     }
 }
 
+/// Tool results render collapsed to a preview by default (CRAB-158): at most
+/// this many lines...
+const TOOL_PREVIEW_LINES: usize = 5;
+/// ...and at most this many characters, before the "Ctrl+O to expand" hint.
+const TOOL_PREVIEW_CHARS: usize = 600;
+
+/// Collapse a tool result to a preview. Returns the preview text and how many
+/// trailing lines were hidden (CRAB-158, mirroring ICARUS-113).
+fn tool_preview(content: &str) -> (String, usize) {
+    let norm = content.replace("\r\n", "\n");
+    let lines: Vec<&str> = norm.split('\n').collect();
+    let shown = lines.len().min(TOOL_PREVIEW_LINES);
+    let mut preview = lines[..shown].join("\n");
+    let chars = preview.chars().count();
+    if chars > TOOL_PREVIEW_CHARS {
+        preview = preview.chars().take(TOOL_PREVIEW_CHARS).collect();
+    }
+    (preview, lines.len().saturating_sub(shown))
+}
+
+/// Lay a tool result out as indented transcript lines: the first gets `⎿`, the
+/// rest align under it. One `TLine` per source line, so wrapping stays sane.
+fn tool_output_lines(content: &str, spec: StyleSpec) -> Vec<TLine<'static>> {
+    content
+        .replace("\r\n", "\n")
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            let prefix = if i == 0 { "  ⎿ " } else { "    " };
+            TLine::from(Span::styled(format!("{prefix}{line}"), style(spec)))
+        })
+        .collect()
+}
+
 /// Build the ratatui lines for the flushed transcript, rendering assistant
-/// messages as markdown (CRAB-145).
+/// messages as markdown (CRAB-145) and tool output under its call line,
+/// collapsed unless `verbose` (Ctrl+O, CRAB-158).
 fn transcript_lines(
     transcript: &[TranscriptLine],
     theme: &Theme,
     width: u16,
+    verbose: bool,
 ) -> Vec<TLine<'static>> {
     let md = markdown_style(theme);
     let mut out: Vec<TLine<'static>> = Vec::new();
@@ -1585,13 +1642,28 @@ fn transcript_lines(
                 format!("  {t}"),
                 style(theme.token(Token::Tool)),
             ))),
-            TranscriptLine::ToolResult { name, ok } => {
+            TranscriptLine::ToolResult { name, ok, output } => {
                 let marker = if *ok { "✓" } else { "✗" };
                 let token = if *ok { Token::ToolOk } else { Token::ToolErr };
                 out.push(TLine::from(Span::styled(
                     format!("  {marker} {name}"),
                     style(theme.token(token)),
                 )));
+                if let Some(content) = output {
+                    let spec = theme.token(token);
+                    if verbose {
+                        out.extend(tool_output_lines(content, spec));
+                    } else {
+                        let (preview, hidden) = tool_preview(content);
+                        out.extend(tool_output_lines(&preview, spec));
+                        if hidden > 0 {
+                            out.push(TLine::from(Span::styled(
+                                format!("    … {hidden} more line(s) — Ctrl+O to expand"),
+                                style(theme.token(Token::Notice)),
+                            )));
+                        }
+                    }
+                }
             }
             TranscriptLine::Notice(t) => out.push(TLine::from(Span::styled(
                 format!("• {t}"),
@@ -1640,7 +1712,7 @@ fn draw(
     let inner_w = chunks[0].width.saturating_sub(2);
     if !matches!(&model.md_cache, Some((r, w, _)) if *r == model.revision && *w == chunks[0].width)
     {
-        let rendered = transcript_lines(&model.transcript, theme, inner_w);
+        let rendered = transcript_lines(&model.transcript, theme, inner_w, model.verbose);
         model.md_cache = Some((model.revision, chunks[0].width, rendered));
     }
     let mut lines: Vec<TLine> = model.md_cache.as_ref().unwrap().2.clone();
@@ -2339,6 +2411,94 @@ mod tests {
         let detail = tool_detail("bash", Some(&json!({"command": long}))).unwrap();
         assert_eq!(detail.chars().count(), 120);
         assert!(detail.ends_with('…'));
+    }
+
+    /// Concatenate each rendered line's span text, for assertions.
+    fn line_texts(lines: &[TLine<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_preview_caps_lines_and_reports_hidden() {
+        // Short results pass through unchanged.
+        assert_eq!(tool_preview("one\ntwo"), ("one\ntwo".into(), 0));
+        // Long results keep the first five lines and count the remainder.
+        let long = (0..9).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let (preview, hidden) = tool_preview(&long);
+        assert_eq!(preview, "0\n1\n2\n3\n4");
+        assert_eq!(hidden, 4);
+        // CRLF is normalized.
+        assert_eq!(tool_preview("a\r\nb"), ("a\nb".into(), 0));
+        // The character cap is char-boundary safe.
+        let (preview, _) = tool_preview(&"é".repeat(1000));
+        assert_eq!(preview.chars().count(), 600);
+    }
+
+    #[test]
+    fn tool_result_renders_a_preview_then_expands_on_ctrl_o() {
+        let theme = Theme::dark();
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ToolStart {
+            name: "bash".into(),
+            id: None,
+            args: None,
+        });
+        m.apply_event(&Event::ToolEnd {
+            name: "bash".into(),
+            ok: true,
+            error: None,
+            output: Some("l0\nl1\nl2\nl3\nl4\nl5\nl6".into()),
+        });
+        // Collapsed by default: marker, first five indented lines, then a hint.
+        assert_eq!(
+            line_texts(&transcript_lines(&m.transcript, &theme, 80, m.verbose)),
+            vec![
+                "  ⚙ bash",
+                "  ✓ bash",
+                "  ⎿ l0",
+                "    l1",
+                "    l2",
+                "    l3",
+                "    l4",
+                "    … 2 more line(s) — Ctrl+O to expand",
+            ]
+        );
+        // Ctrl+O expands every tool result, with no hint.
+        let base = m.revision;
+        m.toggle_verbose();
+        assert!(m.verbose);
+        assert!(
+            m.revision > base,
+            "the toggle must invalidate the render cache"
+        );
+        let expanded = line_texts(&transcript_lines(&m.transcript, &theme, 80, m.verbose));
+        assert_eq!(expanded.len(), 2 + 7);
+        assert_eq!(expanded[8], "    l6");
+        assert!(expanded.iter().all(|l| !l.contains("Ctrl+O")));
+    }
+
+    #[test]
+    fn tool_result_without_output_renders_just_the_marker() {
+        let theme = Theme::dark();
+        let mut m = UiModel::new(state());
+        m.apply_event(&Event::ToolEnd {
+            name: "bash".into(),
+            ok: false,
+            error: Some("boom".into()),
+            output: None,
+        });
+        assert_eq!(
+            line_texts(&transcript_lines(&m.transcript, &theme, 80, m.verbose)),
+            vec!["  ✗ bash"]
+        );
     }
 
     #[test]

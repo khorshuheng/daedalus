@@ -179,6 +179,11 @@ pub enum Event {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The tool result text, so a frontend can render the output under the
+        /// call line (CRAB-158). Optional and omitted on the wire when empty,
+        /// so older event consumers keep working (CRAB-139).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
     },
     /// An assistant turn finished with a final answer (or an empty string
     /// when interrupted).
@@ -1309,6 +1314,7 @@ impl AgentRuntime {
                                     error: result_str
                                         .strip_prefix("tool error:")
                                         .map(|s| s.trim().to_string()),
+                                    output: (!result_str.is_empty()).then(|| result_str.clone()),
                                 });
                                 let mut h = self.inner.history.lock().unwrap();
                                 h.push(Message::ToolResult {
@@ -1884,6 +1890,13 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ToolEnd { name, ok: true, .. } if name == "bash")));
+        // CRAB-158: the same event carries the result text so a frontend can
+        // render the output under the call line.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ToolEnd { name, ok: true, output: Some(out), .. }
+                if name == "bash" && out.contains("hi")
+        )));
         // The bash result was fed back before the final completion.
         let h = rt.history();
         assert!(h
