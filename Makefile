@@ -16,7 +16,7 @@ CARGO_FLAGS ?=
 RELEASE_DIR := target/release
 BINS        := dl daedalus-server
 
-.PHONY: all build link unlink clean test check fmt
+.PHONY: all build link unlink clean test check fmt lint lint-cognitive
 
 ## Build the binaries and refresh the symlinks (default target).
 all: build link
@@ -59,3 +59,11 @@ check:
 ## Format the workspace.
 fmt:
 	$(CARGO) fmt --all
+
+## Lint the workspace.
+lint:
+	$(CARGO) clippy --workspace --all-targets --all-features --tests -- -D warnings
+
+## Lint cognitive complexity.
+lint-cognitive:
+	$(CARGO) clippy --workspace --all-targets --all-features --tests -- -D clippy::cognitive_complexity
