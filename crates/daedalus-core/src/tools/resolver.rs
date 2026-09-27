@@ -52,7 +52,7 @@ impl ToolSet {
         );
         set.push(
             "find",
-            "Find files by name/path regex or glob. Use this instead of `find`/`fd` in bash: it respects .gitignore and is bounded.",
+            "Find files by name/path regex or glob. Use this instead of `find`/`fd` in bash: it respects .gitignore and is bounded. Pass `paths` to filter an explicit list of candidate paths (e.g. from `git ls-files`) instead of walking the tree.",
             Box::new(FindTool { max_output }),
         );
         set.push(
