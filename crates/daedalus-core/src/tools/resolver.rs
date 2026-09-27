@@ -47,7 +47,7 @@ impl ToolSet {
         );
         set.push(
             "grep",
-            "Search file contents with a regex. Use this instead of `grep`/`rg` in bash: it respects .gitignore, skips hidden/binary files, and is bounded.",
+            "Search file contents with a regex. Use this instead of `grep`/`rg` in bash: it respects .gitignore, skips hidden/binary files, and is bounded. Pass `paths` to search an explicit list of candidate files (e.g. from `git ls-files`) instead of walking the tree.",
             Box::new(GrepTool { max_output }),
         );
         set.push(
