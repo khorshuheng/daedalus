@@ -1082,7 +1082,7 @@ impl AgentRuntime {
              - Paths are relative to the workspace by default; absolute paths and `..` are allowed.\n\
              - Read before editing; verify changes with bash.\n\
              - For content searches always use the `grep` tool and for filename searches always use the `find` tool; never call `grep`/`rg`/`find`/`fd` through bash.\n\
-             - To filter a list of paths produced by another command (e.g. `git ls-files`), pass them to the `find` tool's `paths` argument instead of piping into a shell `find`.\n\
+             - To search or filter an explicit list of paths produced by another command (e.g. `git ls-files`, `git diff --name-only`), pass them to the `find` or `grep` tool's `paths` argument instead of piping into a shell `find`/`grep`.\n\
              - Prefer the `read` tool over `cat`/`head`; use bash for commands, not for dumping files.\n\
              - Make the smallest change that satisfies the request.\n\
              - When finished, give a concise final answer.",
