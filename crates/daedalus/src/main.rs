@@ -57,25 +57,10 @@ struct Cli {
     /// from stdin and needs no <prompt>); tui is the full-screen interface.
     #[arg(long, value_name = "MODE", value_parser = parse_mode)]
     mode: Option<Mode>,
-
-    /// TUI theme preset: dark | light | solarized-dark | solarized-light
-    /// (default: detected from the terminal).
-    #[arg(long, value_name = "NAME", value_parser = parse_theme)]
-    theme: Option<String>,
 }
 
 fn parse_mode(s: &str) -> Result<Mode, String> {
     Mode::parse(s)
-}
-
-fn parse_theme(s: &str) -> Result<String, String> {
-    if daedalus_core::theme::Theme::builtin(s).is_some() {
-        Ok(s.to_string())
-    } else {
-        Err(format!(
-            "invalid --theme '{s}' (supported: dark, light, solarized-dark, solarized-light)"
-        ))
-    }
 }
 
 impl Cli {
@@ -84,19 +69,6 @@ impl Cli {
     /// file in `Config::load`).
     fn prompt(&self) -> String {
         self.prompt_parts.join(" ")
-    }
-
-    fn flags(&self) -> PartialConfig {
-        PartialConfig {
-            theme: self
-                .theme
-                .clone()
-                .map(|name| daedalus_core::theme::ThemePartial {
-                    name: Some(name),
-                    ..Default::default()
-                }),
-            ..Default::default()
-        }
     }
 }
 
@@ -137,7 +109,7 @@ fn run(cli: Cli) -> Result<i32, String> {
     let config = Config::load(
         default_workspace,
         config_path.as_deref(),
-        cli.flags(),
+        PartialConfig::default(),
         cli.api_key.clone(),
     )?;
 

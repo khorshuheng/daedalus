@@ -495,8 +495,8 @@ pub struct ThemePartial {
 
 impl ThemePartial {
     /// Merge `higher` over `self`: a set field in `higher` wins. Unlike scalar
-    /// config keys, the theme table merges per field, so a `--theme` name
-    /// override does not discard token overrides from the config file.
+    /// config keys, the theme table merges per field, so a name override does
+    /// not discard token overrides.
     pub fn overlay(&mut self, higher: &ThemePartial) {
         if higher.name.is_some() {
             self.name = higher.name.clone();

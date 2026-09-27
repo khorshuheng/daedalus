@@ -706,7 +706,7 @@ mod tests {
             c.theme.token(crate::theme::Token::User).fg,
             crate::theme::ThemeColor::Indexed(1)
         );
-        // A `--theme` name merges over the file but keeps its token overrides.
+        // A later theme name merges over the file but keeps its token overrides.
         let flags = PartialConfig {
             theme: Some(crate::theme::ThemePartial {
                 name: Some("dark".into()),
