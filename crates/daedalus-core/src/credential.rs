@@ -2,13 +2,13 @@
 //!
 //! Resolution order, applied when building the config:
 //!
-//! 1. `--api-key` flag (highest);
-//! 2. provider-native environment variable (`OPENAI_API_KEY`,
+//! 1. provider-native environment variable (`OPENAI_API_KEY`,
 //!    `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`);
-//! 3. the OS keyring (secret-service on Linux), where `/login` stores the key.
+//! 2. the OS keyring (secret-service on Linux), where `/login` stores the key.
 //!
-//! The keyring is best-effort: a headless run without a Secret Service
-//! falls back to flag/env and simply reports that no stored key exists.
+//! The keyring is best-effort: a headless run without a Secret Service falls
+//! back to the environment variable and simply reports that no stored key
+//! exists.
 
 use crate::config::ProviderInfo;
 
@@ -40,14 +40,10 @@ pub fn delete_api_key(provider: &ProviderInfo) -> Result<(), String> {
         .map_err(|e| format!("could not delete API key: {e}"))
 }
 
-/// Resolve the API key for `provider`: `flag` > provider-native env >
-/// keyring. Returns the key to attach to the config, or `None` when nothing
-/// is configured (providers then fail with a clear auth error at request
-/// time).
-pub fn resolve_api_key(provider: &ProviderInfo, flag: Option<String>) -> Option<String> {
-    if let Some(k) = flag {
-        return Some(k);
-    }
+/// Resolve the API key for `provider`: provider-native env > keyring. Returns
+/// the key to attach to the config, or `None` when nothing is configured
+/// (providers then fail with a clear auth error at request time).
+pub fn resolve_api_key(provider: &ProviderInfo) -> Option<String> {
     if let Some(name) = provider.api_key_env {
         if let Ok(k) = std::env::var(name) {
             if !k.is_empty() {
@@ -69,21 +65,16 @@ mod tests {
     }
 
     #[test]
-    fn flag_beats_env_beats_keyring() {
-        // flag wins over env.
+    fn env_beats_keyring() {
+        // env is used when set.
         std::env::set_var("OPENAI_API_KEY", "env-key");
         assert_eq!(
-            resolve_api_key(test_provider("openai"), Some("flag-key".into())).as_deref(),
-            Some("flag-key")
-        );
-        // env wins when no flag.
-        assert_eq!(
-            resolve_api_key(test_provider("openai"), None).as_deref(),
+            resolve_api_key(test_provider("openai")).as_deref(),
             Some("env-key")
         );
         std::env::remove_var("OPENAI_API_KEY");
-        // No env/flag: keyring (empty in tests) -> None.
-        assert_eq!(resolve_api_key(test_provider("openai"), None), None);
+        // No env: keyring (empty in tests) -> None.
+        assert_eq!(resolve_api_key(test_provider("openai")), None);
     }
 
     #[test]

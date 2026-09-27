@@ -5,7 +5,7 @@
 //! caps, workspace, session retention. Sources merge with documented
 //! precedence: `flags > config file > defaults` (the `DAEDALUS_*` env layer was
 //! removed). API keys are **not** a config key: they are resolved
-//! separately via `credential` (`--api-key` > provider-native env > OS
+//! separately via `credential` (provider-native env > OS
 //! keyring), so a secret can never be stored in the config file.
 //!
 //! Supported providers: a registry (`PROVIDERS`) grown from the original
@@ -409,15 +409,15 @@ impl PartialConfig {
 impl Config {
     /// Build a `Config` by merging the config `file`, then CLI `flags` over
     /// defaults — `flags > config file > defaults` (the env layer was
-    /// removed). `api_key_flag` feeds the resolution chain
-    /// (`--api-key` > provider-native env > keyring); the config file cannot
-    /// carry a secret, so an `api_key` key in it is rejected. `default_workspace`
-    /// is used unless an override supplies one.
+    /// removed). The API key is never a flag: it resolves against the final
+    /// provider from the provider-native environment variable, then the
+    /// keyring. The config file cannot carry a secret, so an `api_key` key in
+    /// it is rejected. `default_workspace` is used unless an override supplies
+    /// one.
     pub fn load(
         default_workspace: PathBuf,
         file: Option<&Path>,
         flags: PartialConfig,
-        api_key_flag: Option<String>,
     ) -> Result<Config, String> {
         let mut merged = PartialConfig::default();
         if let Some(path) = file {
@@ -430,7 +430,7 @@ impl Config {
                 .map_err(|e| format!("invalid config '{}': {e}", path.display()))?;
             if raw.get("api_key").is_some() {
                 return Err(format!(
-                    "invalid config '{}': api_key in the config file is not supported; set it via --api-key, a provider-native environment variable, or /login (keyring)",
+                    "invalid config '{}': api_key in the config file is not supported; set a provider-native environment variable or use /login (keyring)",
                     path.display()
                 ));
             }
@@ -439,12 +439,12 @@ impl Config {
             merged.overlay(&fc);
         }
         merged.overlay(&flags);
-        // Resolve the API key against the final provider (flag > env > keyring).
+        // Resolve the API key against the final provider (env > keyring).
         let info = match merged.provider.as_deref() {
             Some(name) => provider_by_name(name)?,
             None => default_provider(),
         };
-        let api_key = crate::credential::resolve_api_key(info, api_key_flag);
+        let api_key = crate::credential::resolve_api_key(info);
         merged.resolve(default_workspace, api_key)
     }
 }
@@ -607,7 +607,7 @@ mod tests {
     }
 
     fn load(ws: PathBuf, file: Option<&Path>, flags: PartialConfig) -> Result<Config, String> {
-        Config::load(ws, file, flags, None)
+        Config::load(ws, file, flags)
     }
 
     #[test]

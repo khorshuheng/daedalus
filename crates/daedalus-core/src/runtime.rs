@@ -860,12 +860,12 @@ impl AgentRuntime {
                 return;
             }
         };
-        let key = crate::credential::resolve_api_key(info, None);
+        let key = crate::credential::resolve_api_key(info);
         if info.requires_key() && key.as_deref().unwrap_or("").is_empty() {
             let env = info.api_key_env.unwrap_or("<PROVIDER>_API_KEY");
             self.emit(Event::Error {
                 message: format!(
-                    "no API key for provider '{}': set {env} or pass --api-key; note /login stores for the current provider",
+                    "no API key for provider '{}': set {env}, or run /login (stores for the current provider)",
                     info.name
                 ),
                 kind: Some(ErrorKind::Auth),
@@ -1526,7 +1526,7 @@ impl AgentRuntime {
                         crate::provider::ProviderError::Auth(_) => {
                             let info = *self.inner.provider_info.lock().unwrap();
                             format!(
-                                "authentication failed for provider '{}': check the API key ({}, --api-key, or /login) — {e}",
+                                "authentication failed for provider '{}': check the API key ({}, or /login) — {e}",
                                 info.name,
                                 info.api_key_env.unwrap_or("<PROVIDER>_API_KEY"),
                             )

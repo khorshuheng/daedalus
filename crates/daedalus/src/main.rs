@@ -48,10 +48,6 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Provider API key (default: provider-native env var, then the keyring).
-    #[arg(long, value_name = "KEY", hide = true)]
-    api_key: Option<String>,
-
     /// json | rpc | tui. Interactive use (the TUI) is the default on a
     /// terminal; json and rpc are headless modes (rpc reads JSON commands
     /// from stdin and needs no <prompt>); tui is the full-screen interface.
@@ -64,9 +60,7 @@ fn parse_mode(s: &str) -> Result<Mode, String> {
 }
 
 impl Cli {
-    /// Reassemble positional prompt words and the config-file precedence the
-    /// way the hand-rolled parser did (flags here are merged over env and
-    /// file in `Config::load`).
+    /// Reassemble the positional prompt words into a single instruction.
     fn prompt(&self) -> String {
         self.prompt_parts.join(" ")
     }
@@ -110,7 +104,6 @@ fn run(cli: Cli) -> Result<i32, String> {
         default_workspace,
         config_path.as_deref(),
         PartialConfig::default(),
-        cli.api_key.clone(),
     )?;
 
     let workspace = Workspace::new(config.workspace.clone())?;

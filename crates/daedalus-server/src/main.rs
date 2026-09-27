@@ -88,7 +88,7 @@ async fn main() -> Result<(), String> {
         max_iterations: cli.max_iterations,
         ..Default::default()
     };
-    let config = Config::load(default_workspace, cli.config.as_deref(), flags, None)
+    let config = Config::load(default_workspace, cli.config.as_deref(), flags)
         .map_err(|e| format!("{e}\n(supported providers: {})", provider_names()))?;
     let workspace = Workspace::new(config.workspace.clone())?;
 

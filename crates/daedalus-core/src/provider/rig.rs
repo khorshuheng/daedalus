@@ -521,7 +521,7 @@ impl Provider for RigProvider {
             // frontends still launch and `/login` stays reachable.
             if self.provider.requires_key() && self.api_key.is_empty() {
                 return Err(ProviderError::Auth(format!(
-                    "no API key configured; set {}, pass --api-key, or run /login",
+                    "no API key configured; set {} or run /login",
                     self.provider.api_key_env.unwrap_or("<PROVIDER>_API_KEY")
                 )));
             }
