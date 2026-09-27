@@ -10,13 +10,22 @@
 # `make CARGO_FLAGS=--locked`.
 
 CARGO       ?= cargo
+PYTHON      ?= python3
 PREFIX      ?= $(HOME)/.local
 BINDIR      ?= $(PREFIX)/bin
 CARGO_FLAGS ?=
 RELEASE_DIR := target/release
 BINS        := dl daedalus-server
 
-.PHONY: all build link unlink clean test check fmt lint lint-cognitive
+# rust-code-analysis CLI and the per-function cognitive-complexity ceiling
+# enforced by `make metrics-check`. The ceiling passes on the current tree;
+# ratchet it down as complex functions are split up.
+RCA                ?= rust-code-analysis-cli
+RCA_VERSION        ?= 0.0.25
+COGNITIVE_THRESHOLD ?= 100
+
+.PHONY: all build link unlink clean test check fmt lint lint-cognitive \
+        rca-install metrics metrics-check
 
 ## Build the binaries and refresh the symlinks (default target).
 all: build link
@@ -64,6 +73,25 @@ fmt:
 lint:
 	$(CARGO) clippy --workspace --all-targets --all-features --tests -- -D warnings
 
-## Lint cognitive complexity.
+## Lint cognitive complexity (clippy, per compiled function).
 lint-cognitive:
 	$(CARGO) clippy --workspace --all-targets --all-features --tests -- -D clippy::cognitive_complexity
+
+## Install the rust-code-analysis CLI into $(BINDIR).
+rca-install:
+	@mkdir -p "$(BINDIR)"
+	@case "$$(uname -s)-$$(uname -m)" in \
+		Linux-x86_64)  url="https://github.com/mozilla/rust-code-analysis/releases/download/v$(RCA_VERSION)/rust-code-analysis-linux-cli-x86_64.tar.gz" ;; \
+		Darwin-*)      url="https://github.com/mozilla/rust-code-analysis/releases/download/v$(RCA_VERSION)/rust-code-analysis-macos-cli-x86_64.tar.gz" ;; \
+		*) echo "unsupported platform $$(uname -s)-$$(uname -m); install manually with 'cargo install rust-code-analysis'" >&2; exit 1 ;; \
+	esac; \
+	curl -fsSL "$$url" | tar -xz -C "$(BINDIR)"; \
+	"$(BINDIR)/rust-code-analysis-cli" --version
+
+## Report the most complex functions (rust-code-analysis).
+metrics:
+	$(PYTHON) scripts/cognitive-complexity.py --rca "$(RCA)"
+
+## Fail if any function exceeds $(COGNITIVE_THRESHOLD) cognitive complexity.
+metrics-check:
+	$(PYTHON) scripts/cognitive-complexity.py --rca "$(RCA)" --threshold $(COGNITIVE_THRESHOLD)
