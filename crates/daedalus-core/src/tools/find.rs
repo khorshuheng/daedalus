@@ -7,14 +7,22 @@
 //! relative to the search root instead. `glob`/`type` filter which files are
 //! considered at all, the same way they do in `grep`. Everything is bounded: a
 //! total result cap, an output cap, and cooperative cancellation.
+//!
+//! Alternatively, `paths` supplies an explicit list of candidates (e.g. the
+//! output of `git ls-files` or `git diff --name-only`). The list is filtered
+//! by `kind`/`glob`/`type`/`pattern` directly, without walking the filesystem
+//! and without hidden/ignore rules — the caller named these paths, so they are
+//! wanted even inside `.git` or `node_modules`. This is the reason to reach
+//! for the tool instead of piping into a shell `find`, whose walk would comb
+//! those directories unfiltered.
 
 use futures::future::BoxFuture;
-use ignore::overrides::OverrideBuilder;
-use ignore::types::TypesBuilder;
-use ignore::{WalkBuilder, WalkState};
-use regex::RegexBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
+use ignore::types::{Types, TypesBuilder};
+use ignore::{Match, WalkBuilder, WalkState};
+use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 use super::{arg_usize, resolve, Tool, ToolError, ToolOutput};
@@ -39,7 +47,14 @@ impl Tool for FindTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regex matched against the file name (fd's PATTERN); omit to match every entry." },
-                "path": { "type": "string", "description": "Directory to search (default: the workspace root)." },
+                "path": { "type": "string", "description": "Directory to search (default: the workspace root). Ignored when `paths` is set." },
+                "paths": {
+                    "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "type": "string" } }
+                    ],
+                    "description": "Explicit candidate paths to filter instead of walking (e.g. from `git ls-files`). Hidden/ignore rules do not apply. One path or a list."
+                },
                 "glob": {
                     "oneOf": [
                         { "type": "string" },
@@ -107,6 +122,91 @@ fn get_globs(args: &Value) -> Result<Vec<String>, ToolError> {
     }
 }
 
+/// `paths` accepts a single string or an array of strings; absent means walk.
+fn get_paths(args: &Value) -> Result<Option<Vec<String>>, ToolError> {
+    match args.get("paths") {
+        None => Ok(None),
+        Some(Value::String(s)) => Ok(Some(vec![s.clone()])),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| ToolError::Argument("'paths' entries must be strings".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(ToolError::Argument(
+            "'paths' must be a string or an array of strings".into(),
+        )),
+    }
+}
+
+/// Build the glob override matcher for `root`, or `None` when no globs were
+/// given. Shared by the filesystem walk and the explicit-`paths` filter so the
+/// two agree on include/exclude semantics.
+fn build_overrides(root: &Path, globs: &[String]) -> Result<Option<Override>, ToolError> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut ob = OverrideBuilder::new(root);
+    for g in globs {
+        ob.add(g)
+            .map_err(|e| ToolError::Argument(format!("bad glob '{g}': {e}")))?;
+    }
+    ob.build()
+        .map(Some)
+        .map_err(|e| ToolError::Argument(format!("bad globs: {e}")))
+}
+
+/// Build the file-type matcher for `t`, or fail with the same error the walk
+/// path used to raise.
+fn build_types(t: &str) -> Result<Types, ToolError> {
+    let mut tb = TypesBuilder::new();
+    tb.add_defaults();
+    tb.select(t);
+    tb.build()
+        .map_err(|e| ToolError::Argument(format!("bad type '{t}': {e}")))
+}
+
+/// The per-path filter both the walker and the explicit-`paths` mode apply:
+/// first the `kind` (file/dir/symlink/any), then the regex — against the file
+/// name, or the root-relative path when `full_path` is set.
+struct PathFilter<'a> {
+    re: Option<&'a Regex>,
+    full_path: bool,
+    root: &'a Path,
+    kind: &'a str,
+}
+
+impl PathFilter<'_> {
+    fn matches(&self, path: &Path, file_type: std::fs::FileType) -> bool {
+        let kind_ok = match self.kind {
+            "file" => file_type.is_file(),
+            "dir" => file_type.is_dir(),
+            "symlink" => file_type.is_symlink(),
+            _ => true,
+        };
+        if !kind_ok {
+            return false;
+        }
+        let Some(re) = self.re else {
+            return true;
+        };
+        let subject = if self.full_path {
+            path.strip_prefix(self.root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        } else {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        re.is_match(&subject)
+    }
+}
+
 impl FindTool {
     fn run_sync(
         &self,
@@ -165,11 +265,12 @@ impl FindTool {
             )));
         }
 
+        let explicit = get_paths(args)?;
         let root = match args.get("path").and_then(Value::as_str) {
-            Some(p) => resolve(workspace, Path::new(p))?,
-            None => workspace.root().to_path_buf(),
+            Some(p) if explicit.is_none() => resolve(workspace, Path::new(p))?,
+            _ => workspace.root().to_path_buf(),
         };
-        if !root.exists() {
+        if explicit.is_none() && !root.exists() {
             return Err(ToolError::NotFound(
                 args.get("path")
                     .and_then(Value::as_str)
@@ -178,104 +279,109 @@ impl FindTool {
             ));
         }
 
-        // The `ignore` walker: defaults already skip hidden entries and honor
-        // .gitignore/.ignore, exactly like `fd`.
-        let mut wb = WalkBuilder::new(&root);
-        if hidden {
-            wb.hidden(false);
-        }
-        if follow {
-            wb.follow_links(true);
-        }
-        if no_ignore {
-            wb.ignore(false)
-                .git_ignore(false)
-                .git_global(false)
-                .git_exclude(false)
-                .parents(false);
-        }
-        if let Some(depth) = max_depth {
-            wb.max_depth(Some(depth));
-        }
         let globs = get_globs(args)?;
-        if !globs.is_empty() {
-            let mut ob = OverrideBuilder::new(&root);
-            for g in &globs {
-                ob.add(g)
-                    .map_err(|e| ToolError::Argument(format!("bad glob '{g}': {e}")))?;
-            }
-            wb.overrides(
-                ob.build()
-                    .map_err(|e| ToolError::Argument(format!("bad globs: {e}")))?,
-            );
-        }
-        if let Some(t) = args.get("type").and_then(Value::as_str) {
-            let mut tb = TypesBuilder::new();
-            tb.add_defaults();
-            tb.select(t);
-            wb.types(
-                tb.build()
-                    .map_err(|e| ToolError::Argument(format!("bad type '{t}': {e}")))?,
-            );
-        }
+        let overrides = build_overrides(&root, &globs)?;
+        let types = match args.get("type").and_then(Value::as_str) {
+            Some(t) => Some(build_types(t)?),
+            None => None,
+        };
 
-        // Parallel directory walk: filter by kind and pattern up front, so only
-        // matching paths are ever buffered.
-        let collected: std::sync::Mutex<Vec<std::path::PathBuf>> =
-            std::sync::Mutex::new(Vec::new());
-        let walker = wb.build_parallel();
-        let kind = kind.as_str();
-        walker.run(|| {
-            let collected = &collected;
-            let re = re.as_ref();
-            let root = &root;
-            Box::new(move |result| {
+        let filter = PathFilter {
+            re: re.as_ref(),
+            full_path,
+            root: &root,
+            kind: kind.as_str(),
+        };
+
+        let mut paths: Vec<PathBuf> = if let Some(list) = explicit {
+            // Explicit candidate paths: filter the list in place. The walker's
+            // hidden/ignore rules do not apply — the caller named these paths,
+            // so they are wanted even under `.git` or `node_modules`.
+            let mut out = Vec::new();
+            for p in list {
                 if cancel.is_cancelled() {
-                    return WalkState::Quit;
+                    return Err(ToolError::Cancelled);
                 }
-                let Ok(entry) = result else {
-                    return WalkState::Continue;
+                let path = resolve(workspace, Path::new(&p))?;
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
                 };
-                // The root entry itself (depth 0) is never a result.
-                if entry.depth() == 0 {
-                    return WalkState::Continue;
-                }
-                let Some(file_type) = entry.file_type() else {
-                    return WalkState::Continue;
-                };
-                let matches_kind = match kind {
-                    "file" => file_type.is_file(),
-                    "dir" => file_type.is_dir(),
-                    "symlink" => file_type.is_symlink(),
-                    _ => true,
-                };
-                if !matches_kind {
-                    return WalkState::Continue;
-                }
-                if let Some(re) = re {
-                    let path = entry.path();
-                    let subject = if full_path {
-                        path.strip_prefix(root)
-                            .unwrap_or(path)
-                            .display()
-                            .to_string()
-                    } else {
-                        path.file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default()
-                    };
-                    if !re.is_match(&subject) {
-                        return WalkState::Continue;
+                let ft = meta.file_type();
+                if let Some(ovr) = &overrides {
+                    if matches!(ovr.matched(&path, ft.is_dir()), Match::Ignore(_)) {
+                        continue;
                     }
                 }
-                collected
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(entry.into_path());
-                WalkState::Continue
-            })
-        });
-        let mut paths = collected.into_inner().unwrap_or_else(|e| e.into_inner());
+                if let Some(types) = &types {
+                    if matches!(types.matched(&path, ft.is_dir()), Match::Ignore(_)) {
+                        continue;
+                    }
+                }
+                if filter.matches(&path, ft) {
+                    out.push(path);
+                }
+            }
+            out
+        } else {
+            // The `ignore` walker: defaults already skip hidden entries and
+            // honor .gitignore/.ignore, exactly like `fd`.
+            let mut wb = WalkBuilder::new(&root);
+            if hidden {
+                wb.hidden(false);
+            }
+            if follow {
+                wb.follow_links(true);
+            }
+            if no_ignore {
+                wb.ignore(false)
+                    .git_ignore(false)
+                    .git_global(false)
+                    .git_exclude(false)
+                    .parents(false);
+            }
+            if let Some(depth) = max_depth {
+                wb.max_depth(Some(depth));
+            }
+            if let Some(overrides) = overrides.clone() {
+                wb.overrides(overrides);
+            }
+            if let Some(types) = types.clone() {
+                wb.types(types);
+            }
+
+            // Parallel directory walk: filter by kind and pattern up front, so
+            // only matching paths are ever buffered.
+            let collected: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+            let walker = wb.build_parallel();
+            walker.run(|| {
+                let collected = &collected;
+                let filter = &filter;
+                Box::new(move |result| {
+                    if cancel.is_cancelled() {
+                        return WalkState::Quit;
+                    }
+                    let Ok(entry) = result else {
+                        return WalkState::Continue;
+                    };
+                    // The root entry itself (depth 0) is never a result.
+                    if entry.depth() == 0 {
+                        return WalkState::Continue;
+                    }
+                    let Some(file_type) = entry.file_type() else {
+                        return WalkState::Continue;
+                    };
+                    if !filter.matches(entry.path(), file_type) {
+                        return WalkState::Continue;
+                    }
+                    collected
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(entry.into_path());
+                    WalkState::Continue
+                })
+            });
+            collected.into_inner().unwrap_or_else(|e| e.into_inner())
+        };
         if cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
@@ -524,5 +630,69 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn paths_filters_the_list_without_walking() {
+        let (ws, dir) = setup("paths");
+        write(dir.path(), "a.rs");
+        write(dir.path(), "b.txt");
+        // Not listed: must not appear even though it matches the pattern.
+        write(dir.path(), "c.rs");
+        let out = run(&ws, json!({"paths": ["a.rs", "b.txt"], "pattern": "\\.rs$"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn paths_ignores_hidden_and_gitignore_rules() {
+        let (ws, dir) = setup("paths-hidden");
+        write(dir.path(), ".git/objects/aa");
+        write(dir.path(), "built/output.txt");
+        std::fs::write(dir.path().join(".gitignore"), "built/\n").unwrap();
+        let out = run(
+            &ws,
+            json!({"paths": [".git/objects/aa", "built/output.txt"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.content, ".git/objects/aa\nbuilt/output.txt");
+    }
+
+    #[tokio::test]
+    async fn paths_accepts_a_single_string() {
+        let (ws, dir) = setup("paths-single");
+        write(dir.path(), "a.txt");
+        let out = run(&ws, json!({"paths": "a.txt"})).await.unwrap();
+        assert_eq!(out.content, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn paths_applies_glob() {
+        let (ws, dir) = setup("paths-glob");
+        write(dir.path(), "a.rs");
+        write(dir.path(), "b.txt");
+        let out = run(&ws, json!({"paths": ["a.rs", "b.txt"], "glob": "*.rs"}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "a.rs");
+    }
+
+    #[tokio::test]
+    async fn paths_skips_missing_entries() {
+        let (ws, dir) = setup("paths-missing");
+        write(dir.path(), "a.txt");
+        let out = run(&ws, json!({"paths": ["a.txt", "nope.txt"]}))
+            .await
+            .unwrap();
+        assert_eq!(out.content, "a.txt");
+    }
+
+    #[tokio::test]
+    async fn paths_rejects_non_string_entries() {
+        let (ws, _dir) = setup("paths-bad");
+        let err = run(&ws, json!({"paths": [1, 2]})).await.unwrap_err();
+        assert!(matches!(err, ToolError::Argument(_)), "{err:?}");
     }
 }
