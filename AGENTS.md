@@ -44,6 +44,6 @@ handing off a change. Tests live in-module under `#[cfg(test)]` and in
   inferred from the code.
 - **Tool descriptions are user-facing** (they ship to the model). Keep them
   accurate and terse.
-- The built-in tools are `read`, `grep`, `bash`, `edit`, and `write`.
+- The built-in tools are `read`, `grep`, `find`, `bash`, `edit`, and `write`.
 - The TUI is the interactive frontend, and
   headless use requires an explicit `--mode`.

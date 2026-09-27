@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    bash::BashTool, edit::EditTool, grep::GrepTool, read::ReadTool, write::WriteTool, Tool,
-    ToolError, ToolOutput,
+    bash::BashTool, edit::EditTool, find::FindTool, grep::GrepTool, read::ReadTool,
+    write::WriteTool, Tool, ToolError, ToolOutput,
 };
 use crate::workspace::Workspace;
 
@@ -49,6 +49,11 @@ impl ToolSet {
             "grep",
             "Search file contents with a regex. Use this instead of `grep`/`rg` in bash: it respects .gitignore, skips hidden/binary files, and is bounded.",
             Box::new(GrepTool { max_output }),
+        );
+        set.push(
+            "find",
+            "Find files by name/path regex or glob. Use this instead of `find`/`fd` in bash: it respects .gitignore and is bounded.",
+            Box::new(FindTool { max_output }),
         );
         set.push(
             "bash",
@@ -230,7 +235,7 @@ mod tests {
     fn exposes_builtin_tool_schemas() {
         let ts = ToolSet::new(1000);
         let schemas = ts.tool_schemas();
-        assert_eq!(schemas.len(), 5);
+        assert_eq!(schemas.len(), 6);
         for s in &schemas {
             assert!(s.get("name").is_some());
             assert!(s.get("description").is_some());
@@ -288,7 +293,7 @@ mod tests {
                 name: "mcp__echo__echo".into(),
             }),
         );
-        assert_eq!(ts.tool_schemas().len(), 6);
+        assert_eq!(ts.tool_schemas().len(), 7);
         assert!(ts
             .listing()
             .iter()
@@ -380,6 +385,6 @@ mod tests {
         let cfg = crate::config::Config::defaults(ws.root().to_path_buf());
         let (ts, warnings) = ToolSet::from_config(&cfg, 1000);
         assert!(warnings.is_empty());
-        assert_eq!(ts.tool_schemas().len(), 5);
+        assert_eq!(ts.tool_schemas().len(), 6);
     }
 }

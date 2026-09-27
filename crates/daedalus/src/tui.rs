@@ -2756,7 +2756,7 @@ mod tests {
             &mut login_pending,
             SlashCommand::Tools,
         );
-        for builtin in ["read", "bash", "grep", "edit", "write"] {
+        for builtin in ["read", "bash", "grep", "find", "edit", "write"] {
             assert!(
                 model
                     .transcript
