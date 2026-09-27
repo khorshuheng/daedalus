@@ -1,4 +1,4 @@
-//! The `search` tool: ripgrep-style content search over the
+//! The `grep` tool: ripgrep-style content search over the
 //! workspace.
 //!
 //! Traversal uses the `ignore` crate — the same walker ripgrep uses — so the
@@ -37,13 +37,13 @@ const MAX_SEARCH_FILE: u64 = 4 * 1024 * 1024;
 /// Total bytes read across all files before the search stops.
 const MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
 
-pub struct SearchTool {
+pub struct GrepTool {
     pub max_output: usize,
 }
 
-impl Tool for SearchTool {
+impl Tool for GrepTool {
     fn name(&self) -> &'static str {
-        "search"
+        "grep"
     }
 
     fn schema(&self) -> Value {
@@ -101,7 +101,7 @@ impl Tool for SearchTool {
             let ws = workspace.clone();
             let args = args.clone();
             tokio::task::spawn_blocking(move || {
-                SearchTool { max_output }.run_sync(&ws, &args, &cancel)
+                GrepTool { max_output }.run_sync(&ws, &args, &cancel)
             })
             .await
             .unwrap_or_else(|e| Err(ToolError::Io(format!("blocking task failed: {e}"))))
@@ -226,7 +226,7 @@ fn count_matches(
     n
 }
 
-impl SearchTool {
+impl GrepTool {
     fn run_sync(
         &self,
         workspace: &Workspace,
@@ -666,7 +666,7 @@ mod tests {
     }
 
     async fn run(ws: &Workspace, args: Value) -> Result<ToolOutput, ToolError> {
-        SearchTool {
+        GrepTool {
             max_output: 100_000,
         }
         .run(ws, &args, CancellationToken::new())
@@ -988,7 +988,7 @@ mod tests {
         write(dir.path(), "a.txt", "x\n");
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let err = SearchTool { max_output: 1000 }
+        let err = GrepTool { max_output: 1000 }
             .run(&ws, &json!({"pattern": "x"}), cancel)
             .await
             .unwrap_err();

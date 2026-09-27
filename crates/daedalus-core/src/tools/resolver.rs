@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    bash::BashTool, edit::EditTool, read::ReadTool, search::SearchTool, write::WriteTool, Tool,
+    bash::BashTool, edit::EditTool, grep::GrepTool, read::ReadTool, write::WriteTool, Tool,
     ToolError, ToolOutput,
 };
 use crate::workspace::Workspace;
@@ -46,9 +46,9 @@ impl ToolSet {
             Box::new(ReadTool { max_output }),
         );
         set.push(
-            "search",
+            "grep",
             "Search file contents with a regex. Use this instead of `grep`/`rg` in bash: it respects .gitignore, skips hidden/binary files, and is bounded.",
-            Box::new(SearchTool { max_output }),
+            Box::new(GrepTool { max_output }),
         );
         set.push(
             "bash",
@@ -223,7 +223,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("unknown tool 'frobnicate'"));
-        assert!(err.to_string().contains("search"));
+        assert!(err.to_string().contains("grep"));
     }
 
     #[test]
@@ -255,18 +255,18 @@ mod tests {
         assert!(err.to_string().contains("'path' must be a string"));
     }
 
-    /// Regression: `search`'s schema declared `glob` as array-only while the
+    /// Regression: `grep`'s schema declared `glob` as array-only while the
     /// executor accepts a bare string, so a string glob was rejected by
     /// validation before the tool ever ran.
     #[tokio::test]
-    async fn search_accepts_a_bare_string_glob() {
+    async fn grep_accepts_a_bare_string_glob() {
         let (_dir, ws) = workspace("glob");
         std::fs::write(ws.root().join("a.rs"), "needle\n").unwrap();
         let ts = ToolSet::new(1000);
         let out = ts
             .execute(
                 &ws,
-                "search",
+                "grep",
                 &json!({"pattern": "needle", "glob": "*.rs"}),
                 CancellationToken::new(),
             )

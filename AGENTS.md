@@ -15,7 +15,6 @@ a headless server.
   `--mode json` / `--mode rpc` adapters, and the ratatui TUI.
 - `crates/daedalus-server` — the headless WebSocket server frontend over the
   same `AgentRuntime` protocol.
-- `docs/open-items.md` — candidates that are not scheduled yet.
 
 ## Build, test, format
 
@@ -41,10 +40,10 @@ handing off a change. Tests live in-module under `#[cfg(test)]` and in
   worker thread). The library never uses `#[tokio::main]`; the crate stays
   runtime-agnostic at its boundaries.
 - **Comments are prose.** Doc and line comments explain behavior and *why*;
-  they do not cite internal ticket ids. If a sentence only parses with a ticket
-  reference in it, rewrite it.
+  they do not cite internal ticket ids. Avoid adding comments which can be
+  inferred from the code.
 - **Tool descriptions are user-facing** (they ship to the model). Keep them
   accurate and terse.
-- The built-in tools are `read`, `search`, `bash`, `edit`, and `write`.
-- The interactive REPL was removed; the TUI is the interactive frontend, and
+- The built-in tools are `read`, `grep`, `bash`, `edit`, and `write`.
+- The TUI is the interactive frontend, and
   headless use requires an explicit `--mode`.

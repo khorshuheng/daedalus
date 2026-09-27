@@ -7,10 +7,10 @@
 
 pub mod bash;
 pub mod edit;
+pub mod grep;
 pub mod mutation;
 pub mod read;
 pub mod resolver;
-pub mod search;
 pub mod write;
 
 use std::path::Path;

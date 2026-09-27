@@ -371,14 +371,16 @@ fn run_command(
 }
 
 /// Block on the waiter channel until the child exits, the deadline elapses, or
-/// cancellation fires. Without a deadline it wakes periodically to check the
-/// cancel token rather than busy-polling the process.
+/// cancellation fires. It wakes at least every 50ms to check the cancel
+/// token rather than blocking for the whole remaining deadline, so an abort
+/// is noticed promptly even when a long timeout is set.
 fn wait_loop(
     rx: &std::sync::mpsc::Receiver<std::io::Result<ExitStatus>>,
     deadline: Option<Instant>,
     cancel: &CancellationToken,
 ) -> WaitOutcome {
     use std::sync::mpsc::RecvTimeoutError;
+    const POLL: Duration = Duration::from_millis(50);
     loop {
         if cancel.is_cancelled() {
             return WaitOutcome::Cancelled;
@@ -389,17 +391,18 @@ fn wait_loop(
                 if now >= deadline {
                     return WaitOutcome::TimedOut;
                 }
-                deadline - now
+                (deadline - now).min(POLL)
             }
-            None => Duration::from_millis(50),
+            None => POLL,
         };
         match rx.recv_timeout(timeout) {
             Ok(Ok(status)) => return WaitOutcome::Exited(status),
             Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => return WaitOutcome::Cancelled,
             Err(RecvTimeoutError::Timeout) => {
-                if deadline.is_some() {
-                    return WaitOutcome::TimedOut;
-                }
+                // A poll-interval wakeup, not necessarily the real deadline
+                // (the wait is capped to `POLL` so cancellation gets
+                // checked promptly); the top of the loop re-checks both the
+                // cancel token and `now >= deadline` before waiting again.
             }
         }
     }
@@ -838,6 +841,33 @@ mod tests {
         cancel.cancel();
         let result = handle.join().unwrap();
         assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    /// Cancellation must be noticed quickly even when a long timeout is also
+    /// set: the deadline used to make `wait_loop` block for the whole
+    /// remaining timeout before it re-checked the cancel token.
+    #[test]
+    fn cancel_is_prompt_even_with_a_long_timeout() {
+        let (ws, _dir) = setup("cancel-with-timeout");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
+        let cancel = CancellationToken::new();
+        let cancel2 = cancel.clone();
+        let start = std::time::Instant::now();
+        let handle = std::thread::spawn(move || {
+            block_on(tool.run(&ws, &json!({"command": "sleep 30", "timeout": 60}), cancel2))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        cancel.cancel();
+        let result = handle.join().unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)), "{result:?}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "cancel took too long: {:?}",
+            start.elapsed()
+        );
     }
 
     #[cfg(unix)]
