@@ -18,6 +18,11 @@
 //! searched directly, without walking the filesystem and without hidden/ignore
 //! rules — the caller named these paths, so they are wanted even inside `.git`
 //! or `node_modules`. `glob`/`type` still apply.
+//!
+//! `path` narrows the walk to a single file or directory. A named path is
+//! always searched, even when `.gitignore`/`.ignore` would exclude it, so
+//! ignored trees such as `vendor/` stay reachable on demand; `no_ignore` widens
+//! that to the whole walk.
 
 use futures::future::BoxFuture;
 use ignore::overrides::{Override, OverrideBuilder};
@@ -57,7 +62,7 @@ impl Tool for GrepTool {
             "type": "object",
             "properties": {
                 "pattern": { "type": "string", "description": "Regex to search for (Rust regex syntax)." },
-                "path": { "type": "string", "description": "File or directory to search (default: the workspace root). Ignored when `paths` is set." },
+                "path": { "type": "string", "description": "File or directory to search (default: the workspace root). A named path is searched even when .gitignore/.ignore exclude it. Ignored when `paths` is set." },
                 "paths": {
                     "oneOf": [
                         { "type": "string" },
@@ -95,7 +100,7 @@ impl Tool for GrepTool {
                 "sort_reverse": { "type": "boolean", "description": "Reverse the sort order (rg --sortr)." },
                 "max_columns": { "type": "integer", "minimum": 1, "description": "Clip each displayed line to this many characters (rg -M; default 200)." },
                 "hidden": { "type": "boolean", "description": "Also search hidden files and directories (rg --hidden)." },
-                "no_ignore": { "type": "boolean", "description": "Do not respect .gitignore/.ignore (rg --no-ignore)." },
+                "no_ignore": { "type": "boolean", "description": "Do not respect .gitignore/.ignore (rg --no-ignore); searches excluded trees like `vendor/`." },
                 "follow": { "type": "boolean", "description": "Follow symbolic links (rg -L)." },
                 "max_results": { "type": "integer", "minimum": 1, "description": "Total match cap for this call (default 100, max 1000)." }
             },
@@ -812,6 +817,54 @@ mod tests {
         assert!(out.content.contains("visible.txt"), "{}", out.content);
         assert!(!out.content.contains("hidden.txt"), "{}", out.content);
         assert!(!out.content.contains("built.txt"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn ignore_file_excludes_a_directory() {
+        let (ws, dir) = setup("dotignore");
+        write(dir.path(), "top.txt", "needle\n");
+        write(dir.path(), "vendor/lib/src/a.rs", "needle\n");
+        std::fs::write(dir.path().join(".ignore"), "/vendor\n").unwrap();
+        let out = run(&ws, json!({"pattern": "needle"})).await.unwrap();
+        assert!(out.content.contains("top.txt"), "{}", out.content);
+        assert!(!out.content.contains("a.rs"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn explicit_path_searches_an_ignored_directory() {
+        let (ws, dir) = setup("dotignore-path");
+        write(dir.path(), "top.txt", "needle\n");
+        write(dir.path(), "vendor/lib/src/a.rs", "needle\n");
+        std::fs::write(dir.path().join(".ignore"), "/vendor\n").unwrap();
+        let out = run(&ws, json!({"pattern": "needle", "path": "vendor/lib"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("a.rs"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn explicit_path_searches_a_gitignored_directory() {
+        let (ws, dir) = setup("gitignore-path");
+        write(dir.path(), "top.txt", "needle\n");
+        write(dir.path(), "target/built.txt", "needle\n");
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "/target\n").unwrap();
+        let out = run(&ws, json!({"pattern": "needle", "path": "target"}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("built.txt"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn no_ignore_searches_ignored_directories() {
+        let (ws, dir) = setup("dotignore-noignore");
+        write(dir.path(), "top.txt", "needle\n");
+        write(dir.path(), "vendor/lib/src/a.rs", "needle\n");
+        std::fs::write(dir.path().join(".ignore"), "/vendor\n").unwrap();
+        let out = run(&ws, json!({"pattern": "needle", "no_ignore": true}))
+            .await
+            .unwrap();
+        assert!(out.content.contains("a.rs"), "{}", out.content);
     }
 
     #[tokio::test]
