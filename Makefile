@@ -18,13 +18,14 @@ RELEASE_DIR := target/release
 BINS        := dl daedalus-server
 
 # rust-code-analysis CLI and the per-function cognitive-complexity ceiling
-# enforced by `make metrics-check`. The ceiling passes on the current tree;
-# ratchet it down as complex functions are split up.
+# enforced by `make metrics-check`; this is the only cognitive-complexity
+# check. The ceiling passes on the current tree; ratchet it down as complex
+# functions are split up.
 RCA                ?= rust-code-analysis-cli
 RCA_VERSION        ?= 0.0.25
 COGNITIVE_THRESHOLD ?= 100
 
-.PHONY: all build link unlink clean test check fmt lint lint-cognitive \
+.PHONY: all build link unlink clean test check fmt lint \
         rca-install metrics metrics-check
 
 ## Build the binaries and refresh the symlinks (default target).
@@ -72,10 +73,6 @@ fmt:
 ## Lint the workspace.
 lint:
 	$(CARGO) clippy --workspace --all-targets --all-features --tests -- -D warnings
-
-## Lint cognitive complexity (clippy, per compiled function).
-lint-cognitive:
-	$(CARGO) clippy --workspace --all-targets --all-features --tests -- -D clippy::cognitive_complexity
 
 ## Install the rust-code-analysis CLI into $(BINDIR).
 rca-install:

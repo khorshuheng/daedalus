@@ -31,15 +31,14 @@ handing off a change. Tests live in-module under `#[cfg(test)]` and in
 
 ## Complexity metrics
 
-`cargo clippy` is the linter and the build gate; it reports per-function
-complexity only for the crates it compiles. For a repo-wide view — which
-functions and files are getting hard to read, and how size and complexity are
-trending — use [rust-code-analysis][rca] through `make metrics`, which ranks
-functions by cognitive and cyclomatic complexity, and `make metrics-check`,
-which fails when any function exceeds `COGNITIVE_THRESHOLD` (default 100). The
-threshold currently clears the tree, so ratchet it down as the worst functions
-are split up. `make rca-install` drops the pinned release binary into
-`$(BINDIR)`; the metrics tool is optional and never required to build or test.
+`cargo clippy` is the linter and the build gate, but it deliberately does not
+enforce cognitive complexity here. That check lives in
+[rust-code-analysis][rca], applied through `make metrics`, which ranks functions
+by cognitive and cyclomatic complexity, and `make metrics-check`, which fails
+when any function exceeds `COGNITIVE_THRESHOLD` (default 100). The threshold
+currently clears the tree, so ratchet it down as the worst functions are split
+up. `make rca-install` drops the pinned release binary into `$(BINDIR)`; the
+metrics tool is optional and never required to build or test.
 
 [rca]: https://github.com/mozilla/rust-code-analysis
 
