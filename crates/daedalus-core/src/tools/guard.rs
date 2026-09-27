@@ -44,13 +44,13 @@ enum Kind {
     Name,
 }
 
-/// One token of the command: a word (quotes stripped, `quoted` when any part
-/// of it was quoted) or a statement separator (`;`, `&&`, `||`, `&`, newline).
-/// A single `|` is *not* a separator: a pipe stage is a bounded filter, and
-/// the guard judges only each statement's head.
+/// One token of the command: a word with quotes resolved, or a statement
+/// separator (`;`, `&&`, `||`, `&`, newline). A single `|` is *not* a
+/// separator: a pipe stage is a bounded filter, and the guard judges only
+/// each statement's head.
 #[derive(Debug, PartialEq, Eq)]
 enum Seg {
-    Word(String, bool),
+    Word(String),
     Sep,
 }
 
@@ -78,7 +78,7 @@ fn statements(segs: &[Seg]) -> Vec<Vec<&str>> {
                     out.push(std::mem::take(&mut current));
                 }
             }
-            Seg::Word(w, _) => current.push(w.as_str()),
+            Seg::Word(w) => current.push(w.as_str()),
         }
     }
     if !current.is_empty() {
@@ -173,19 +173,18 @@ fn refusal_message(tool: &str, kind: Kind) -> String {
 }
 
 /// Tokenize `command` quote-aware: separators outside quotes split statements,
-/// and a quoted word is kept intact (so `echo "grep -r x"` has head `echo`).
+/// and quoting keeps its contents in the same word, so `echo "grep -r x"`
+/// heads with `echo` and is allowed.
 fn segments(command: &str) -> Vec<Seg> {
     // 0 = unquoted, 1 = single-quoted, 2 = double-quoted.
     let mut state = 0u8;
     let mut out = Vec::new();
     let mut word = String::new();
-    let mut quoted = false;
     let mut chars = command.chars().peekable();
 
-    fn flush(word: &mut String, quoted: &mut bool, out: &mut Vec<Seg>) {
+    fn flush(word: &mut String, out: &mut Vec<Seg>) {
         if !word.is_empty() {
-            out.push(Seg::Word(std::mem::take(word), *quoted));
-            *quoted = false;
+            out.push(Seg::Word(std::mem::take(word)));
         }
     }
 
@@ -194,7 +193,6 @@ fn segments(command: &str) -> Vec<Seg> {
             1 => {
                 if c == '\'' {
                     state = 0;
-                    quoted = true;
                 } else {
                     word.push(c);
                 }
@@ -202,7 +200,6 @@ fn segments(command: &str) -> Vec<Seg> {
             2 => {
                 if c == '"' {
                     state = 0;
-                    quoted = true;
                 } else if c == '\\' {
                     if let Some(next) = chars.next() {
                         word.push(next);
@@ -214,11 +211,9 @@ fn segments(command: &str) -> Vec<Seg> {
             _ => match c {
                 '\'' => {
                     state = 1;
-                    quoted = true;
                 }
                 '"' => {
                     state = 2;
-                    quoted = true;
                 }
                 '\\' => {
                     if let Some(next) = chars.next() {
@@ -226,13 +221,13 @@ fn segments(command: &str) -> Vec<Seg> {
                     }
                 }
                 c if c.is_whitespace() => {
-                    flush(&mut word, &mut quoted, &mut out);
+                    flush(&mut word, &mut out);
                     if c == '\n' {
                         out.push(Seg::Sep);
                     }
                 }
                 ';' | '&' => {
-                    flush(&mut word, &mut quoted, &mut out);
+                    flush(&mut word, &mut out);
                     // `&&` is one separator, not two.
                     if c == '&' && chars.peek() == Some(&'&') {
                         chars.next();
@@ -243,7 +238,7 @@ fn segments(command: &str) -> Vec<Seg> {
                 // grep -i fix` stays one statement headed by `git`. `||` is a
                 // real separator, so the command after it is judged.
                 '|' => {
-                    flush(&mut word, &mut quoted, &mut out);
+                    flush(&mut word, &mut out);
                     if chars.peek() == Some(&'|') {
                         chars.next();
                         out.push(Seg::Sep);
@@ -253,7 +248,7 @@ fn segments(command: &str) -> Vec<Seg> {
             },
         }
     }
-    flush(&mut word, &mut quoted, &mut out);
+    flush(&mut word, &mut out);
     out
 }
 
