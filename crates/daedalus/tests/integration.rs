@@ -3,7 +3,7 @@
 //! No network required: drives the real agent loop with an in-memory scripted
 //! provider against a temp workspace, plus a CLI smoke test.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use daedalus_core::config::{provider_by_name, Config};
@@ -34,6 +34,19 @@ fn config_for(dir: &Path, max_iterations: usize) -> Config {
         workspace: dir.to_path_buf(),
         ..Config::defaults(dir.to_path_buf())
     }
+}
+
+/// Write a `config.toml` in `dir` selecting `provider`/`model` and using `dir`
+/// as the workspace, returning its path (passed to the binary via `--config`).
+/// Provider, model, and workspace are config-file keys, not CLI flags.
+fn write_config(dir: &Path, provider: &str, model: &str) -> PathBuf {
+    let path = dir.join("config.toml");
+    let body = format!(
+        "provider = {provider:?}\nmodel = {model:?}\nworkspace = {:?}\n",
+        dir.to_string_lossy()
+    );
+    std::fs::write(&path, body).expect("write config");
+    path
 }
 
 /// A full multi-step session: write, read, edit, bash, then answer. Verifies
@@ -131,9 +144,10 @@ fn integration_iteration_cap() {
 #[test]
 fn cli_smoke_piped_without_mode_is_rejected() {
     let tmp = tempdir("cli-no-mode");
+    let cfg = write_config(tmp.path(), "fake", "test");
     let out = Command::new(env!("CARGO_BIN_EXE_dl"))
-        .args(["hello", "--provider", "fake", "--model", "test", "--dir"])
-        .arg(tmp.path())
+        .args(["hello", "--config"])
+        .arg(&cfg)
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run daedalus binary");
@@ -152,9 +166,10 @@ fn cli_smoke_piped_without_mode_is_rejected() {
 #[test]
 fn cli_smoke_repl_mode_is_removed() {
     let tmp = tempdir("cli-repl-removed");
+    let cfg = write_config(tmp.path(), "fake", "test");
     let out = Command::new(env!("CARGO_BIN_EXE_dl"))
-        .args(["hello", "--mode", "repl", "--provider", "fake", "--dir"])
-        .arg(tmp.path())
+        .args(["hello", "--mode", "repl", "--config"])
+        .arg(&cfg)
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run daedalus binary");
@@ -168,9 +183,10 @@ fn cli_smoke_repl_mode_is_removed() {
 #[test]
 fn cli_smoke_unknown_provider_fails() {
     let tmp = tempdir("cli-bad");
+    let cfg = write_config(tmp.path(), "nope", "test");
     let out = Command::new(env!("CARGO_BIN_EXE_dl"))
-        .args(["hi", "--provider", "nope", "--dir"])
-        .arg(tmp.path())
+        .args(["hi", "--config"])
+        .arg(&cfg)
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run daedalus binary");
@@ -212,19 +228,12 @@ fn integration_path_outside_workspace_is_allowed() {
 #[test]
 fn cli_rpc_mode_drives_a_session_over_stdio() {
     let tmp = tempdir("rpc");
+    let cfg = write_config(tmp.path(), "fake", "test");
     let script = r#"{"id":"1","type":"prompt","text":"say hi"}
 "#;
     let mut child = Command::new(env!("CARGO_BIN_EXE_dl"))
-        .args([
-            "--mode",
-            "rpc",
-            "--provider",
-            "fake",
-            "--model",
-            "test",
-            "--dir",
-        ])
-        .arg(tmp.path())
+        .args(["--mode", "rpc", "--config"])
+        .arg(&cfg)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -258,18 +267,10 @@ fn cli_rpc_mode_drives_a_session_over_stdio() {
 #[test]
 fn cli_json_mode_emits_events_as_jsonl() {
     let tmp = tempdir("json");
+    let cfg = write_config(tmp.path(), "fake", "test");
     let out = Command::new(env!("CARGO_BIN_EXE_dl"))
-        .args([
-            "hello",
-            "--mode",
-            "json",
-            "--provider",
-            "fake",
-            "--model",
-            "test",
-            "--dir",
-        ])
-        .arg(tmp.path())
+        .args(["hello", "--mode", "json", "--config"])
+        .arg(&cfg)
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run daedalus json");
@@ -288,10 +289,8 @@ fn cli_json_mode_emits_events_as_jsonl() {
 /// CLI smoke: unknown --mode fails fast.
 #[test]
 fn cli_unknown_mode_fails() {
-    let tmp = tempdir("mode-bad");
     let out = Command::new(env!("CARGO_BIN_EXE_dl"))
-        .args(["hi", "--mode", "nope", "--dir"])
-        .arg(tmp.path())
+        .args(["hi", "--mode", "nope"])
         .stdin(std::process::Stdio::null())
         .output()
         .expect("run daedalus");

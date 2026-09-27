@@ -1,7 +1,8 @@
 //! Daedalus CLI binary in the `daedalus` crate of the workspace.
 //!
-//! Takes a positional `<prompt>` and a workspace directory (`--dir`, defaulting
-//! to cwd) plus `--model`, `--provider`, `--max-iterations`, and `--config`.
+//! Takes a positional `<prompt>` plus `--config` (an alternate config file).
+//! Provider, model, workspace, and max_iterations come from the config file
+//! (defaulting to `~/.config/daedalus/config.toml`) rather than flags.
 //! Builds the app from the `daedalus_core` library (config, runtime,
 //! providers, tools). Interactive use is the TUI (the default on a
 //! terminal) — the line-based REPL has been removed. Headless/scripted
@@ -43,23 +44,6 @@ struct Cli {
     #[arg(value_name = "PROMPT", num_args = 0.., trailing_var_arg = false)]
     prompt_parts: Vec<String>,
 
-    /// Workspace directory (default: current directory).
-    #[arg(long, value_name = "PATH")]
-    dir: Option<PathBuf>,
-
-    /// Provider name from the registry (openai, anthropic, gemini, ollama,
-    /// …). Default: openai.
-    #[arg(long, value_name = "NAME", value_parser = parse_provider)]
-    provider: Option<&'static daedalus_core::config::ProviderInfo>,
-
-    /// Model identifier (provider-specific default).
-    #[arg(long, value_name = "NAME")]
-    model: Option<String>,
-
-    /// Iteration cap for the agent loop (default: 30).
-    #[arg(long, value_name = "N", value_parser = parse_max_iterations)]
-    max_iterations: Option<usize>,
-
     /// Config file (default: ~/.config/daedalus/config.toml).
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -80,17 +64,8 @@ struct Cli {
     theme: Option<String>,
 }
 
-fn parse_provider(s: &str) -> Result<&'static daedalus_core::config::ProviderInfo, String> {
-    daedalus_core::config::provider_by_name(s)
-}
-
 fn parse_mode(s: &str) -> Result<Mode, String> {
     Mode::parse(s)
-}
-
-fn parse_max_iterations(s: &str) -> Result<usize, String> {
-    s.parse()
-        .map_err(|_| format!("invalid --max-iterations '{s}'"))
 }
 
 fn parse_theme(s: &str) -> Result<String, String> {
@@ -113,9 +88,6 @@ impl Cli {
 
     fn flags(&self) -> PartialConfig {
         PartialConfig {
-            provider: self.provider.map(|p| p.name.to_string()),
-            model: self.model.clone(),
-            max_iterations: self.max_iterations,
             theme: self
                 .theme
                 .clone()
@@ -152,8 +124,8 @@ fn run(cli: Cli) -> Result<i32, String> {
     if needs_prompt && cli.prompt_parts.is_empty() {
         return Err("no prompt given".into());
     }
-    let cwd = std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
-    let default_workspace = cli.dir.clone().unwrap_or(cwd);
+    let default_workspace =
+        std::env::current_dir().map_err(|e| format!("cannot determine cwd: {e}"))?;
     let config_path = resolve_config_path(cli.config.clone());
     // Where a runtime model/provider choice is written back. With no
     // `--config` (and no file yet) that is still the default path: creating it

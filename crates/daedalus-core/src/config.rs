@@ -331,7 +331,7 @@ impl PartialConfig {
             Some(m) if !m.trim().is_empty() => m.trim().to_string(),
             _ => {
                 return Err(format!(
-                    "no model configured for provider '{}': set `model` in the config file or pass --model",
+                    "no model configured for provider '{}': set `model` in the config file",
                     provider.name
                 ))
             }
