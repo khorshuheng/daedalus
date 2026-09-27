@@ -472,6 +472,16 @@ impl BashTool {
         cancel: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let command = arg_string(args, "command")?;
+
+        // Steer the shell search commands back to the bounded tools before the
+        // shell runs anything: the system prompt already bans them, but only
+        // this makes the rule stick (a `grep -r` of a 163 G home tree wedged a
+        // turn). Head-of-statement only, and fails open — it is guidance, not a
+        // sandbox; see [`super::guard`].
+        if let Some(refusal) = super::guard::refuse_search(&command) {
+            return Err(ToolError::Denied(refusal));
+        }
+
         let timeout = match arg_usize(args, "timeout")? {
             Some(0) => return Err(ToolError::Argument("'timeout' must be >= 1".into())),
             Some(s) if s as u64 > MAX_TIMEOUT_SECS => {
@@ -615,6 +625,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.content, "(no output)", "{}", out.content);
+    }
+
+    /// A shell search command is refused up front, before the shell spawns,
+    /// and the error names the bounded replacement tool.
+    #[tokio::test]
+    async fn refuses_shell_search_commands_before_running_them() {
+        let (ws, _dir) = setup("guard");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
+        // Marker proves the shell never ran: `grep` here would create the file
+        // only if the guard let the command through.
+        let dir = ws.root().to_path_buf();
+        let err = tool
+            .run(
+                &ws,
+                &json!({"command": "grep -ril needle . ; touch ran.txt"}),
+                token(),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolError::Denied(msg) => {
+                assert!(msg.contains("`grep` tool"), "{msg}");
+                assert!(msg.contains("paths"), "{msg}");
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+        assert!(!dir.join("ran.txt").exists(), "the command must not run");
+
+        let err = tool
+            .run(&ws, &json!({"command": "find . -name x"}), token())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Denied(_)), "{err:?}");
+    }
+
+    /// Filtering an explicit list is bounded work, so a search tool as a pipe
+    /// stage still runs.
+    #[tokio::test]
+    async fn allows_a_search_tool_as_a_pipe_stage() {
+        let (ws, _dir) = setup("guard-pipe");
+        let tool = BashTool {
+            max_output: 1000,
+            default_timeout_secs: None,
+        };
+        let out = tool
+            .run(
+                &ws,
+                &json!({"command": "printf 'a\\nb\\n' | grep b"}),
+                token(),
+            )
+            .await
+            .unwrap();
+        assert!(out.content.contains('b'), "{}", out.content);
     }
 
     #[tokio::test]

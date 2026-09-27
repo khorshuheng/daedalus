@@ -76,7 +76,9 @@ fn integration_multi_step_session() {
         Response::ToolCalls(vec![call(
             "b1",
             "bash",
-            serde_json::json!({"command": "grep -c there a.txt"}),
+            // `cat`, not `grep`: the bash guard refuses shell search commands
+            // even against a single explicit file (see `tools::guard`).
+            serde_json::json!({"command": "cat a.txt"}),
         )]),
         Response::Text("all done".into()),
     ]);

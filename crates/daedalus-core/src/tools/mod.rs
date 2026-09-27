@@ -9,6 +9,7 @@ pub mod bash;
 pub mod edit;
 pub mod find;
 pub mod grep;
+pub mod guard;
 pub mod mutation;
 pub mod read;
 pub mod resolver;
@@ -52,6 +53,10 @@ pub enum ToolError {
     /// The tool was interrupted by a cancellation request.
     #[error("cancelled")]
     Cancelled,
+    /// The tool refused the request before running it (e.g. `bash` rejecting a
+    /// shell search command). Carries the corrective message shown to the model.
+    #[error("{0}")]
+    Denied(String),
 }
 /// A tool. Implementations must be cheap to construct and stateless apart
 /// from their output cap. `run` is async: the built-ins wrap their
