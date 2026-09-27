@@ -26,6 +26,12 @@ const NAME_SEARCH: &[&str] = &["find", "fd"];
 
 /// Commands that merely wrap another command, dropped before the head is
 /// classified (`sudo grep -r x` is still a search).
+///
+/// `xargs` is here on purpose, which costs one over-block: `git ls-files |
+/// xargs grep foo` is refused even though a pipe stage would be allowed, and
+/// the refusal points at the `grep` tool's `paths` argument — the shape we want
+/// that command in anyway. The alternative, letting `xargs` through, would
+/// also let `xargs fd` (recursive, unbounded) through.
 const WRAPPERS: &[&str] = &[
     "sudo", "doas", "env", "nice", "ionice", "time", "timeout", "nohup", "exec", "xargs", "stdbuf",
     "setsid",
@@ -88,7 +94,6 @@ fn statements(segs: &[Seg]) -> Vec<Vec<&str>> {
 }
 
 /// `(tool, kind)` when the statement's head is a banned search command.
-/// `(tool, kind)` when the statement's head is a banned search command.
 ///
 /// Returns the constant name from [`CONTENT_SEARCH`]/[`NAME_SEARCH`], not the
 /// model's spelling: `grep` and `/usr/bin/grep` refuse identically.
@@ -141,8 +146,9 @@ fn is_keyword(word: &str) -> bool {
 }
 
 /// A bare value passed to a wrapper's option or taken positionally (`nice -n 5
-/// grep`, `timeout 5 grep`). No command is named `5` or `5s`, so skipping
-/// these cannot hide a head we mean to classify.
+/// grep`, `timeout 5 grep`). Command names are words, not digit-led numbers
+/// (`7z` is the one real exception, and it is never followed by a search
+/// tool), so skipping these cannot hide a head we mean to classify.
 fn is_wrapper_value(word: &str) -> bool {
     if !word.starts_with(|c: char| c.is_ascii_digit()) {
         return false;
@@ -226,10 +232,19 @@ fn segments(command: &str) -> Vec<Seg> {
                         out.push(Seg::Sep);
                     }
                 }
-                ';' | '&' => {
+                ';' => {
+                    flush(&mut word, &mut out);
+                    out.push(Seg::Sep);
+                }
+                // `&&` separates statements, and so does a bare `&`. A `&`
+                // that belongs to a redirection does not: in `2>&1` and
+                // `>&2` it follows a `>`, and in `&>file` it precedes one.
+                '&' if word.ends_with('>') => word.push('&'),
+                '&' if chars.peek() == Some(&'>') => word.push('&'),
+                '&' => {
                     flush(&mut word, &mut out);
                     // `&&` is one separator, not two.
-                    if c == '&' && chars.peek() == Some(&'&') {
+                    if chars.peek() == Some(&'&') {
                         chars.next();
                     }
                     out.push(Seg::Sep);
@@ -339,6 +354,23 @@ mod tests {
         allowed("git log | grep -i fix");
         allowed("git diff --name-only | rg '^src/'");
         allowed("cargo tree | grep -c '^├'");
+    }
+
+    /// A redirection's `&` is not a statement separator, so the pipe stage
+    /// after `2>&1` is still a filter over the first command's output.
+    #[test]
+    fn allows_a_pipe_stage_after_a_stream_redirect() {
+        allowed("cargo test 2>&1 | grep -i warning");
+        allowed("ls -la 2>&1 | tail -5");
+    }
+
+    /// The redirection exception must not swallow real separators: `&&`, a
+    /// bare `&` and `;` still start a new statement whose head is judged.
+    #[test]
+    fn still_splits_on_real_separators() {
+        refused("cd /tmp && grep -r x .", "`grep` tool");
+        refused("sleep 1 & grep -r x .", "`grep` tool");
+        refused("true; find . -name x", "`find` tool");
     }
 
     /// Quoting and evaluation order keep the head something other than a tool.
