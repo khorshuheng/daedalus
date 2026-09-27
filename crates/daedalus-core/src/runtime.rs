@@ -1078,13 +1078,6 @@ impl AgentRuntime {
     fn system_prompt(&self) -> String {
         let base = format!(
             "You are daedalus, a minimal coding agent. You inspect and modify files in the workspace '{}' by calling tools.\n\
-             You have exactly six tools and no others: read, grep, find, bash, edit, write.\n\
-             - read: read one or more files (a path, a list of paths, or a directory + glob) with an optional line range; use offset to page through long files.\n\
-             - grep: search file contents with a regex; respects .gitignore, skips hidden and binary files, and is bounded. Use this for all content searches.\n\
-             - find: find files by name/path regex or glob; respects .gitignore and is bounded. Use this for all filename searches.\n\
-             - bash: run a shell command in the workspace; check results before trusting them.\n\
-             - edit: apply precise text replacements; each oldText must match exactly once.\n\
-             - write: create or overwrite a file.\n\
              Rules:\n\
              - Paths are relative to the workspace by default; absolute paths and `..` are allowed.\n\
              - Read before editing; verify changes with bash.\n\
